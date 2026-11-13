@@ -1,6 +1,7 @@
 //! Original canvas tools project native primitives through existing Craft painters.
 use super::*;
 use egui::{Rect, vec2};
+use pcbcraft_chrome::menu::CheckKind;
 use pcbcraft_chrome::{Tokens, board, grid, workspace};
 use pcbcraft_engine::{
     authoring::Primitive,
@@ -218,7 +219,7 @@ impl Document {
                     (Tool::Polyline { .. }, Some(Place::Polyline)) => true,
                     _ => false,
                 },
-                toggle: true,
+                menu_check: Some(CheckKind::Choice),
             })
             .collect::<Vec<_>>();
         if let Some(index) = workspace::ribbon_group(ui, "Draw", &buttons) {
@@ -229,8 +230,15 @@ impl Document {
             }
         }
         workspace::ribbon_separator(ui);
-        let button =
-            |icon, label, available| RibbonTool { icon, label, description: label, shortcut: "", enabled: available, active: false, toggle: false };
+        let button = |icon, label, available| RibbonTool {
+            icon,
+            label,
+            description: label,
+            shortcut: "",
+            enabled: available,
+            active: false,
+            menu_check: None,
+        };
         let tools = [
             button(Icon::Move, "Move", selected),
             button(Icon::Rotate, "Rotate", selected),
@@ -271,18 +279,22 @@ impl Document {
                         GraphicPurpose::Silkscreen => "Silkscreen",
                         GraphicPurpose::Courtyard => "Courtyard",
                     };
-                    egui::ComboBox::from_id_salt("drawing_layer").selected_text(title).show_ui(ui, |ui| {
-                        for (value, label) in [
-                            (GraphicPurpose::Fabrication, "Fabrication"),
-                            (GraphicPurpose::Silkscreen, "Silkscreen"),
-                            (GraphicPurpose::Courtyard, "Courtyard"),
-                        ] {
-                            ui.selectable_value(&mut self.drawing_purpose, value, label);
-                        }
-                    });
+                    pcbcraft_chrome::controls::Choice::from_id_salt("drawing_layer")
+                        .selected_text(title)
+                        .show_ui(ui, |ui| {
+                            for (value, label) in [
+                                (GraphicPurpose::Fabrication, "Fabrication"),
+                                (GraphicPurpose::Silkscreen, "Silkscreen"),
+                                (GraphicPurpose::Courtyard, "Courtyard"),
+                            ] {
+                                ui.selectable_value(&mut self.drawing_purpose, value, label);
+                            }
+                        })
+                        .response
+                        .accessible_name("Drawing layer");
                 } else {
                     use pcbcraft_engine::library_graphics::Fill;
-                    egui::ComboBox::from_id_salt("drawing_fill")
+                    pcbcraft_chrome::controls::Choice::from_id_salt("drawing_fill")
                         .selected_text(match self.drawing_fill {
                             Fill::None => "Unfilled",
                             Fill::Solid => "Solid fill",
@@ -292,10 +304,16 @@ impl Document {
                             for (value, label) in [(Fill::None, "Unfilled"), (Fill::Solid, "Solid fill"), (Fill::Background, "Background fill")] {
                                 ui.selectable_value(&mut self.drawing_fill, value, label);
                             }
-                        });
+                        })
+                        .response
+                        .accessible_name("Drawing fill");
                 }
                 let mut width = self.drawing_stroke_nm as f64 / 1_000_000.;
-                if ui.add(egui::DragValue::new(&mut width).range(0.01..=2.).speed(0.01).suffix(" mm stroke")).changed() {
+                if ui
+                    .add(egui::DragValue::new(&mut width).range(0.01..=2.).speed(0.01).suffix(" mm stroke"))
+                    .accessible_name("Drawing stroke width")
+                    .changed()
+                {
                     self.drawing_stroke_nm = (width * 1_000_000.).round() as i64;
                 }
             },
@@ -305,7 +323,15 @@ impl Document {
     pub(super) fn view_tools(&mut self, ui: &mut Ui) {
         use workspace::{RibbonTool, ToolIcon as Icon};
         let tools = [(Icon::Fit, "Fit", false), (Icon::Browser, "Browser", !self.collapsed[0]), (Icon::Settings, "Properties", !self.collapsed[1])]
-            .map(|(icon, label, active)| RibbonTool { icon, label, description: label, shortcut: "", enabled: true, active, toggle: label != "Fit" });
+            .map(|(icon, label, active)| RibbonTool {
+                icon,
+                label,
+                description: label,
+                shortcut: "",
+                enabled: true,
+                active,
+                menu_check: (label != "Fit").then_some(CheckKind::Toggle),
+            });
         if let Some(index) = workspace::ribbon_group(ui, "View", &tools) {
             match index {
                 0 => self.camera.request_fit(),
@@ -314,9 +340,9 @@ impl Document {
         }
         workspace::ribbon_separator(ui);
         workspace::ribbon_control(ui, "Grid", Tokens::get().space_24 * 5.0, |ui| {
-            egui::ComboBox::from_id_salt("library_grid").selected_text(format!("Grid {} mm", self.camera.snap_nm() as f64 / 1_000_000.0)).show_ui(
-                ui,
-                |ui| {
+            pcbcraft_chrome::controls::Choice::from_id_salt("library_grid")
+                .selected_text(format!("Grid {} mm", self.camera.snap_nm() as f64 / 1_000_000.0))
+                .show_ui(ui, |ui| {
                     let spacings: &[i64] = if self.session.snapshot().kind == Kind::Symbol {
                         &[1_270_000]
                     } else {
@@ -327,8 +353,9 @@ impl Document {
                             self.camera.set_snap_nm(spacing);
                         }
                     }
-                },
-            );
+                })
+                .response
+                .accessible_name("Library grid");
         });
     }
     /// Move retains the captured selection and revision until a completed placement.
@@ -499,14 +526,32 @@ impl Document {
         }
         primitive(item, kind, start, end)
     }
+    /// Preview the library's generated reference using default physical silkscreen settings.
+    /// Authoring revisions invalidate the paths, while zoom and pan only reproject them.
+    fn reference_preview(&mut self, item: &Item) -> Option<std::sync::Arc<[Vec<Point>]>> {
+        item.reference_font.as_ref()?;
+        let revision = self.session.revision();
+        if let Some((cached, paths)) = &self.reference_preview
+            && *cached == revision
+        {
+            return Some(paths.clone());
+        }
+        let definition = item.footprint().ok()?;
+        let paths: std::sync::Arc<[_]> =
+            definition.reference_paths("REF", Default::default(), pcbcraft_engine::board::DEFAULT_REFERENCE_OFFSET).into();
+        self.reference_preview = Some((revision, paths.clone()));
+        Some(paths)
+    }
+
     /// Navigate and edit the focused pane through revision-checked transactions. Directional
     /// boxes, modifier selection, clipboard placement and repeated drawing share stable IDs.
     pub(super) fn canvas(&mut self, ui: &mut Ui, area: Rect, covered: [Rect; 2], navigation: Navigation, active: bool) {
         use pcbcraft_engine::library_graphics::{Fill, Geometry, Graphic};
         let item = self.session.snapshot();
+        let reference = self.reference_preview(&item);
         let t = Tokens::get();
-        let response = ui.interact(area, ui.id().with("library_canvas"), egui::Sense::click_and_drag());
-        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, ui.is_enabled(), "Library canvas"));
+        let response = ui.interact(area, ui.scope_id().with("library_canvas"), egui::Sense::click_and_drag());
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::GenericContainer, ui.is_enabled(), "Library canvas"));
         if !ui.input(|i| i.focused) {
             self.tool = Tool::Select;
         }
@@ -520,7 +565,8 @@ impl Document {
                     && ui.ctx().layer_id_at(p).is_none_or(|layer| layer.order == egui::Order::Background)
             });
         self.camera.set_uncovered(area, workspace::catalog::uncovered(area, &covered));
-        self.camera.navigate_definition(&response, area, item.objects.values().flat_map(points), over, navigation);
+        let extents = item.objects.values().flat_map(points).chain(reference.iter().flat_map(|paths| paths.iter().flatten().copied()));
+        self.camera.navigate_definition(&response, area, extents, over, navigation);
         let painter = ui.ctx().layer_painter(egui::LayerId::background()).with_clip_rect(area);
         painter.rect_filled(area, 0, if item.kind == Kind::Symbol { t.canvas } else { t.board_canvas });
         let origin = self.camera.screen(Point { x_nm: 0, y_nm: 0 }, area);
@@ -729,6 +775,14 @@ impl Document {
         for p in preview {
             paint(&painter, &p, &self.camera, area, true);
         }
+        if let Some(paths) = &reference {
+            let width = pcbcraft_engine::board::silkscreen::Settings::default().stroke_width_nm as f32 / pcbcraft_engine::schematic::GRID_NM as f32
+                * self.camera.unit_step();
+            let stroke = egui::Stroke::new(width, pcbcraft_chrome::board::graphic_color(pcbcraft_chrome::board::GraphicStyle::Silkscreen));
+            for path in paths.iter() {
+                painter.add(egui::Shape::line(path.iter().map(|point| self.camera.screen(*point, area)).collect(), stroke));
+            }
+        }
         if let Tool::Box { start, .. } = self.tool
             && let Some(point) = pointer
         {
@@ -879,6 +933,8 @@ fn paint(painter: &egui::Painter, primitive: &Primitive, camera: &crate::canvas_
             board::copper_color(Some(true)),
             selected,
             false,
+            false,
+            egui::Vec2::ZERO,
         ),
         Primitive::Outline { graphic } => board::footprint(
             painter,
@@ -893,12 +949,15 @@ fn paint(painter: &egui::Painter, primitive: &Primitive, camera: &crate::canvas_
                 },
                 closed: true,
                 stroke_width: None,
+                reference: false,
             }],
             "",
             at(graphic.center),
             board::copper_color(Some(true)),
             selected,
             false,
+            false,
+            egui::Vec2::ZERO,
         ),
         Primitive::Silkscreen { path } => board::footprint(
             painter,
@@ -909,12 +968,15 @@ fn paint(painter: &egui::Painter, primitive: &Primitive, camera: &crate::canvas_
                 style: board::GraphicStyle::Silkscreen,
                 closed: path.closed,
                 stroke_width: None,
+                reference: false,
             }],
             "",
             at(primitive.anchor()),
             board::copper_color(Some(true)),
             selected,
             false,
+            false,
+            egui::Vec2::ZERO,
         ),
     }
     if selected {

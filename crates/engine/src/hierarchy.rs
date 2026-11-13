@@ -215,7 +215,7 @@ impl Project {
     /// Resolve all sheets through explicit parent/child pins and scoped named anchors.
     /// Hierarchical names alone do not join unrelated sheets; global/power labels do.
     pub fn electrical_connectivity(&self) -> Connectivity {
-        if self.has_named_nets() {
+        if self.requires_project_graph() {
             return self.named_connectivity(true);
         }
         let symbols: Vec<_> = self.all_symbols().cloned().collect();
@@ -299,6 +299,7 @@ fn check_label_name(name: &str) -> Result<(), String> {
 impl Session {
     /// Apply one hierarchy edit to an isolated sheet transaction. Cross-sheet pin cleanup is
     /// part of the same undo step, and validation failure never publishes partial state.
+    /// Creating a child allocates its occurrence; reparenting retains the existing occurrence ID.
     pub(super) fn edit_hierarchy(&mut self, id: &str, params: &Value) -> Result<(), CommandError> {
         self.check_revision(params)?;
         let mut project = self.open_project()?.clone();
@@ -322,7 +323,8 @@ impl Session {
                         return Err(CommandError::InvalidParams("a sheet with that name already exists".into()));
                     }
                     let child = fresh_id()?;
-                    Arc::make_mut(&mut project.sheets).push(sheets::SchematicSheet::empty(child, name));
+                    let sheet = project.new_sheet_record(child, name)?;
+                    Arc::make_mut(&mut project.sheets).push(sheet);
                     SheetTarget { project: project.id, sheet: child }
                 } else {
                     project.resolve_sheet(params["child"].as_str())?
@@ -436,7 +438,7 @@ impl Session {
         for sheet in Arc::make_mut(&mut project.sheets) {
             sheet.connectivity = Arc::default();
         }
-        self.change(project);
+        self.change(project)?;
         Ok(())
     }
 }

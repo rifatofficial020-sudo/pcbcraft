@@ -12,25 +12,32 @@ use uuid::Uuid;
 use crate::{
     MAX_NAME, MAX_OBJECT_ID, MAX_REFERENCE_NUMBER, Project,
     board::{Board, Footprint},
-    schematic::{Component, MAX_CENTER_NM, MAX_SYMBOLS, Point, SymbolPlacement, Terminal, Wire, WireEndpoint, wiring::MAX_WIRES},
+    schematic::{MAX_CENTER_NM, MAX_SYMBOLS, PartInstance, Point, SymbolPlacement, Terminal, Wire, WireEndpoint, wiring::MAX_WIRES},
 };
 
 mod archive;
 pub use archive::ArchiveEncoder;
 mod documents;
+pub mod layout;
 pub use documents::{
-    Documents, DocumentsEncoder, ENTRY_POINT, MAX_DOCUMENT_BYTES, MAX_DOCUMENTS, MAX_DOCUMENTS_BYTES, decode_documents, encode_documents,
-    is_document_path,
+    Documents, DocumentsEncoder, ENTRY_POINT, MAX_DOCUMENT_BYTES, MAX_DOCUMENTS, MAX_DOCUMENTS_BYTES, convert_legacy_documents, decode_documents,
+    encode_documents, is_document_path, migrate_board_layout, project_board_path, project_instances_path, project_layout_root,
+    project_registered_board_id,
 };
 mod packed;
-pub use packed::{PackedEncoder, PackedProject, decode_packed, encode_packed, encode_packed_documents};
+mod power_migration;
+pub use packed::{PackedEncoder, PackedProject, decode_legacy_packed, decode_packed, encode_packed, encode_packed_documents};
+pub use power_migration::migrate_power_markers;
 #[cfg(test)]
 mod split_tests;
+
+/// Explain the intentional app 0.1.0 break when a legacy standalone document is opened.
+pub const UNSUPPORTED_PROJECT_LAYOUT: &str = "Unsupported project layout. Open a split project folder, its project.json or project.pc entry point, or a packed project ZIP. Legacy standalone JSON and container-v1 projects remain unsupported.";
 
 /// Maximum number of bytes in a supported project ZIP.
 pub const MAX_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
 
-/// The encoding of a native .pc file, independent of its filename.
+/// JSON document or ZIP package encoding, detected independently of the filename.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Encoding {
     #[default]
@@ -53,15 +60,23 @@ impl Encoding {
     }
 }
 
-/// Read and validate a native project using the encoding detected from its content.
-pub fn decode_file(bytes: &[u8]) -> Result<(Arc<Project>, Encoding), String> {
+/// Read a diagnostic single-document fixture or current packed project, including legacy
+/// inputs refused by normal app/CLI opens. Use [`decode_packed`] for current archives or
+/// [`decode_documents`] after folder I/O; this compatibility helper is for tests and benchmarks.
+pub fn decode_diagnostic_file(bytes: &[u8]) -> Result<(Arc<Project>, Encoding), String> {
     let encoding = Encoding::detect(bytes);
     if bytes.len() > encoding.input_limit() {
         return Err("project exceeds the native file size limit".to_owned());
     }
     let project = match encoding {
         Encoding::Json => decode(bytes)?,
-        Encoding::Zip => decode_packed(bytes)?.project,
+        Encoding::Zip => {
+            if let Ok(payload) = archive::unpack(bytes) {
+                decode(&payload)?
+            } else {
+                decode_packed(bytes)?.project
+            }
+        }
     };
     Ok((project, encoding))
 }
@@ -160,7 +175,7 @@ struct BoardRecords {
     footprints: Vec<Footprint>,
 }
 
-/// Component data has no schematic coordinates or footprint geometry.
+/// Part instance data has no schematic coordinates or footprint geometry.
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ComponentRecord<'a> {
@@ -174,6 +189,10 @@ struct ComponentRecord<'a> {
     value: std::borrow::Cow<'a, str>,
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
     metadata: Option<crate::schematic::fields::Metadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+    part: Option<crate::part_instances::Record>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+    no_connects: Option<Vec<crate::no_connect::Intent>>,
 }
 
 /// A schematic unit stores only its identity, owner and geometry.
@@ -186,6 +205,9 @@ struct Placement<'a> {
     x_nm: i64,
     y_nm: i64,
     rotation: u16,
+    /// Sheet/6 extension: reflect left-to-right before rotation. Canonical records omit false.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+    mirrored: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
     field_layout: Option<crate::schematic::fields::Layouts>,
 }
@@ -273,6 +295,7 @@ fn migrate_from_1(legacy: LegacyDocument) -> Result<Document2, String> {
             x_nm: record.x_nm,
             y_nm: record.y_nm,
             rotation: 0,
+            mirrored: None,
             field_layout: None,
         });
     }
@@ -282,6 +305,7 @@ fn migrate_from_1(legacy: LegacyDocument) -> Result<Document2, String> {
             .footprints
             .into_iter()
             .map(|record| Footprint {
+                unconnected_pads: Vec::new(),
                 id: record.id,
                 component: record.symbol,
                 definition: record.definition,
@@ -292,6 +316,9 @@ fn migrate_from_1(legacy: LegacyDocument) -> Result<Document2, String> {
                 rotation: 0,
                 library: None,
                 mapping: None,
+                bottom: false,
+                reference_offset: None,
+                reference_text: None,
             })
             .collect(),
     });
@@ -344,6 +371,8 @@ fn migrate_to_4(document: Document2) -> Result<Document, String> {
             reference: record.reference.into(),
             value: record.value.into(),
             metadata: None,
+            part: None,
+            no_connects: None,
         });
         used.insert((definition.id.clone(), definition.revision()), definition);
     }
@@ -375,7 +404,7 @@ struct Connection<'a> {
     bends: Option<Vec<Point>>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
 #[serde(untagged, deny_unknown_fields)]
 enum Endpoint<'a> {
     Pin { symbol: u64, pin: std::borrow::Cow<'a, str> },
@@ -408,7 +437,8 @@ impl From<WireEndpoint> for Endpoint<'static> {
 
 /// Encode deterministic single-document JSON for migration fixtures and diagnostic tools.
 /// Legacy snapshots retain format 4; adopted allocation metadata requires format 8.
-/// Configured boards are refused. Normal saves use [`encode_documents`] or [`encode_packed`].
+/// Configured boards and adopted occurrence IDs are refused. Normal saves use
+/// [`encode_documents`] or [`encode_packed`].
 pub fn encode(project: Arc<Project>) -> Result<Vec<u8>, String> {
     let mut encoder = Encoder::new(project)?;
     loop {
@@ -441,12 +471,21 @@ pub struct Encoder {
 impl Encoder {
     /// Begin incremental single-document encoding after rejecting unsupported document features.
     /// Metadata, text appearance, setup, physical definitions, silkscreen, outlines, layer
-    /// drawings and rotation require split documents or an archive; refuse lossy export.
+    /// drawings, rotation and occurrence IDs require split documents or an archive; refuse loss.
     pub fn new(project: Arc<Project>) -> Result<Self, String> {
+        if project.no_connect_count() != 0 {
+            return Err("No-connect intent requires split documents or a packed archive.".into());
+        }
+        if project.components.values().any(|c| c.part.is_some()) {
+            return Err("Native library part selections require split documents or a packed archive.".into());
+        }
+        if project.sheets.iter().any(|sheet| sheet.has_live_generated_legs()) {
+            return Err("generated named-contact legs require the split project format".into());
+        }
         if project.components.values().any(|c| !c.metadata.is_empty())
-            || project.sheets.iter().any(|s| s.symbols.iter().any(|s| !s.field_layout.is_empty()))
+            || project.sheets.iter().any(|s| s.symbols.iter().any(|s| !s.field_layout.is_empty() || s.mirrored))
         {
-            return Err("component fields and text appearance require the split project format".into());
+            return Err("component fields, text appearance and mirrored symbols require the split project format".into());
         }
         if project.sheets.len() != 1 || project.sheet_name() != "Main" {
             return Err("legacy single-file encoding cannot represent multiple or renamed sheets; use split documents or a packed archive".to_owned());
@@ -462,15 +501,19 @@ impl Encoder {
             || project.board.drawings.is_some()
             || !project.board.tracks.is_empty()
             || !project.board.vias.is_empty()
+            || project.board.rules.is_some()
             || project.board.setup.is_some()
             || !project.board.definitions.is_empty()
-            || project.board.footprints().iter().any(|f| f.rotation != 0)
+            || project.board.footprints().iter().any(|f| f.rotation != 0 || f.bottom || f.reference_offset.is_some() || f.reference_text.is_some())
         {
             return Err(
-                "legacy single-file encoding cannot represent board setup, accepted board baselines, physical footprints, independent assignments, silkscreen settings, outlines, layer drawings, tracks, vias or footprint rotation; use split documents or a packed archive".to_owned()
+                "legacy single-file encoding cannot represent board setup, board rules, accepted board baselines, physical footprints, independent assignments, silkscreen settings, outlines, layer drawings, tracks, vias, footprint rotation, bottom-side footprints, reference offsets or print overrides; use split documents or a packed archive".to_owned()
             );
         }
         let name = serde_json::to_string(&project.name).map_err(|error| error.to_string())?;
+        if project.has_sheet_occurrences() {
+            return Err("legacy diagnostic encoding cannot represent sheet occurrence identities; use split documents or a packed archive".into());
+        }
         let mut bytes = Vec::new();
         let registrations = project.board.ownership.records();
         let format = if registrations.is_some() {
@@ -540,6 +583,8 @@ impl Encoder {
                     reference: component.reference.as_str().into(),
                     value: component.value.as_str().into(),
                     metadata: None,
+                    part: None,
+                    no_connects: None,
                 };
                 let more = self.project.components.last_key_value().is_some_and(|(&last, _)| last != id);
                 write_record(&mut self.bytes, &record, more)?;
@@ -559,6 +604,7 @@ impl Encoder {
                     x_nm: symbol.position.x_nm,
                     y_nm: symbol.position.y_nm,
                     rotation: u16::from(symbol.rotation) * 90,
+                    mirrored: None,
                     field_layout: None,
                 };
                 write_record(&mut self.bytes, &record, self.symbols + 1 < self.project.symbols.len())?;
@@ -666,8 +712,14 @@ pub fn decode(bytes: &[u8]) -> Result<Arc<Project>, String> {
     if document.components.iter().any(|c| c.metadata.is_some()) || document.sheet.symbols.iter().any(|s| s.field_layout.is_some()) {
         return Err("component fields and text appearance require split project/sheet formats 11/4".into());
     }
+    if document.sheet.symbols.iter().any(|s| s.mirrored.is_some()) {
+        return Err("mirrored symbol placements require split sheet format 6".into());
+    }
     if document.board.as_ref().is_some_and(|b| b.footprints.iter().any(|f| f.rotation != 0 || f.library.is_some())) {
         return Err("physical footprints and rotation require split board format 5 or 4 respectively".to_owned());
+    }
+    if document.board.as_ref().is_some_and(|b| b.footprints.iter().any(|f| f.reference_offset.is_some() || f.reference_text.is_some())) {
+        return Err("footprint reference offsets and print overrides require split board format 15".into());
     }
     if document.board.as_ref().is_some_and(|board| board.baseline.is_some()) {
         return Err("accepted board baselines require split board format 10".into());
@@ -733,6 +785,12 @@ fn validate_with_hierarchy(
     let mut shown = BTreeSet::new();
     let mut components = BTreeMap::new();
     for record in records {
+        if record.no_connects.is_some() {
+            return Err("No-connect intent requires the split marker format.".into());
+        }
+        if record.part.is_some() {
+            return Err("Pinned part references require the split native part format.".into());
+        }
         validate_id(&mut component_ids, record.id)?;
         let (definition, used) =
             saved.get_mut(&(record.library.to_string(), record.definition.to_string(), record.definition_revision)).ok_or_else(|| {
@@ -757,13 +815,15 @@ fn validate_with_hierarchy(
         metadata.validate()?;
         components.insert(
             record.id,
-            Component {
+            PartInstance {
                 ordinal: record.id,
                 definition,
                 reference_number: record.reference_number,
                 reference: record.reference.into_owned(),
                 value: record.value.into_owned(),
                 metadata,
+                part: None,
+                no_connects: BTreeMap::new(),
             },
         );
     }
@@ -776,10 +836,13 @@ fn validate_with_hierarchy(
     for record in sheet.symbols {
         validate_id(&mut ids, record.id)?;
         let component = components.get(&record.component).ok_or_else(|| "symbol points to a missing component".to_owned())?;
-        let unit = component.definition.unit_id();
-        if record.unit != unit {
-            return Err(format!("unavailable unit {} on component {}", record.unit, record.component));
-        }
+        let unit = record.unit.as_ref();
+        let unit_index = component
+            .definition
+            .units
+            .iter()
+            .position(|drawing| drawing.unit_id() == unit)
+            .ok_or_else(|| format!("unavailable unit {} on component {}", record.unit, record.component))?;
         if units.insert((record.component, unit.to_owned()), record.id).is_some() {
             return Err("component unit is placed more than once".to_owned());
         }
@@ -797,12 +860,15 @@ fn validate_with_hierarchy(
             ordinal: record.id,
             component: record.component,
             unit: unit.to_owned(),
+            unit_index,
             position: Point { x_nm: record.x_nm, y_nm: record.y_nm },
             field_layout,
             rotation,
+            mirrored: record.mirrored.unwrap_or(false),
         });
     }
-    if components.len() != units.len() {
+    let placed_components: BTreeSet<_> = units.keys().map(|(component, _)| component).collect();
+    if components.keys().any(|id| !placed_components.contains(id)) {
         return Err("component has no placed unit".to_owned());
     }
     symbols.sort_unstable_by_key(|symbol| symbol.ordinal);
@@ -835,7 +901,7 @@ fn validate_with_hierarchy(
         Endpoint::Pin { symbol, pin } => symbols
             .binary_search_by_key(&symbol, |placed| placed.ordinal)
             .ok()
-            .and_then(|index| Terminal::from_number(symbol, &symbols[index].definition, &pin))
+            .and_then(|index| Terminal::from_number(symbol, symbols[index].unit_definition(), &pin))
             .map(WireEndpoint::Terminal)
             .ok_or_else(|| format!("wire points to missing pin {pin} on symbol {symbol}")),
         Endpoint::Junction { junction } => junctions
@@ -915,6 +981,7 @@ fn validate_with_hierarchy(
         sheets: Arc::new(vec![crate::sheets::SchematicSheet {
             sheet_id: sheet.id,
             sheet_name: "Main".to_owned(),
+            occurrence_id: None,
             labels: Arc::default(),
             net_labels: Arc::default(),
             subsheets: Arc::default(),
@@ -922,6 +989,8 @@ fn validate_with_hierarchy(
             wires: Arc::new(wires),
             junctions: Arc::new(junctions),
             connectivity: Arc::default(),
+            generated_legs: Arc::default(),
+            no_connect_ends: Arc::default(),
         }]),
         sheet_index: 0,
         name,
@@ -931,6 +1000,9 @@ fn validate_with_hierarchy(
         board: Arc::new(layout),
         named_graph: Arc::default(),
         upgraded_from,
+        layout: None,
+        circuit_use: None,
+        net_registry: Arc::default(),
     };
     let ownership = crate::board::identity::Ownership::decode(boards, &result)?;
     Arc::make_mut(&mut result.board).ownership = ownership;
@@ -956,12 +1028,53 @@ pub(crate) fn validate_id(ids: &mut BTreeSet<u64>, id: u64) -> Result<(), String
     Ok(())
 }
 
+/// Resolve the physical payload in either supported layout for codec regression tests.
+#[cfg(test)]
+pub(crate) fn test_board_path(documents: &Documents) -> String {
+    project_board_path(&documents[ENTRY_POINT]).unwrap().unwrap()
+}
+
+/// Construct an explicitly historical snapshot for retained diagnostic-codec regression tests.
+/// Current application exports never use this test-only removal of occurrence metadata.
+#[cfg(test)]
+pub(crate) fn diagnostic_snapshot(project: Arc<Project>) -> Arc<Project> {
+    let mut diagnostic = Project::clone(&project);
+    diagnostic.net_registry = Arc::default();
+    diagnostic.circuit_use = None;
+    for sheet in Arc::make_mut(&mut diagnostic.sheets) {
+        sheet.occurrence_id = None;
+    }
+    Arc::new(diagnostic)
+}
+
+/// Exercise historical standalone JSON/container-v1 output without weakening current exporters.
+#[cfg(test)]
+pub(crate) fn diagnostic_test_file(project: Arc<Project>, encoding: Encoding) -> Result<Vec<u8>, String> {
+    encode_file(diagnostic_snapshot(project), encoding)
+}
+
 #[cfg(test)]
 mod tests {
+    /// Diagnostic single-document files have no directory layout. Compare electrical inspection
+    /// independently from board `file` paths, which are covered by the split-layout tests.
+    fn without_storage_paths(mut project: serde_json::Value) -> serde_json::Value {
+        project.as_object_mut().unwrap().remove("sheet_instances");
+        for board in project["boards"].as_array_mut().unwrap() {
+            board.as_object_mut().unwrap().remove("file");
+        }
+        project
+    }
+
     use serde_json::json;
 
     use super::*;
     use crate::{CONNECT_PINS, MOVE_SYMBOL, PLACE_SYMBOL, Session};
+
+    /// Exercise the retained diagnostic codec with an explicitly historical metadata snapshot.
+    /// Normal current-format encoding must refuse losing independently allocated occurrence IDs.
+    fn encode(project: Arc<Project>) -> Result<Vec<u8>, String> {
+        super::encode(diagnostic_snapshot(project))
+    }
 
     fn fixture() -> Session {
         let mut session = Session::default();
@@ -1059,7 +1172,7 @@ mod tests {
         let bytes = encode(session.snapshot().unwrap()).unwrap();
         let mut reopened = Session::default();
         reopened.open_snapshot(decode(&bytes).unwrap());
-        assert_eq!(reopened.inspect()["project"], state["project"]);
+        assert_eq!(without_storage_paths(reopened.inspect()["project"].clone()), without_storage_paths(state["project"].clone()));
 
         let footprint = json!({
             "symbol": "symbol-3", "definition": "generic-through-hole-2",
@@ -1239,7 +1352,7 @@ mod tests {
         assert!(error(&|d| d["symbol_definitions"][0]["library"] = json!("Bad Library")).contains("library ID"));
     }
 
-    /// Component fields and unit rotation survive a save, while invalid rotations and
+    /// Part instance fields and unit rotation survive a save, while invalid rotations and
     /// duplicate component references are refused.
     #[test]
     fn rotation_and_edited_fields_round_trip() {
@@ -1255,7 +1368,7 @@ mod tests {
         assert!(text.contains("\"rotation\":180"));
         let mut reopened = Session::default();
         reopened.open_snapshot(decode(&bytes).unwrap());
-        assert_eq!(reopened.inspect()["project"], session.inspect()["project"]);
+        assert_eq!(without_storage_paths(reopened.inspect()["project"].clone()), without_storage_paths(session.inspect()["project"].clone()));
         let led = &reopened.inspect()["project"]["schematic"]["symbols"][1];
         assert_eq!((led["reference"].clone(), led["value"].clone()), (json!("D7"), json!("Red")));
 
@@ -1276,7 +1389,7 @@ mod tests {
         assert!(before.same_document(&loaded));
         let mut reopened = Session::default();
         reopened.open_snapshot(loaded.clone());
-        assert_eq!(session.inspect()["project"], reopened.inspect()["project"]);
+        assert_eq!(without_storage_paths(session.inspect()["project"].clone()), without_storage_paths(reopened.inspect()["project"].clone()));
         reopened
             .apply(
                 MOVE_SYMBOL,
@@ -1339,7 +1452,7 @@ mod tests {
         assert!(decode(&serde_json::to_vec(&invalid).unwrap()).is_err());
     }
 
-    /// Component and symbol IDs may differ. Field edits only change the component record;
+    /// Part instance and symbol IDs may differ. Field edits only change the component record;
     /// wire/pad addresses, geometry, undo/redo and last-unit deletion follow explicit ownership.
     #[test]
     fn independent_component_identity_survives_edit_history_and_board_links() {
@@ -1419,7 +1532,7 @@ mod tests {
         assert_eq!(pad.inspect(), json!({"board":migrated.board_target().unwrap().board,"footprint": "footprint-5", "pad": "2"}));
         for encoding in [Encoding::Json, Encoding::Zip] {
             let bytes = encode_file(migrated.clone(), encoding).unwrap();
-            let (project, detected) = decode_file(&bytes).unwrap();
+            let (project, detected) = decode_diagnostic_file(&bytes).unwrap();
             assert_eq!(detected, encoding);
             assert_eq!(project.terminal_for_pad(pad), Some(terminal));
             assert_eq!(project.wires()[0].terminals(), migrated.wires()[0].terminals());

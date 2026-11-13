@@ -152,7 +152,7 @@ impl Assistant {
         if ctx.input(|input| input.pointer.any_pressed()) {
             self.keyboard_active = self.panel_rect.zip(ctx.pointer_interact_pos()).is_some_and(|(rect, point)| rect.contains(point));
         }
-        let owns_keys = self.keyboard_active || ctx.memory(|memory| memory.has_focus(egui::Id::new("assistant_draft_input")));
+        let owns_keys = self.keyboard_active || ctx.memory(|memory| memory.has_focus(egui::Id::unique("assistant_draft_input")));
         if owns_keys {
             self.chat_shortcuts(ctx);
         }
@@ -198,7 +198,7 @@ impl Assistant {
     fn release_focus(&mut self, ctx: &Context) {
         ctx.memory_mut(|memory| {
             if let Some(id) = memory.focused()
-                && (self.keyboard_active || id == egui::Id::new("assistant_draft_input"))
+                && (self.keyboard_active || id == egui::Id::unique("assistant_draft_input"))
             {
                 memory.surrender_focus(id);
             }
@@ -538,6 +538,11 @@ impl Assistant {
         self.chat.generation()
     }
 
+    /// Retain endpoint revocation and reply ownership for queued ordinary UI input.
+    pub(super) fn automation_owner(&self, generation: u64) -> Option<crate::ui_automation::Owner> {
+        self.chat.automation_owner(generation)
+    }
+
     /// The approvals the person answered since the last frame, each once, for the editor to run
     /// or refuse. "Always allow" is remembered when the person answers.
     pub(super) fn take_answers(&mut self) -> Vec<(Approval, Answer)> {
@@ -572,15 +577,22 @@ impl Assistant {
     }
 
     /// Draw the agent row, conversation and questions for the active document context.
+    /// Synthetic passes disable these controls; consent handlers also check provenance.
     /// Document availability is separate from temporary edit refusals.
     fn panel(&mut self, ui: &mut Ui, session: &Session, can_edit: bool, has_document: bool) {
+        let human = pcbcraft_chrome::automation::human_input(ui.ctx());
+        ui.add_enabled_ui(human, |ui| self.panel_contents(ui, session, can_edit, has_document));
+    }
+
+    /// Render chat controls with the caller's input provenance retained through nested popups.
+    fn panel_contents(&mut self, ui: &mut Ui, session: &Session, can_edit: bool, has_document: bool) {
         let t = Tokens::get();
         if self.confirm_new {
             ui.label("Start a new chat? This clears the conversation and draft.");
             ui.horizontal(|ui| {
-                if ui.button("Start new chat").clicked() {
+                if pcbcraft_chrome::controls::button(ui, "Start new chat").clicked() {
                     self.new_chat();
-                } else if ui.button("Keep chat").clicked() {
+                } else if pcbcraft_chrome::controls::button(ui, "Keep chat").clicked() {
                     self.confirm_new = false;
                 }
             });
@@ -619,30 +631,35 @@ impl Assistant {
                 }
                 ui.horizontal_wrapped(|ui| match &approval.source {
                     chat::Source::Tool { .. } => {
-                        if ui.button("Allow").clicked() {
+                        if pcbcraft_chrome::controls::button(ui, "Allow").clicked() {
                             answered = Some((approval.id, Answer::Allow));
                         }
-                        if ui.button("Always allow").on_hover_text("Allow this command for this agent from now on").clicked() {
+                        if pcbcraft_chrome::controls::button(ui, "Always allow")
+                            .on_hover_text("Allow this command for this agent from now on")
+                            .clicked()
+                        {
                             answered = Some((approval.id, Answer::AlwaysAllow));
                         }
-                        if ui.button("Deny").clicked() {
+                        if pcbcraft_chrome::controls::button(ui, "Deny").clicked() {
                             answered = Some((approval.id, Answer::Deny));
                         }
                     }
                     chat::Source::Agent { options, .. } => {
                         for option in options {
-                            if ui.button(&option.name).clicked() {
+                            if pcbcraft_chrome::controls::button(ui, &option.name).clicked() {
                                 answered = Some((approval.id, Answer::Option(option.id.clone())));
                             }
                         }
-                        if ui.button("Cancel").clicked() {
+                        if pcbcraft_chrome::controls::button(ui, "Cancel").clicked() {
                             answered = Some((approval.id, Answer::Deny));
                         }
                     }
                 });
             });
         }
-        if let Some((id, answer)) = answered {
+        if pcbcraft_chrome::automation::human_input(ui.ctx())
+            && let Some((id, answer)) = answered
+        {
             self.answer(id, answer);
         }
     }
@@ -682,11 +699,11 @@ impl Assistant {
                     .on_disabled_hover_text(format!("Install with: {install}"));
             }
             ui.separator();
-            if ui.button("Add agent…").clicked() {
+            if pcbcraft_chrome::controls::button(ui, "Add agent…").clicked() {
                 self.settings_request = Some(SettingsRequest::Add(Box::default()));
                 ui.close();
             }
-            if ui.button("AI settings…").clicked() {
+            if pcbcraft_chrome::controls::button(ui, "AI settings…").clicked() {
                 self.settings_request = Some(SettingsRequest::Settings);
                 ui.close();
             }
@@ -700,12 +717,12 @@ impl Assistant {
         }
         ui.horizontal_wrapped(|ui| {
             if self.chat.connected() {
-                if ui.button("Disconnect").clicked() {
+                if pcbcraft_chrome::controls::button(ui, "Disconnect").clicked() {
                     self.chat.disconnect();
                 }
             } else {
                 let label = if matches!(self.chat.state, State::Failed(_)) { "Retry" } else { "Connect" };
-                if ui.add_enabled(current.is_some(), egui::Button::new(label)).clicked() {
+                if pcbcraft_chrome::controls::enabled_button(ui, current.is_some(), label).clicked() {
                     self.connect(ui.ctx());
                 }
             }
@@ -721,7 +738,7 @@ impl Assistant {
                 ui.horizontal(|ui| {
                     ui.label("Sign in to continue.");
                     // A terminal or environment sign-in happens outside; the agent restarts to see it.
-                    if ui.button("Retry").on_hover_text("Restart the agent after signing in elsewhere").clicked() {
+                    if pcbcraft_chrome::controls::button(ui, "Retry").on_hover_text("Restart the agent after signing in elsewhere").clicked() {
                         self.connect(ui.ctx());
                     }
                 });
@@ -729,7 +746,7 @@ impl Assistant {
                     for method in methods {
                         match &method.kind {
                             craft_agents::acp::AuthKind::Agent => {
-                                if ui.button(&method.name).on_hover_text(&method.description).clicked() {
+                                if pcbcraft_chrome::controls::button(ui, &method.name).on_hover_text(&method.description).clicked() {
                                     self.chat.sign_in(&method.id);
                                 }
                             }
@@ -750,7 +767,7 @@ impl Assistant {
     /// The agent's own options (model, effort, mode) as it lists them, as SolidCraft's chat header
     /// shows them. A chosen model is remembered for the agent.
     fn option_pickers(&mut self, ui: &mut Ui) {
-        let idle = self.chat.state == State::Ready;
+        let idle = self.chat.state == State::Ready && pcbcraft_chrome::automation::human_input(ui.ctx());
         let mut chosen: Option<(String, String, bool)> = None;
         let mut model = None;
         let mut mode = None;
@@ -759,23 +776,31 @@ impl Assistant {
                 if self.chat.config.is_empty() {
                     if let Some((current, models)) = &self.chat.models {
                         let shown = models.iter().find(|m| &m.id == current).map_or(current.as_str(), |m| m.name.as_str());
-                        egui::ComboBox::from_id_salt("assistant_model").selected_text(format!("Model: {shown}")).show_ui(ui, |ui| {
-                            for m in models {
-                                if ui.selectable_label(&m.id == current, &m.name).on_hover_text(&m.description).clicked() {
-                                    model = Some(m.id.clone());
+                        pcbcraft_chrome::controls::Choice::from_id_salt("assistant_model")
+                            .selected_text(format!("Model: {shown}"))
+                            .show_ui(ui, |ui| {
+                                for m in models {
+                                    if ui.selectable_label(&m.id == current, &m.name).on_hover_text(&m.description).clicked() {
+                                        model = Some(m.id.clone());
+                                    }
                                 }
-                            }
-                        });
+                            })
+                            .response
+                            .accessible_name("Assistant model");
                     }
                     if let Some((current, modes)) = &self.chat.modes {
                         let shown = modes.iter().find(|(id, _)| id == current).map_or(current.as_str(), |(_, name)| name.as_str());
-                        egui::ComboBox::from_id_salt("assistant_mode").selected_text(format!("Mode: {shown}")).show_ui(ui, |ui| {
-                            for (id, name) in modes {
-                                if ui.selectable_label(id == current, name).clicked() {
-                                    mode = Some(id.clone());
+                        pcbcraft_chrome::controls::Choice::from_id_salt("assistant_mode")
+                            .selected_text(format!("Mode: {shown}"))
+                            .show_ui(ui, |ui| {
+                                for (id, name) in modes {
+                                    if ui.selectable_label(id == current, name).clicked() {
+                                        mode = Some(id.clone());
+                                    }
                                 }
-                            }
-                        });
+                            })
+                            .response
+                            .accessible_name("Assistant permission mode");
                     }
                 }
                 for option in &self.chat.config {
@@ -784,20 +809,24 @@ impl Assistant {
                         .iter()
                         .find(|choice| choice.value == option.current_value)
                         .map_or(option.current_value.as_str(), |choice| choice.name.as_str());
-                    egui::ComboBox::from_id_salt(("assistant_option", &option.id)).selected_text(format!("{}: {shown}", option.name)).show_ui(
-                        ui,
-                        |ui| {
+                    pcbcraft_chrome::controls::Choice::from_id_salt(("assistant_option", &option.id))
+                        .selected_text(format!("{}: {shown}", option.name))
+                        .show_ui(ui, |ui| {
                             for choice in &option.options {
                                 let row = ui.selectable_label(choice.value == option.current_value, &choice.name);
                                 if row.on_hover_text(&choice.description).clicked() {
                                     chosen = Some((option.id.clone(), choice.value.clone(), option.category == "model"));
                                 }
                             }
-                        },
-                    );
+                        })
+                        .response
+                        .accessible_name(option.name.clone());
                 }
             });
         });
+        if !pcbcraft_chrome::automation::human_input(ui.ctx()) {
+            return;
+        }
         if let Some((id, value, is_model)) = chosen {
             self.chat.set_option(&id, &value);
             if is_model {
@@ -814,12 +843,15 @@ impl Assistant {
     }
 
     /// Keep the prompt above Send/Stop, retaining typed input while edits are paused.
+    /// Raw Enter submission requires human provenance as well as focus and an editable document.
     /// A library document can provide context even when no project session is open.
     fn composer(&mut self, ui: &mut Ui, _session: &Session, can_edit: bool, has_document: bool) {
+        let human = pcbcraft_chrome::automation::human_input(ui.ctx());
         let running = self.chat.state == State::Running;
         let can_send = has_document && can_edit && self.chat.state == State::Ready && !self.draft.trim().is_empty();
-        let draft_id = egui::Id::new("assistant_draft_input");
+        let draft_id = egui::Id::unique("assistant_draft_input");
         let enter = can_send
+            && human
             && ui.memory(|memory| memory.has_focus(draft_id))
             && ui.input_mut(|input| input.modifiers == egui::Modifiers::NONE && input.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
         ScrollArea::vertical().id_salt("assistant_draft").max_height(96.0).auto_shrink([false, true]).show(ui, |ui| {
@@ -827,6 +859,7 @@ impl Assistant {
                 has_document,
                 TextEdit::multiline(&mut self.draft)
                     .id(draft_id)
+                    .interactive(human)
                     .hint_text("Ask about the document or request a change…")
                     .desired_rows(2)
                     .desired_width(f32::INFINITY)
@@ -835,11 +868,11 @@ impl Assistant {
         });
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if running {
-                if ui.button("Stop").clicked() {
+                if pcbcraft_chrome::controls::button(ui, "Stop").clicked() {
                     self.chat.stop();
                 }
                 ui.spinner();
-            } else if ui.add_enabled(can_send, egui::Button::new("Send")).on_hover_text("Send (Enter)").clicked() || enter {
+            } else if pcbcraft_chrome::controls::enabled_button(ui, can_send, "Send").on_hover_text("Send (Enter)").clicked() || enter {
                 let text = self.draft.trim().to_owned();
                 if self.chat.send(&text) {
                     self.draft.clear();
@@ -890,7 +923,7 @@ fn conversation_item(ui: &mut Ui, item: &Item, agent: &str) {
                 Some(craft_agents::acp::ToolStatus::InProgress) => "Running",
                 Some(craft_agents::acp::ToolStatus::Pending) | None => "Waiting",
             };
-            egui::CollapsingHeader::new(format!("{title} · {status}")).id_salt(("assistant_tool", id)).show(ui, |ui| {
+            pcbcraft_chrome::controls::collapsing(ui, ("assistant_tool", id), &format!("{title} · {status}"), false, None, |ui| {
                 if let Some(input) = input {
                     ui.monospace(input.to_string().chars().take(MAX_TOOL_DETAIL).collect::<String>());
                 }
@@ -1485,6 +1518,122 @@ mod chat_tests {
         Ok(())
     }
 
+    /// Synthetic coordinate clicks and focused-key activation cannot answer or remember a held
+    /// tool request; an ordinary human answer still releases it through the existing gate.
+    #[test]
+    fn synthetic_input_cannot_grant_or_remember_tool_approval() -> Result<(), Box<dyn std::error::Error>> {
+        let (mut h, _script, endpoint) = harness_with_agent()?;
+        open_turn(&mut h);
+        h.state_mut().assistant.settings.agents.ai_permissions = craft_agents::agents::Mode::Ask;
+        thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                let mut remote = Remote::from_token_file(endpoint.0, &endpoint.1).unwrap().with_wait(10);
+                remote.call("engine.execute", json!({"command":"view.fit","params":{"view":0}}))
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while h.state().assistant.chat.approvals.is_empty() && Instant::now() < deadline {
+                h.run_steps(1);
+                thread::sleep(Duration::from_millis(2));
+            }
+            h.run_steps(2);
+            for label in ["Allow", "Always allow"] {
+                let at = h.get_by_label(label).rect().center();
+                pcbcraft_chrome::automation::mark_synthetic_input(&h.ctx, true);
+                h.input_mut().events.extend([
+                    egui::Event::PointerMoved(at),
+                    egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
+                    egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE },
+                ]);
+                h.step();
+                assert_eq!(h.state().assistant.chat.approvals.len(), 1);
+                assert!(!h.state().assistant.always_allowed("view.fit"));
+                assert!(!worker.is_finished());
+                pcbcraft_chrome::automation::mark_synthetic_input(&h.ctx, false);
+                h.run_steps(2);
+            }
+            h.get_by_label("Always allow").focus();
+            h.run_steps(2);
+            pcbcraft_chrome::automation::mark_synthetic_input(&h.ctx, true);
+            h.key_press(egui::Key::Enter);
+            h.run_steps(2);
+            assert_eq!(h.state().assistant.chat.approvals.len(), 1);
+            assert!(!h.state().assistant.always_allowed("view.fit"));
+            pcbcraft_chrome::automation::mark_synthetic_input(&h.ctx, false);
+            h.run_steps(2);
+            h.get_by_label("Always allow").click();
+            h.run_steps(2);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !worker.is_finished() && Instant::now() < deadline {
+                h.step();
+                thread::sleep(Duration::from_millis(2));
+            }
+            assert!(worker.join().unwrap().is_ok());
+        });
+        assert!(h.state().assistant.always_allowed("view.fit"));
+        Ok(())
+    }
+
+    /// Agent-provided approval options use the same human-consent boundary as held MCP calls.
+    #[test]
+    fn synthetic_input_cannot_answer_an_agent_permission_question() -> Result<(), Box<dyn std::error::Error>> {
+        let (mut h, script, _endpoint) = harness_with_agent()?;
+        open_turn(&mut h);
+        push(
+            &script,
+            Event::Permission {
+                key: 42,
+                title: "Run fixture operation".into(),
+                kind: Some("execute".into()),
+                options: vec![option("approve-once", "allow_once"), option("reject-once", "reject_once")],
+            },
+        );
+        h.run_steps(2);
+        h.get_by_label("approve-once").focus();
+        h.run_steps(2);
+        pcbcraft_chrome::automation::mark_synthetic_input(&h.ctx, true);
+        h.key_press(egui::Key::Enter);
+        h.run_steps(2);
+        assert_eq!(h.state().assistant.chat.approvals.len(), 1);
+        assert!(script.lock().map_err(|_| "poisoned")?.answers.is_empty());
+        pcbcraft_chrome::automation::mark_synthetic_input(&h.ctx, false);
+        h.run_steps(2);
+        h.get_by_label("approve-once").click();
+        h.run_steps(2);
+        assert_eq!(script.lock().map_err(|_| "poisoned")?.answers, [(42, Some("approve-once".to_owned()))]);
+        Ok(())
+    }
+
+    /// A focused draft survives synthetic Enter without a prompt, message or turn; ordinary
+    /// Enter still sends it through the existing chat path.
+    #[test]
+    fn synthetic_enter_cannot_send_a_focused_assistant_draft() -> Result<(), Box<dyn std::error::Error>> {
+        let (mut h, script, _endpoint) = harness_with_agent()?;
+        let draft = "Explain this unsent draft";
+        h.state_mut().assistant.draft = draft.to_owned();
+        h.run();
+        let items = h.state().assistant.chat.items.len();
+        let generation = h.state().assistant.generation();
+        let draft_id = egui::Id::unique("assistant_draft_input");
+        h.ctx.memory_mut(|memory| memory.request_focus(draft_id));
+        pcbcraft_chrome::automation::mark_synthetic_input(&h.ctx, true);
+        h.key_press(egui::Key::Enter);
+        h.run_steps(2);
+        assert!(script.lock().map_err(|_| "poisoned")?.prompts.is_empty());
+        assert_eq!(h.state().assistant.draft, draft);
+        assert_eq!(h.state().assistant.chat.items.len(), items);
+        assert_eq!(h.state().assistant.generation(), generation);
+        assert!(!h.state().assistant.turn_open());
+        pcbcraft_chrome::automation::mark_synthetic_input(&h.ctx, false);
+        h.run();
+        h.ctx.memory_mut(|memory| memory.request_focus(draft_id));
+        h.key_press(egui::Key::Enter);
+        h.run_steps(2);
+        assert_eq!(script.lock().map_err(|_| "poisoned")?.prompts, [draft]);
+        assert!(h.state().assistant.draft.is_empty());
+        assert!(h.state().assistant.turn_open());
+        Ok(())
+    }
+
     /// Each request's first line and body, in order.
     type Seen = Arc<Mutex<Vec<(String, String)>>>;
 
@@ -1573,6 +1722,16 @@ mod chat_tests {
         let body: Value = serde_json::from_str(&seen[1].1)?;
         assert_eq!(body["model"], "test-model");
         assert!(body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message| message["content"] == "hi")), "{body}");
+
+        // Disconnecting removes the agent's working folder once the tools bridge has ended (#218;
+        // cargo puts `pcbcraft-cli` on PATH for tests when it is built, so the bridge runs then).
+        let workdir = harness.state().assistant.chat.workdir_path().ok_or("connected chats have a working folder")?;
+        harness.state_mut().assistant.chat.disconnect();
+        let deadline = Instant::now() + chat::WORKDIR_RELEASE_LIMIT;
+        while workdir.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!workdir.exists(), "{} was left behind", workdir.display());
         Ok(())
     }
 }

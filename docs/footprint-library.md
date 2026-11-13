@@ -10,13 +10,15 @@ catalog or fetching its source URL.
 ## Assigning and placing a package
 
 From a schematic symbol's context menu, choose **Assign Footprint…**. In PCB
-layout, **Layout → Components → Footprints** opens the same chooser for the
+layout, **Layout → Place → Footprint** opens the same chooser for the
 project's components, including components not yet placed on the board. A
 schematic-only project can assign packages before creating a PCB. Search
 and choose a package, then review the editable pad choices for each logical terminal.
 The chooser shows the library, item, revision, license and dimensional source.
-**Assign** validates a complete bijection and pins the exact definition and map;
-it creates no copper, placement ID or board coordinates. The schematic wiring
+Each terminal may select several pads; **Unconnected pads** explicitly accounts
+for remaining pads. **Assign** validates complete coverage and exclusive pad
+ownership, then pins the exact definition and map. It creates no copper,
+placement ID or board coordinates. The schematic wiring
 and reference stay unchanged.
 
 Assignments survive folder/archive save and offline reopen without a board.
@@ -29,8 +31,10 @@ package and placing it are separate undo steps. A modified chooser must apply
 its assignment before it can place; a stale form closes without changing data.
 
 `pcb.assign_footprint` accepts an optional board UUID, a stable `component` ID,
-`library`, `definition`, `definition_revision`, explicit `mapping` and
-`expected_revision`. `pcb.place_assigned_footprint` takes the board/component,
+`library`, `definition`, `definition_revision`, explicit `mapping`, optional
+`unconnected_pads` and `expected_revision`. Mapping values are a pad ID or a
+nonempty pad-ID list. Native part instances open their package/requirements
+form so the selected package retains its definition-owned map. `pcb.place_assigned_footprint` takes the board/component,
 `x_nm`, `y_nm` and revision, resolving solely from the project. Both use the same
 engine command catalog in GUI, live and headless MCP. `inspect_project` reports
 `project.footprint_assignments` with `placed` status and a null `board` for
@@ -58,10 +62,11 @@ incompatible numbering still requires an explicit mapping.
 The Preferences-style mapping section separates **Symbol terminal** from
 **Footprint pad** in aligned columns. **Match numbers** explicitly replaces the
 mapping with equal identifiers, which can differ from a package's library default.
-The chooser does not register
-folders, import external footprints or create library parts. Those source and
-library workflows remain under #92/#28. This slice supports the original starter
-packages and physical definitions already pinned into an opened project.
+The chooser includes original starter packages, project-pinned physical definitions
+and footprints from loaded native sources. Folder registration and native bundle
+uploads use the separate Library sources manager, described in the
+[native source guide](native-library-sources.md) and #92/#28. External-format
+import and library-part creation remain separate workflows.
 
 ## Packages and sources
 
@@ -94,6 +99,10 @@ The starter NPN symbol uses 1 Base, 2 Emitter and 3 Collector, matching
 16-Feb-2024. Q1 in the demo is an unwired package example.
 
 ## Definition and placement contract
+
+The [footprint format specification](footprint-schema.md) defines field ownership,
+reference defaults and overrides, coordinate transforms and compatibility, with
+machine-readable schemas for canonical definitions and physical placements.
 
 A `pcbcraft-footprint/1` document has `library`, `id`, positive `revision`, `name`,
 `license`, `source`, `pads` and `graphics`. `source` records `kind: "original"`,
@@ -133,9 +142,11 @@ neither the project nor its undo history.
 
 Board instances carry the pinned identity, mapping, origin and optional rotation;
 geometry remains in the definition. Rotation transforms pad centers and every
-rectangle corner together. Quarter turns retain exact integer coordinates;
-other whole-degree angles round to the nearest nanometer. Fit and hit bounds
-include the physical graphics. Surface copper renders on the front/component
+rectangle corner together. Coordinates use board axes with positive Y down.
+A 90-degree counterclockwise footprint rotation maps local `(x, y)` to `(y, -x)`
+after side mirroring. Quarter turns retain exact integer coordinates, and other
+whole-degree angles round to the nearest nanometer. Fit and hit bounds include
+the physical graphics. Surface copper renders on the front/component
 side, independently of the active layer; hiding front copper hides these SMD
 pads. The engine projects each physical pad's copper membership as explicit layer
 UUIDs in physical stack order. Plated lands span all copper layers, remain visible
@@ -199,6 +210,31 @@ specifies nominal capital height; curves retain the font's optical overshoot.
 Stroke width and minimum ink spacing remain physical quantities. The earlier
 `pcbcraft-stroke-1` geometry and legacy rectangle graphics remain available for
 older pinned definitions without changing their saved data.
+
+The optional `reference_offset` adds a local X/Y displacement to the automatic
+anchor. In the Footprint Editor, select **Definition**, enable **Generate
+silkscreen reference**, and set the offsets in Properties. The canvas previews
+the template as `REF`. A board placement can add its own offset, and its
+component still supplies the printed reference text.
+
+Selecting reference lettering opens **Silkscreen text** in PCB Properties. The
+component reference remains visible alongside **Printed text**, font, size,
+stroke width, local rotation, alignment, visibility and offsets. Clear **Use
+part reference** to print local words such as `Power input`. These edits
+belong to the placed footprint and its Gerber ink. **Rename… → Rename part**
+explicitly changes the shared component reference through its validated command,
+including the schematic. A local text literal retains its wording across a
+component rename. **Reset silkscreen** restores inherited wording and appearance.
+Body selection offers **Edit silkscreen text** to recover hidden lettering.
+A dashed view-only leader connects selected or moving text to its footprint,
+independently of unrouted electrical airwires. Selection lightens the copper and
+technical-layer colors, including the generated reference and fixed silkscreen.
+The Properties fields use aligned label/value columns; position offsets expand
+under **Position**, and Apply/Reset remain below the scrolling fields in short
+windows. Editing a dimension creates its local size override automatically.
+Fixed footprint silkscreen paths and artwork still belong to the pinned library
+definition; these reference controls do not provide individual board-instance
+editing of those objects.
 
 Passive footprints use two short silk lines outside the pads, LEDs a cathode
 bar, and SOT-23 a clipped body outline and an external triangular pad-1 marker.

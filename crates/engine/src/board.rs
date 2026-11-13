@@ -8,18 +8,28 @@ use std::{
 };
 
 pub mod assignment;
+pub mod clearance;
+pub mod clipboard;
 pub mod definition;
 pub mod drawing;
+pub mod drc;
+pub mod fabrication;
+pub mod geometry;
 pub mod identity;
 pub mod materials;
 pub mod outline;
 pub mod ratsnest;
+pub mod reference;
+pub mod rules;
 pub mod setup;
+#[cfg(test)]
+mod side_tests;
 pub mod silkscreen;
 pub mod track;
-mod transform;
+pub(crate) mod transform;
 pub mod update;
 pub mod view;
+pub mod work;
 
 pub(crate) const FOOTPRINT_DEFINITION: &str = "generic-through-hole-2";
 pub(crate) const FOOTPRINT_REVISION: u32 = 1;
@@ -66,13 +76,35 @@ pub(crate) struct Footprint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) library: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) mapping: Option<BTreeMap<String, String>>,
+    pub(crate) mapping: Option<BTreeMap<String, crate::library::parts::PadIds>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) unconnected_pads: Vec<String>,
     #[serde(default, skip_serializing_if = "zero_pad")]
     pub(crate) pin_1_pad: u8,
     pub(crate) x_nm: i64,
     pub(crate) y_nm: i64,
     #[serde(default, skip_serializing_if = "zero_rotation")]
     pub(crate) rotation: u16,
+    /// Placed on the bottom side: local X is mirrored before rotation, and component-side pads
+    /// and technical graphics use the back layers. Omitted for top-side placements.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) bottom: bool,
+    /// Additional reference displacement from the library default in footprint-local coordinates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reference_offset: Option<Point>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "reference::present")]
+    pub(crate) reference_text: Option<reference::Text>,
+}
+
+/// Maximum displacement of a footprint reference along either local axis, in nanometers.
+pub const MAX_REFERENCE_OFFSET_NM: i64 = definition::MAX_OFFSET_NM;
+
+/// Zero displacement inherits the library reference default and needs no saved override.
+pub const DEFAULT_REFERENCE_OFFSET: Point = Point { x_nm: 0, y_nm: 0 };
+
+/// Validate a local reference displacement for either a definition or a placement.
+pub(crate) fn valid_reference_offset(offset: Point) -> bool {
+    [offset.x_nm, offset.y_nm].into_iter().all(|n| (-MAX_REFERENCE_OFFSET_NM..=MAX_REFERENCE_OFFSET_NM).contains(&n))
 }
 /// Preserve omitted orientation on legacy records.
 fn zero_rotation(rotation: &u16) -> bool {
@@ -93,10 +125,14 @@ impl Footprint {
             definition_revision: FOOTPRINT_REVISION,
             library: None,
             mapping: None,
+            unconnected_pads: Vec::new(),
             pin_1_pad,
             x_nm: position.x_nm,
             y_nm: position.y_nm,
             rotation: 0,
+            bottom: false,
+            reference_offset: None,
+            reference_text: None,
         }
     }
     /// Validate placement vocabulary, bounded origin and whole-degree orientation; the board
@@ -115,21 +151,31 @@ impl Footprint {
                     && self.definition_revision == FOOTPRINT_REVISION
                     && (1..=2).contains(&self.pin_1_pad)
                     && self.mapping.is_none()
+                    && self.unconnected_pads.is_empty()
             }
         };
         identity
             && self.rotation < 360
             && (-MAX_CENTER_NM..=MAX_CENTER_NM).contains(&self.x_nm)
             && (-MAX_CENTER_NM..=MAX_CENTER_NM).contains(&self.y_nm)
+            && self.reference_offset.is_none_or(|offset| offset != DEFAULT_REFERENCE_OFFSET && valid_reference_offset(offset))
+            && self.reference_text.as_ref().is_none_or(|text| self.library.is_some() && text.validate().is_ok())
     }
     /// Resolve the pinned library identity; legacy marker geometry is explicit compatibility behavior.
     pub(crate) fn key(&self) -> Option<definition::Key> {
         Some((self.library.clone()?, self.definition.clone(), self.definition_revision))
     }
-    /// Locate a mapped physical pad from a logical terminal, preserving explicit permutation.
+    /// Enumerate every physical land belonging to a logical terminal; NC pads have no terminal.
+    fn pads_for(&self, pin: &str) -> Vec<PinNumber> {
+        if let Some(mapping) = &self.mapping {
+            return mapping.get(pin).into_iter().flat_map(|pads| pads.pads()).filter_map(|pad| PinNumber::new(pad)).collect();
+        }
+        self.pad_for(pin).into_iter().collect()
+    }
+    /// Locate a representative pad for cross-probing, preserving explicit permutation.
     fn pad_for(&self, pin: &str) -> Option<PinNumber> {
         if let Some(mapping) = &self.mapping {
-            return PinNumber::new(mapping.get(pin)?);
+            return PinNumber::new(mapping.get(pin)?.first()?);
         }
         let number = match pin {
             "1" => self.pin_1_pad,
@@ -141,17 +187,19 @@ impl Footprint {
     /// Find the logical terminal associated with a physical pad, without numeric conversion.
     fn component_pin(&self, pad: PinNumber) -> Option<(u64, &str)> {
         if let Some(mapping) = &self.mapping {
-            return mapping.iter().find(|(_, number)| number.as_str() == pad.as_str()).map(|(pin, _)| (self.component, pin.as_str()));
+            return mapping.iter().find(|(_, number)| number.contains(pad.as_str())).map(|(pin, _)| (self.component, pin.as_str()));
         }
         match pad.as_str() {
             "1" | "2" => Some((self.component, if pad.as_str() == self.pin_1_pad.to_string() { "1" } else { "2" })),
             _ => None,
         }
     }
-    /// Transform a local point around the footprint origin. Quarter turns are exact; other
-    /// whole-degree rotations round local offsets to the nearest nanometer without accumulation.
+    /// Transform a local point around the footprint origin: mirror X for a bottom-side placement,
+    /// then rotate. Quarter turns are exact; other whole-degree rotations round local offsets to
+    /// the nearest nanometer without accumulation.
     pub(crate) fn point(&self, local: Point) -> Point {
-        let (x, y) = rotate(local.x_nm, local.y_nm, self.rotation);
+        let local_x = if self.bottom { -local.x_nm } else { local.x_nm };
+        let (x, y) = rotate(local_x, local.y_nm, self.rotation);
         Point { x_nm: self.x_nm + x, y_nm: self.y_nm + y }
     }
     /// Locate a real pad center from the pinned definition, or the legacy marker's known pitch.
@@ -172,20 +220,42 @@ impl Footprint {
     pub(crate) fn inspect(&self, project: &crate::Project) -> Value {
         let mut value = json!({"id":format!("footprint-{}",self.id),"board":project.board_target().map(|target|target.board),
             "component":format!("component-{}",self.component),"definition":self.definition,"definition_revision":self.definition_revision,
-            "x_nm":self.x_nm,"y_nm":self.y_nm,"rotation":self.rotation,
+            "x_nm":self.x_nm,"y_nm":self.y_nm,"rotation":self.rotation,"side":if self.bottom {"back"} else {"front"},
             "pins":project.board.pad_numbers(self).into_iter().filter_map(|pad| {
                 let point=self.pad_position(pad,&project.board)?;
-                let (_,pin)=self.component_pin(pad)?;
+                let pin=self.component_pin(pad).map(|(_, pin)| pin);
                 let mut record=json!({"pad":Pad{board:project.board_target().map(|target|target.board),footprint:self.id,number:pad}.inspect(),
-                    "terminal":project.component_terminal(self.component,pin).map(Terminal::inspect),"x_nm":point.x_nm,"y_nm":point.y_nm});
+                    "terminal":pin.and_then(|pin|project.component_terminal(self.component,pin)).map(Terminal::inspect),"x_nm":point.x_nm,"y_nm":point.y_nm});
+                if self.unconnected_pads.iter().any(|number| number == pad.as_str()) {
+                    record["unconnected"] = json!(true);
+                }
                 if let Some(definition)=project.board.definition_for(self).and_then(|definition|definition.pads.iter().find(|item|item.number==pad.as_str())) {
-                    record["copper_layers"]=json!(view::CopperLayers::resolve(project.board.setup.as_ref(),definition.copper));
+                    record["copper_layers"]=json!(view::CopperLayers::resolve(project.board.setup.as_ref(),definition.copper,self.bottom));
                 }
                 Some(record)
             }).collect::<Vec<_>>()});
         if let Some(library) = &self.library {
             value["library"] = json!(library);
             value["mapping"] = json!(self.mapping);
+            if !self.unconnected_pads.is_empty() {
+                value["unconnected_pads"] = json!(self.unconnected_pads);
+            }
+        }
+        if let Some(offset) = self.reference_offset {
+            value["reference_offset"] = json!(offset);
+        }
+        if let Some(text) = &self.reference_text {
+            value["reference_text"] = json!(text);
+        }
+        if let Some(definition) = project.board.definition_for(self) {
+            let name = project
+                .components
+                .get(&self.component)
+                .map(|component| component.reference())
+                .or_else(|| project.board.baseline.as_ref()?.components.get(&self.component).map(|component| component.reference.as_str()))
+                .unwrap_or_default();
+            value["reference_appearance"] =
+                json!(reference::Resolved::new(Some(definition), name, project.board.silkscreen.unwrap_or_default(), self.reference_text.as_ref()));
         }
         if let Some(baseline) = &project.board.baseline {
             let pending_removal = !project.component_is_board_eligible(self.component);
@@ -198,8 +268,10 @@ impl Footprint {
     }
 }
 
-/// Rotate a bounded local footprint offset, with exact quarter turns and nearest-nanometer output.
-pub(crate) fn rotate(x: i64, y: i64, degrees: u16) -> (i64, i64) {
+/// Rotate a bounded local footprint offset counterclockwise in board coordinates (positive Y
+/// points down). Whole-degree angles use nearest-nanometer output; quarter turns are exact.
+/// Shared by resolved footprint geometry and disposable editor previews.
+pub fn rotate(x: i64, y: i64, degrees: u16) -> (i64, i64) {
     if degrees.is_multiple_of(90) {
         return crate::schematic::rotate(x, y, (degrees / 90) as u8);
     }
@@ -217,6 +289,7 @@ pub(crate) struct Board {
     pub(crate) drawings: Option<drawing::Drawings>,
     pub(crate) setup: Option<setup::BoardSetup>,
     pub(crate) silkscreen: Option<silkscreen::Settings>,
+    pub(crate) rules: Option<rules::Settings>,
     /// Copper segments in stable ID order; empty boards keep their earlier saved format.
     pub(crate) tracks: Vec<track::Track>,
     /// Through vias in stable ID order, saved beside tracks.
@@ -252,10 +325,7 @@ impl Board {
         let Some(mapping) = &footprint.mapping else {
             return false;
         };
-        mapping.len() == definition.pads.len()
-            && mapping.len() == symbol.pins().len()
-            && mapping.keys().map(String::as_str).collect::<BTreeSet<_>>() == symbol.pins().iter().map(|p| p.number.as_str()).collect()
-            && mapping.values().map(String::as_str).collect::<BTreeSet<_>>() == definition.pads.iter().map(|p| p.number.as_str()).collect()
+        crate::library::parts::mapping::validate(mapping, &footprint.unconnected_pads, symbol, definition).is_ok()
     }
     /// Append a placement after identity, mapping shape and definition resolution succeed.
     pub(crate) fn append(&mut self, footprint: Footprint) -> Result<(), &'static str> {
@@ -277,20 +347,24 @@ impl Board {
     }
     /// Drop obsolete unaccepted state. An enabled baseline retains accepted placements
     /// and their historical assets until a reviewed update; Undo restores either case.
-    pub(crate) fn remove_component(&mut self, component: u64, display: Option<(&str, &str)>) {
+    /// Format-3 history also retains the last visible typed quantity; older history
+    /// stays text-only until a real board update accepts the newer vocabulary.
+    pub(crate) fn remove_component(&mut self, component: u64, display: Option<&crate::PartInstance>) {
         let assigned = self.assignments.remove(&component).is_some();
-        let changed_display = display.filter(|(reference, value)| {
-            self.baseline
-                .as_ref()
-                .and_then(|baseline| baseline.components.get(&component))
-                .is_some_and(|historical| historical.reference != *reference || historical.value != *value)
+        let changed_display = display.and_then(|part| {
+            let baseline = self.baseline.as_ref()?;
+            let historical = baseline.components.get(&component)?;
+            let quantity = if baseline.format == update::QUANTITY_FORMAT { update::PartInstanceState::quantity_for(part) } else { None };
+            (historical.reference != part.reference() || historical.value != part.value() || historical.primary_quantity != quantity)
+                .then_some((part, quantity))
         });
-        if let Some((reference, value)) = changed_display
+        if let Some((part, quantity)) = changed_display
             && let Some(baseline) = self.baseline.as_mut()
             && let Some(historical) = Arc::make_mut(baseline).components.get_mut(&component)
         {
-            historical.reference = reference.to_owned();
-            historical.value = value.to_owned();
+            historical.reference = part.reference().into();
+            historical.value = part.value().into();
+            historical.primary_quantity = quantity;
         }
         if self.baseline.as_ref().is_some_and(|baseline| baseline.components.contains_key(&component)) {
             let used = self.used_package_keys();
@@ -346,7 +420,7 @@ impl Board {
 }
 
 /// Parse bounded terminal-to-pad mappings before schema dispatch; resolution checks actual identities.
-pub(crate) fn parse_mapping(value: &Value) -> Option<BTreeMap<String, String>> {
+pub(crate) fn parse_mapping(value: &Value) -> Option<BTreeMap<String, crate::library::parts::PadIds>> {
     let object = value.as_object()?;
     if object.is_empty() || object.len() > 128 {
         return None;
@@ -354,10 +428,9 @@ pub(crate) fn parse_mapping(value: &Value) -> Option<BTreeMap<String, String>> {
     object
         .iter()
         .map(|(terminal, pad)| {
-            let pad = pad.as_str()?;
             PinNumber::new(terminal)?;
-            PinNumber::new(pad)?;
-            Some((terminal.clone(), pad.to_owned()))
+            let pads: crate::library::parts::PadIds = serde_json::from_value(pad.clone()).ok()?;
+            pads.valid().then(|| (terminal.clone(), crate::library::parts::PadIds::from(pads.pads().to_vec())))
         })
         .collect()
 }

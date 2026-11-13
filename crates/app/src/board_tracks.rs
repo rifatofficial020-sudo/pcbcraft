@@ -1,11 +1,21 @@
 //! Copper track and via routing and selection. Previews are view-local; every completed edit is an engine command.
-use crate::{board_drawing::Command, canvas_camera::Camera, editor_view::ViewInput};
+use crate::{
+    board_appearance::{Appearance, CopperFocus, RouteContact},
+    board_drawing::Command,
+    canvas_camera::Camera,
+    editor_view::ViewInput,
+};
 use egui::{PointerButton, Pos2, Rect, Response, Ui};
+use pcbcraft_chrome::{
+    MenuItem,
+    menu::{self, MenuIcon},
+    workspace::ToolIcon,
+};
 use pcbcraft_engine::{
     board::{
         setup::{LayerPurpose, Side},
         track::{DEFAULT_VIA_DIAMETER_NM, DEFAULT_VIA_DRILL_NM, DEFAULT_WIDTH_NM, MAX_PATH_POINTS, Track, Via},
-        view::{BoardView, CopperLayers},
+        view::{BoardTarget, BoardView, CopperLayers},
     },
     schematic::Point,
 };
@@ -13,8 +23,12 @@ use serde_json::json;
 use std::collections::BTreeSet;
 use uuid::Uuid;
 
+mod preparation;
+
 /// Screen distance within which the pointer snaps to a pad center, track end or via.
 const SNAP_PX: f32 = 8.;
+/// A free routing point follows the pointer when the nearest grid point is farther away.
+const GRID_SNAP_PX: f32 = 8.;
 /// Minimum screen half-width used to pick a thin track or small via.
 const PICK_PX: f32 = 4.;
 
@@ -23,6 +37,8 @@ const PICK_PX: f32 = 4.;
 #[derive(Clone, Debug)]
 struct Draft {
     source: ViewInput,
+    /// Existing copper that stays emphasized until the draft ends.
+    contact: Option<RouteContact>,
     /// The layer the first segment runs on.
     start: String,
     /// The layer the next segment will run on.
@@ -57,10 +73,35 @@ struct Committed {
     vias: Vec<Point>,
 }
 
+/// A rigid move of the selected tracks and vias, captured with its input authority. A drag
+/// completes on release; an M move completes on the next click.
+#[derive(Clone, Debug)]
+struct MoveDraft {
+    source: ViewInput,
+    anchor: Point,
+    offset: (i64, i64),
+    drag: bool,
+}
+
+/// D: one segment follows the pointer while segments touching its ends on the same layer
+/// stretch to stay attached, until a click commits the new ends.
+#[derive(Clone, Debug)]
+struct SegmentDrag {
+    source: ViewInput,
+    track: Uuid,
+    anchor: Point,
+    offset: (i64, i64),
+}
+
 /// Independent route tool, sizes and track/via selection for one board view, never saved in files.
 #[derive(Debug)]
 pub(super) struct State {
+    preparation: preparation::Preparation,
+    retry_route: Option<Draft>,
+    rules_source: Option<(BoardTarget, Option<pcbcraft_engine::board::rules::Settings>)>,
     pub(super) tool: bool,
+    /// Place › Via: each click places one standalone via until Esc or right-click.
+    pub(super) via_tool: bool,
     pub(super) width_nm: i64,
     pub(super) via_diameter_nm: i64,
     pub(super) via_drill_nm: i64,
@@ -71,6 +112,20 @@ pub(super) struct State {
     pub(super) backspace_requested: bool,
     pub(super) posture_requested: bool,
     pub(super) via_requested: bool,
+    /// PgUp/PgDn mid-route: drop a via and continue on that side's copper.
+    pub(super) via_side_requested: Option<Side>,
+    /// M with copper selected and no footprint selected: move the selected tracks and vias.
+    pub(super) move_requested: bool,
+    /// U: select every track and via joined by copper to the hovered or selected copper.
+    pub(super) connected_requested: bool,
+    moving: Option<MoveDraft>,
+    /// D over a segment: drag it with its attached neighbors stretching.
+    pub(super) drag_segment_requested: bool,
+    segment: Option<SegmentDrag>,
+    /// New ends just submitted by a segment drag, painted until the engine applies them.
+    committed_ends: Vec<(Uuid, Point, Point)>,
+    /// The displacement just submitted for the selection, painted until the engine applies it.
+    committed_move: Option<(i64, i64)>,
     /// Leave each vertex on a 45° diagonal first, then run straight. Toggled with `/`.
     diagonal_first: bool,
     draft: Option<Draft>,
@@ -80,7 +135,11 @@ pub(super) struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
+            preparation: Default::default(),
+            retry_route: None,
+            rules_source: None,
             tool: false,
+            via_tool: false,
             width_nm: DEFAULT_WIDTH_NM,
             via_diameter_nm: DEFAULT_VIA_DIAMETER_NM,
             via_drill_nm: DEFAULT_VIA_DRILL_NM,
@@ -90,6 +149,14 @@ impl Default for State {
             backspace_requested: false,
             posture_requested: false,
             via_requested: false,
+            via_side_requested: None,
+            move_requested: false,
+            connected_requested: false,
+            moving: None,
+            drag_segment_requested: false,
+            segment: None,
+            committed_ends: Vec::new(),
+            committed_move: None,
             diagonal_first: false,
             draft: None,
             committed: None,
@@ -107,37 +174,218 @@ pub(super) struct Interaction {
 }
 
 impl State {
+    /// Refresh preferred sizes when switching boards or changing saved rules. Explicit local
+    /// size choices survive ordinary edits; a rule change resets them and invalidates drafts.
+    pub(super) fn sync_rules(&mut self, board: BoardView<'_>) {
+        let key = (board.target, board.authored_rules().cloned());
+        if self.rules_source.as_ref() == Some(&key) {
+            return;
+        }
+        let target_changed = self.rules_source.as_ref().is_some_and(|(target, _)| *target != key.0);
+        if target_changed || key.1.is_some() || self.rules_source.as_ref().is_some_and(|(_, rules)| rules.is_some()) {
+            let values = board.effective_rules().values;
+            self.width_nm = values.preferred_track_width_nm;
+            self.via_diameter_nm = values.preferred_via_diameter_nm;
+            self.via_drill_nm = values.preferred_via_drill_nm;
+        }
+        self.rules_source = Some(key);
+    }
     /// Arm the route tool with no authored changes; the first click captures revision and layer.
     pub(super) fn start(&mut self) {
         self.cancel();
         self.tool = true;
         self.selected.clear();
     }
+    /// Arm Place › Via with no authored changes; each click captures the current revision.
+    pub(super) fn start_via(&mut self) {
+        self.cancel();
+        self.via_tool = true;
+        self.selected.clear();
+    }
     /// Drop the tool, any unfinished route and pending key requests. Selection and sizes remain.
     pub(super) fn cancel(&mut self) {
+        self.preparation.cancel();
+        self.retry_route = None;
+        self.committed = None;
+        self.committed_ends.clear();
+        self.committed_move = None;
         self.tool = false;
+        self.via_tool = false;
         self.draft = None;
         self.delete_requested = false;
         self.finish_requested = false;
         self.backspace_requested = false;
         self.posture_requested = false;
         self.via_requested = false;
+        self.via_side_requested = None;
+        self.move_requested = false;
+        self.connected_requested = false;
+        self.moving = None;
+        self.drag_segment_requested = false;
+        self.segment = None;
     }
     /// Escape drops an unfinished route first, then exits the tool, then clears the selection.
     /// Returns false when there was nothing to escape.
     pub(super) fn escape(&mut self) -> bool {
-        if self.draft.take().is_some() {
+        if self.preparation.committing() {
+            self.preparation.cancel();
+            self.retry_route = None;
+            self.committed = None;
+            self.committed_ends.clear();
+            self.committed_move = None;
             return true;
         }
-        if std::mem::take(&mut self.tool) {
+        self.preparation.cancel();
+        if self.draft.take().is_some() || self.moving.take().is_some() || self.segment.take().is_some() {
+            return true;
+        }
+        if std::mem::take(&mut self.tool) | std::mem::take(&mut self.via_tool) {
             return true;
         }
         !std::mem::take(&mut self.selected).is_empty()
     }
-    /// Whether the tool or an unfinished route owns canvas input.
-    pub(super) fn busy(&self) -> bool {
-        self.tool || self.draft.is_some()
+    /// Whether a route is in progress, so layer keys should place a via instead.
+    pub(super) fn routing(&self) -> bool {
+        self.draft.is_some()
     }
+
+    /// The contact at the start of the unfinished route, if it started on copper.
+    pub(super) fn route_contact(&self) -> Option<&RouteContact> {
+        self.draft.as_ref()?.contact.as_ref()
+    }
+    /// Whether a tool, unfinished route or accepted pending commit owns canvas input.
+    pub(super) fn busy(&self) -> bool {
+        self.tool || self.via_tool || self.draft.is_some() || self.moving.is_some() || self.segment.is_some() || self.preparation.committing()
+    }
+    /// Current preparation state for the focused route's status bar.
+    pub(super) fn preparation_status(&self) -> Option<String> {
+        self.preparation.status()
+    }
+    /// Property controls remain read-only until the accepted copper edit is published or canceled.
+    pub(super) fn committing(&self) -> bool {
+        self.preparation.committing()
+    }
+
+    /// The displacement to paint selected copper with: a move in progress, or one just submitted.
+    fn shift(&self) -> Option<(i64, i64)> {
+        self.moving.as_ref().map(|moving| moving.offset).or(self.committed_move)
+    }
+}
+
+/// Which copper the selection filters allow picking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Kinds {
+    pub(super) tracks: bool,
+    pub(super) vias: bool,
+}
+
+impl Kinds {
+    /// Every kind, for lookups that are not selection, such as net highlighting.
+    pub(super) const ALL: Self = Self { tracks: true, vias: true };
+}
+
+/// The topmost visible via or track under a screen point, among the allowed kinds.
+pub(super) fn copper_at(pointer: Pos2, camera: &Camera, rect: Rect, view: BoardView<'_>, hidden: &BTreeSet<String>, kinds: Kinds) -> Option<Uuid> {
+    let via = view.vias().iter().rev().filter(|_| kinds.vias).find(|via| hit_via(pointer, camera, rect, via)).map(|via| via.id);
+    via.or_else(|| {
+        view.tracks()
+            .iter()
+            .rev()
+            .filter(|track| kinds.tracks && !hidden.contains(&track.layer.to_string()))
+            .find(|track| hit(pointer, camera, rect, track))
+            .map(|track| track.id)
+    })
+}
+
+/// Whether a press here would start a copper drag rather than a box selection.
+pub(super) fn copper_under(pointer: Pos2, camera: &Camera, rect: Rect, view: BoardView<'_>, hidden: &BTreeSet<String>, kinds: Kinds) -> bool {
+    copper_at(pointer, camera, rect, view, hidden, kinds).is_some()
+}
+
+/// Where `p` projects onto `track`, as a fraction from its start (0) to its end (1), and how far
+/// it lies from that point in nanometers.
+fn projection(p: Point, track: &Track) -> (f64, f64) {
+    let (ax, ay, bx, by) = (track.start.x_nm as f64, track.start.y_nm as f64, track.end.x_nm as f64, track.end.y_nm as f64);
+    let (dx, dy, px, py) = (bx - ax, by - ay, p.x_nm as f64 - ax, p.y_nm as f64 - ay);
+    let length = dx * dx + dy * dy;
+    let t = if length > 0. { ((px * dx + py * dy) / length).clamp(0., 1.) } else { 0. };
+    (t, (px - t * dx).hypot(py - t * dy))
+}
+
+/// Whether `p`, on copper `width_nm` wide, overlaps `track`'s copper.
+fn touches(p: Point, width_nm: i64, track: &Track) -> bool {
+    projection(p, track).1 <= (width_nm + track.width_nm) as f64 / 2.
+}
+
+/// New ends for a segment drag of `track` by `offset`, listing only tracks that change.
+///
+/// The dragged segment moves by `offset`, except that an end meeting the middle of another
+/// track on its layer is held there, so the segment pivots and that junction stays attached.
+/// Every other track on the layer whose end touches the dragged segment, at one of its ends or
+/// along it, follows that point to the same place on the moved segment. Empty when nothing
+/// would move, such as when both ends are held.
+fn dragged_ends(view: BoardView<'_>, track: Uuid, offset: (i64, i64)) -> Vec<(Uuid, Point, Point)> {
+    let tracks = view.tracks();
+    let Some(dragged) = tracks.iter().find(|t| t.id == track) else { return Vec::new() };
+    let others: Vec<&Track> = tracks.iter().filter(|t| t.id != track && t.layer == dragged.layer).collect();
+    // Ends of other tracks that touch the dragged segment stretch with it rather than hold it.
+    let attached = |other: &Track| touches(other.start, other.width_nm, dragged) || touches(other.end, other.width_nm, dragged);
+    let held = |p: Point| others.iter().any(|other| !attached(other) && touches(p, dragged.width_nm, other));
+    let shift = |p: Point| if held(p) { (0, 0) } else { offset };
+    let (from, to) = (shift(dragged.start), shift(dragged.end));
+    if (from, to) == ((0, 0), (0, 0)) {
+        return Vec::new();
+    }
+    let add = |p: Point, (dx, dy): (i64, i64)| Point { x_nm: p.x_nm.saturating_add(dx), y_nm: p.y_nm.saturating_add(dy) };
+    // A point on the dragged segment moves by the blend of its ends' moves at its position.
+    let follow = |p: Point| {
+        let t = if p == dragged.start {
+            0.
+        } else if p == dragged.end {
+            1.
+        } else {
+            projection(p, dragged).0
+        };
+        let blend = |a: i64, b: i64| a + ((b - a) as f64 * t).round() as i64;
+        add(p, (blend(from.0, to.0), blend(from.1, to.1)))
+    };
+    let mut out = vec![(dragged.id, add(dragged.start, from), add(dragged.end, to))];
+    for other in others {
+        let ends = [other.start, other.end].map(|p| if touches(p, other.width_nm, dragged) { follow(p) } else { p });
+        if ends != [other.start, other.end] {
+            out.push((other.id, ends[0], ends[1]));
+        }
+    }
+    out
+}
+
+/// Every track and via sharing a copper island with any of `seeds`.
+fn connected(view: BoardView<'_>, seeds: &BTreeSet<Uuid>) -> BTreeSet<Uuid> {
+    let copper = view.copper();
+    let islands: BTreeSet<_> = seeds.iter().filter_map(|id| copper.tracks.get(id).or_else(|| copper.vias.get(id))).copied().collect();
+    copper.tracks.iter().chain(&copper.vias).filter(|(_, island)| islands.contains(island)).map(|(id, _)| *id).collect()
+}
+
+/// Whether the board has the two copper layers a through via needs.
+pub(super) fn can_place_via(view: BoardView<'_>) -> bool {
+    view.setup().is_some_and(|setup| setup.layers().iter().filter(|layer| layer.purpose == LayerPurpose::Copper).count() >= 2)
+}
+
+/// Snap to the nearest pad center, track end or via on any copper layer within reach of the
+/// pointer, otherwise to this view's grid. Used to place vias and to measure.
+pub(super) fn copper_target(pointer: Pos2, camera: &Camera, rect: Rect, view: BoardView<'_>) -> Point {
+    view.footprints()
+        .flat_map(|footprint| footprint.pads)
+        .filter(|pad| matches!(pad.copper_layers, Some(CopperLayers::Resolved { .. })))
+        .map(|pad| pad.center)
+        .chain(view.tracks().iter().flat_map(|track| [track.start, track.end]))
+        .chain(view.vias().iter().map(|via| via.at))
+        .filter_map(|point| {
+            let distance = camera.screen(point, rect).distance(pointer);
+            (distance <= SNAP_PX).then_some((distance, point))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map_or_else(|| camera.snap(pointer, rect), |(_, point)| point)
 }
 
 /// Whether the active layer is a visible copper layer of the board setup.
@@ -160,28 +408,59 @@ fn paired_layer(view: BoardView<'_>, layer: &str, hidden: &BTreeSet<String>) -> 
     (id != layer && !hidden.contains(&id)).then_some(id)
 }
 
-/// Snap to a pad center, track end or via when the pointer is over or near it, otherwise to this
-/// view's grid. Pads and track ends count only on the routing layer; vias reach every layer.
-/// The flag reports a copper target, which finishes a route.
-fn snapped(pointer: Pos2, camera: &Camera, rect: Rect, view: BoardView<'_>, layer: &str) -> (Point, bool) {
-    let on_layer = |layers: &Option<CopperLayers>| matches!(layers, Some(CopperLayers::Resolved { layers, .. }) if layers.iter().any(|id| id.to_string() == layer));
+/// The visible copper layer on one side of the board, if the setup has one.
+fn side_layer(view: BoardView<'_>, side: Side, hidden: &BTreeSet<String>) -> Option<String> {
+    view.setup()?
+        .layers()
+        .iter()
+        .find(|layer| layer.purpose == LayerPurpose::Copper && layer.side == Some(side))
+        .map(|layer| layer.id.to_string())
+        .filter(|id| !hidden.contains(id))
+}
+
+/// Resolve the click target for a route. Nearby pads and track ends on its layer and through
+/// vias keep their exact positions. A new route can also start along the body of a track.
+/// Free points use a nearby grid point unless Ctrl is held.
+fn route_target(
+    pointer: Pos2,
+    camera: &Camera,
+    rect: Rect,
+    view: BoardView<'_>,
+    layer: &str,
+    snap_to_grid: bool,
+    starting: bool,
+) -> (Point, Option<RouteContact>) {
+    let layer = Uuid::try_parse(layer).ok();
+    let on_layer = |layers: &Option<CopperLayers>| matches!((layer, layers), (Some(layer), Some(CopperLayers::Resolved { layers, .. })) if layers.contains(&layer));
     let pads = view.footprints().flat_map(|footprint| footprint.pads).filter(|pad| on_layer(&pad.copper_layers)).filter_map(|pad| {
         let land = pad.copper?.map(|corner| camera.screen(corner, rect));
         let over = egui::Rect::from_points(&land).contains(pointer);
         let distance = camera.screen(pad.center, rect).distance(pointer);
-        (over || distance <= SNAP_PX).then_some((if over { 0. } else { distance }, pad.center))
+        (over || distance <= SNAP_PX).then_some((if over { 0. } else { distance }, pad.center, RouteContact::Pad(pad.net)))
     });
-    let ends = view
-        .tracks()
-        .iter()
-        .filter(|track| track.layer.to_string() == layer)
-        .flat_map(|track| [track.start, track.end])
-        .chain(view.vias().iter().map(|via| via.at))
-        .filter_map(|point| {
+    let tracks = view.tracks().iter().filter(|track| Some(track.layer) == layer);
+    let ends = tracks
+        .clone()
+        .flat_map(|track| [(track.start, track.id), (track.end, track.id)])
+        .chain(view.vias().iter().map(|via| (via.at, via.id)))
+        .filter_map(|(point, id)| {
             let distance = camera.screen(point, rect).distance(pointer);
-            (distance <= SNAP_PX).then_some((distance, point))
+            (distance <= SNAP_PX).then_some((distance, point, RouteContact::Copper(id)))
         });
-    pads.chain(ends).min_by(|a, b| a.0.total_cmp(&b.0)).map_or_else(|| (camera.snap(pointer, rect), false), |(_, point)| (point, true))
+    if let Some((_, point, contact)) = pads.chain(ends).min_by(|a, b| a.0.total_cmp(&b.0)) {
+        return (point, Some(contact));
+    }
+    let free = camera.unsnapped(pointer, rect);
+    if starting && let Some(track) = tracks.rev().find(|track| hit(pointer, camera, rect, track)) {
+        let (along, _) = projection(free, track);
+        let at = |a: i64, b: i64| a + ((b - a) as f64 * along).round() as i64;
+        return (
+            Point { x_nm: at(track.start.x_nm, track.end.x_nm), y_nm: at(track.start.y_nm, track.end.y_nm) },
+            Some(RouteContact::Copper(track.id)),
+        );
+    }
+    let grid = camera.snap(pointer, rect);
+    (if snap_to_grid && camera.screen(grid, rect).distance(pointer) <= GRID_SNAP_PX { grid } else { free }, None)
 }
 
 /// The KiCad-style two-leg posture from `a` to `b`: one straight run along the major axis and one
@@ -232,6 +511,7 @@ fn width_px(camera: &Camera, rect: Rect, width_nm: i64) -> f32 {
 /// Build the one route transaction for a finished path, with its vias and the current sizes.
 /// A path without a single segment produces nothing.
 fn add(state: &mut State, draft: Draft) -> Option<Command> {
+    state.retry_route = Some(draft.clone());
     if draft.points.len() < 2 {
         return None;
     }
@@ -249,14 +529,55 @@ fn add(state: &mut State, draft: Draft) -> Option<Command> {
         params["via_diameter_nm"] = json!(state.via_diameter_nm);
         params["via_drill_nm"] = json!(state.via_drill_nm);
     }
-    Some(Command { source: draft.source, id: pcbcraft_engine::ADD_TRACKS, params })
+    Some(Command::new(draft.source, pcbcraft_engine::ADD_TRACKS, params))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RouteAction {
+    Finish,
+    Back,
+    Via,
+    Posture,
+    Cancel,
+}
+
+/// Present the route's existing commands. Escape cancels the same step as the canvas shortcut.
+fn route_menu(ui: &mut Ui, draft: Option<&Draft>, via: bool) -> Option<RouteAction> {
+    let keys = egui::Modifiers { ctrl: ui.input(|input| input.modifiers.ctrl), ..egui::Modifiers::NONE };
+    if ui.input_mut(|input| input.consume_key(keys, egui::Key::Escape)) {
+        ui.close();
+        return Some(RouteAction::Cancel);
+    }
+    if MenuItem::new("Finish track").tool_icon(ToolIcon::Track).shortcut("Enter").enabled(draft.is_some_and(|draft| draft.points.len() >= 2)).show(ui)
+    {
+        return Some(RouteAction::Finish);
+    }
+    if MenuItem::new("Remove last vertex").icon(MenuIcon::Undo).shortcut("Backspace").enabled(draft.is_some()).show(ui) {
+        return Some(RouteAction::Back);
+    }
+    if MenuItem::new("Place through via").tool_icon(ToolIcon::Via).shortcut("V").enabled(draft.is_some() && via).show(ui) {
+        return Some(RouteAction::Via);
+    }
+    if MenuItem::new("Flip track posture").tool_icon(ToolIcon::Track).shortcut("/").show(ui) {
+        return Some(RouteAction::Posture);
+    }
+    menu::separator(ui);
+    MenuItem::new("Cancel").icon(MenuIcon::Close).shortcut("Esc").show(ui).then_some(RouteAction::Cancel)
+}
+
+/// Where the routing popup opened, in the same screen coordinates as the canvas response.
+fn menu_anchor(response: &Response) -> Option<Pos2> {
+    let pointer = egui::Popup::position_of_id(&response.ctx, egui::Popup::default_response_id(response))?;
+    Some(response.ctx.layer_transform_from_global(response.layer_id).map_or(pointer, |transform| transform * pointer))
 }
 
 /// Route on the active copper layer, or select tracks and vias when no tool owns input. V drops a
 /// via at the pointer and continues on the paired layer, reported through `switch_layer`.
-/// Release over chrome, right-click, stale input, disabled input or a hidden/changed layer never
+/// Release over chrome, stale input, disabled input or a hidden/changed layer never
 /// commits an unfinished route. Key requests (Delete, Enter, Backspace, `/`, V) are consumed every
 /// frame and ignored while input is disabled. `over_footprint` gives footprints priority for picks.
+/// Selection and connected copper selection honor `kinds`; routing uses the full board geometry.
+/// The route popup owns input through dismissal and uses its opening point for via placement.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn interact(
     ui: &mut Ui,
@@ -269,17 +590,31 @@ pub(super) fn interact(
     source: Option<ViewInput>,
     enabled: bool,
     over_footprint: bool,
+    kinds: Kinds,
 ) -> Interaction {
+    state.sync_rules(view);
     let mut out = Interaction::default();
-    state.committed = None;
+    if !state.preparation.committing() {
+        state.committed = None;
+    }
     let rect = response.rect;
     let visible: Vec<_> = view.tracks().iter().filter(|track| !hidden.contains(&track.layer.to_string())).collect();
     let vias = view.vias();
-    state.selected.retain(|id| visible.iter().any(|track| track.id == *id) || vias.iter().any(|via| via.id == *id));
-    if !enabled || state.draft.as_ref().is_some_and(|draft| Some(draft.source) != source || Some(draft.layer.as_str()) != active) {
+    let vias_visible = view.layers().iter().any(|layer| layer.purpose == LayerPurpose::Copper && !hidden.contains(&layer.id.to_string()));
+    let selectable = |id: &Uuid| {
+        (kinds.tracks && visible.iter().any(|track| track.id == *id)) || (kinds.vias && vias_visible && vias.iter().any(|via| via.id == *id))
+    };
+    state.selected.retain(selectable);
+    let stale_route = state.draft.as_ref().is_some_and(|draft| Some(draft.source) != source || Some(draft.layer.as_str()) != active);
+    let route_available = !state.tool || can_route(view, active, hidden);
+    if state.tool && (!enabled || source.is_none() || stale_route || !route_available) && response.context_menu_opened() {
+        egui::Popup::close_id(ui.ctx(), egui::Popup::default_response_id(response));
+    }
+    if !enabled || stale_route {
+        state.preparation.cancel();
         state.draft = None;
     }
-    if state.tool && !can_route(view, active, hidden) {
+    if !route_available {
         state.cancel();
     }
     // Key requests apply to this frame only. Taking them before the disabled-input return keeps
@@ -289,10 +624,29 @@ pub(super) fn interact(
     let backspace = std::mem::take(&mut state.backspace_requested);
     let finish = std::mem::take(&mut state.finish_requested);
     let via = std::mem::take(&mut state.via_requested);
+    let via_side = state.via_side_requested.take();
+    let move_copper = std::mem::take(&mut state.move_requested);
+    let select_connected = std::mem::take(&mut state.connected_requested);
+    let drag_segment = std::mem::take(&mut state.drag_segment_requested);
+    if state.preparation.committing() {
+        if ui.input(|input| input.pointer.button_pressed(PointerButton::Secondary)) {
+            state.escape();
+        }
+        out.consumed = true;
+        return out;
+    }
+    state.committed_move = None;
+    state.committed_ends.clear();
+    if !enabled || state.segment.as_ref().is_some_and(|segment| Some(segment.source) != source) {
+        state.segment = None;
+    }
+    if !enabled || state.moving.as_ref().is_some_and(|moving| Some(moving.source) != source) {
+        state.moving = None;
+    }
     let Some(source) = source.filter(|_| enabled) else { return out };
-    if ui.input(|input| input.pointer.button_pressed(PointerButton::Secondary)) && state.busy() {
-        if state.draft.take().is_none() {
-            state.tool = false;
+    if !state.tool && state.busy() && ui.input(|input| input.pointer.button_pressed(PointerButton::Secondary)) {
+        if state.moving.take().is_none() && state.segment.take().is_none() {
+            state.via_tool = false;
         }
         out.consumed = true;
         return out;
@@ -306,19 +660,66 @@ pub(super) fn interact(
         if !gone_vias.is_empty() {
             params["vias"] = json!(gone_vias);
         }
-        out.command = Some(Command { source, id: pcbcraft_engine::DELETE_TRACKS, params });
+        out.command = Some(Command::new(source, pcbcraft_engine::DELETE_TRACKS, params));
         state.selected.clear();
         out.consumed = true;
         return out;
     }
     let pointer = ui.input(|input| input.pointer.hover_pos()).filter(|point| rect.contains(*point));
+    if state.via_tool {
+        out.consumed = true;
+        if !can_place_via(view) {
+            state.cancel();
+            return out;
+        }
+        if response.clicked()
+            && let Some(pointer) = pointer
+        {
+            let at = copper_target(pointer, camera, rect, view);
+            state.committed = Some(Committed {
+                width_nm: state.width_nm,
+                via_diameter_nm: state.via_diameter_nm,
+                via_drill_nm: state.via_drill_nm,
+                segments: Vec::new(),
+                vias: vec![at],
+            });
+            out.command = Some(Command::new(
+                source,
+                pcbcraft_engine::ADD_VIA,
+                json!({"at":at,"via_diameter_nm":state.via_diameter_nm,"via_drill_nm":state.via_drill_nm,"expected_revision":source.revision}),
+            ));
+        }
+        return out;
+    }
     if state.tool {
         out.consumed = true;
         let Some(layer) = active else { return out };
-        if posture {
+        let menu_open = response.context_menu_opened();
+        let anchor = menu_anchor(response);
+        let action = menu::context(response, |ui| route_menu(ui, state.draft.as_ref(), paired_layer(view, layer, hidden).is_some()))
+            .and_then(|menu| menu.inner);
+        if action == Some(RouteAction::Cancel) {
+            state.escape();
+            return out;
+        }
+        if action.is_none() && (menu_open || response.secondary_clicked()) {
+            return out;
+        }
+        let pointer = if action == Some(RouteAction::Via) {
+            anchor
+        } else if response.clicked() {
+            response.interact_pointer_pos()
+        } else {
+            response.hover_pos()
+        };
+        let pointer = pointer.filter(|point| rect.contains(*point));
+        let snap_to_grid = !ui.input(|input| input.modifiers.ctrl);
+        if posture || action == Some(RouteAction::Posture) {
             state.diagonal_first = !state.diagonal_first;
         }
-        if backspace && let Some(draft) = &mut state.draft {
+        if (backspace || action == Some(RouteAction::Back))
+            && let Some(draft) = &mut state.draft
+        {
             // Undo the most recent step: a via at the last vertex first, then the vertex itself.
             if draft.changes.last().is_some_and(|(at, _)| *at + 1 == draft.points.len()) {
                 draft.changes.pop();
@@ -331,12 +732,13 @@ pub(super) fn interact(
                 }
             }
         }
-        if via
+        if (via || via_side.is_some() || action == Some(RouteAction::Via))
             && let Some(pointer) = pointer
             && let Some(draft) = &mut state.draft
-            && let Some(next) = paired_layer(view, &draft.layer, hidden)
+            && let Some(next) = via_side.map_or_else(|| paired_layer(view, &draft.layer, hidden), |side| side_layer(view, side, hidden))
+            && next != draft.layer
         {
-            let (at, _) = snapped(pointer, camera, rect, view, &draft.layer);
+            let (at, _) = route_target(pointer, camera, rect, view, &draft.layer, snap_to_grid, false);
             let path = extended(&draft.points, at, state.diagonal_first);
             let index = path.len() - 1;
             if index > 0 && path.len() <= MAX_PATH_POINTS && !draft.changes.iter().any(|(existing, _)| *existing == index) {
@@ -347,25 +749,27 @@ pub(super) fn interact(
             }
             return out;
         }
-        if finish {
+        if finish || action == Some(RouteAction::Finish) {
             if let Some(draft) = state.draft.take() {
                 out.command = add(state, draft);
             }
             return out;
         }
         let Some(pointer) = pointer else { return out };
-        if !response.clicked() {
+        if action.is_some() || !response.clicked() {
             return out;
         }
-        let (at, copper) = snapped(pointer, camera, rect, view, layer);
+        let (at, contact) = route_target(pointer, camera, rect, view, layer, snap_to_grid, state.draft.is_none());
         match state.draft.take() {
-            None => state.draft = Some(Draft { source, start: layer.to_owned(), layer: layer.to_owned(), points: vec![at], changes: Vec::new() }),
+            None => {
+                state.draft = Some(Draft { source, contact, start: layer.to_owned(), layer: layer.to_owned(), points: vec![at], changes: Vec::new() })
+            }
             Some(mut draft) => {
                 let path = extended(&draft.points, at, state.diagonal_first);
                 if path.len() <= MAX_PATH_POINTS {
                     draft.points = path;
                 }
-                if (copper || response.double_clicked()) && draft.points.len() >= 2 {
+                if (contact.is_some() || response.double_clicked()) && draft.points.len() >= 2 {
                     out.command = add(state, draft);
                 } else {
                     state.draft = Some(draft);
@@ -374,18 +778,103 @@ pub(super) fn interact(
         }
         return out;
     }
+    if select_connected {
+        let seeds = pointer
+            .filter(|_| !over_footprint)
+            .and_then(|pointer| copper_at(pointer, camera, rect, view, hidden, kinds))
+            .map_or_else(|| state.selected.clone(), |id| BTreeSet::from([id]));
+        if !seeds.is_empty() {
+            state.selected = connected(view, &seeds);
+            state.selected.retain(selectable);
+            out.consumed = true;
+            return out;
+        }
+    }
+    if drag_segment
+        && state.moving.is_none()
+        && state.segment.is_none()
+        && let Some(pointer) = pointer.filter(|_| !over_footprint)
+        && let Some(track) = copper_at(pointer, camera, rect, view, hidden, Kinds { vias: false, ..kinds })
+    {
+        state.selected = BTreeSet::from([track]);
+        state.segment = Some(SegmentDrag { source, track, anchor: camera.snap(pointer, rect), offset: (0, 0) });
+        out.consumed = true;
+        return out;
+    }
+    if let Some(segment) = &mut state.segment {
+        out.consumed = true;
+        if let Some(pointer) = pointer {
+            let at = camera.snap(pointer, rect);
+            segment.offset = (at.x_nm - segment.anchor.x_nm, at.y_nm - segment.anchor.y_nm);
+        }
+        if response.clicked() {
+            let segment = segment.clone();
+            state.segment = None;
+            let ends = dragged_ends(view, segment.track, segment.offset);
+            if !ends.is_empty() {
+                state.committed_ends = ends.clone();
+                let tracks: Vec<_> = ends.iter().map(|(id, start, end)| json!({"track":id,"start":start,"end":end})).collect();
+                out.command = Some(Command::new(
+                    segment.source,
+                    pcbcraft_engine::RESHAPE_TRACKS,
+                    json!({"tracks":tracks,"expected_revision":segment.source.revision}),
+                ));
+            }
+        }
+        return out;
+    }
+    if state.moving.is_none() && !state.selected.is_empty() && move_copper {
+        // Without a pointer over the canvas (the ribbon was used), anchor on the selection itself.
+        let anchor = pointer.map(|pointer| camera.snap(pointer, rect)).unwrap_or_else(|| {
+            vias.iter()
+                .find(|via| state.selected.contains(&via.id))
+                .map(|via| via.at)
+                .or_else(|| visible.iter().find(|track| state.selected.contains(&track.id)).map(|track| track.start))
+                .unwrap_or(Point { x_nm: 0, y_nm: 0 })
+        });
+        state.moving = Some(MoveDraft { source, anchor, offset: (0, 0), drag: false });
+    }
+    if state.moving.is_none()
+        && response.drag_started_by(PointerButton::Primary)
+        && let Some(origin) = ui.input(|input| input.pointer.press_origin())
+        && !over_footprint
+        && let Some(id) = copper_at(origin, camera, rect, view, hidden, kinds)
+    {
+        if !state.selected.contains(&id) {
+            state.selected = BTreeSet::from([id]);
+        }
+        state.moving = Some(MoveDraft { source, anchor: camera.snap(origin, rect), offset: (0, 0), drag: true });
+    }
+    if let Some(moving) = &mut state.moving {
+        out.consumed = true;
+        if let Some(pointer) = ui.input(|input| input.pointer.hover_pos()) {
+            let at = camera.snap(pointer, rect);
+            moving.offset = (at.x_nm - moving.anchor.x_nm, at.y_nm - moving.anchor.y_nm);
+        }
+        let completed = if moving.drag { response.drag_stopped_by(PointerButton::Primary) } else { response.clicked() && !move_copper };
+        let abandoned = !completed && moving.drag && !ui.input(|input| input.pointer.primary_down());
+        // Copy the finished gesture out so the borrow ends before the move is cleared.
+        if let Some(moving) = (completed || abandoned).then(|| moving.clone()) {
+            state.moving = None;
+            if completed && response.contains_pointer() && moving.offset != (0, 0) {
+                let (gone_vias, gone_tracks): (Vec<Uuid>, Vec<Uuid>) = state.selected.iter().partition(|id| vias.iter().any(|via| via.id == **id));
+                let mut params = json!({"dx_nm":moving.offset.0,"dy_nm":moving.offset.1,"expected_revision":moving.source.revision});
+                if !gone_tracks.is_empty() {
+                    params["tracks"] = json!(gone_tracks);
+                }
+                if !gone_vias.is_empty() {
+                    params["vias"] = json!(gone_vias);
+                }
+                state.committed_move = Some(moving.offset);
+                out.command = Some(Command::new(moving.source, pcbcraft_engine::MOVE_TRACKS, params));
+            }
+        }
+        return out;
+    }
     if response.clicked()
         && let Some(pointer) = pointer
     {
-        let picked = (!over_footprint)
-            .then(|| {
-                vias.iter()
-                    .rev()
-                    .find(|via| hit_via(pointer, camera, rect, via))
-                    .map(|via| via.id)
-                    .or_else(|| visible.iter().rev().find(|track| hit(pointer, camera, rect, track)).map(|track| track.id))
-            })
-            .flatten();
+        let picked = (!over_footprint).then(|| copper_at(pointer, camera, rect, view, hidden, kinds)).flatten();
         let modifiers = ui.input(|input| input.modifiers);
         let extend = modifiers.shift || modifiers.ctrl || modifiers.command;
         if !extend {
@@ -403,9 +892,19 @@ pub(super) fn interact(
     out
 }
 
+/// Resolve the layer's personal or default color, falling back to board ink for unknown IDs.
+fn layer_color(view: BoardView<'_>, appearance: &Appearance, layer: &str) -> egui::Color32 {
+    Uuid::try_parse(layer)
+        .ok()
+        .and_then(|id| view.setup()?.layers().iter().find(|record| record.id == id))
+        .map_or_else(|| pcbcraft_chrome::Tokens::get().board_ink, |record| appearance.color(view, record))
+}
+
 /// Paint visible tracks with round ends at their physical width, inactive copper first so the
 /// active layer reads on top, then vias above all copper. A route committed this frame is
-/// painted where it will land.
+/// painted where it will land, and `carried` tracks (stretched by a footprint move preview)
+/// are painted at their carried ends. Net focus takes precedence over selection tinting,
+/// matching pads and avoiding a second brightening of selected copper.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn paint(
     ui: &Ui,
@@ -415,92 +914,193 @@ pub(super) fn paint(
     state: &State,
     active: Option<&str>,
     hidden: &BTreeSet<String>,
-    appearance: &crate::board_appearance::Appearance,
+    appearance: &Appearance,
+    focus: Option<CopperFocus<'_>>,
+    carried: &[Track],
 ) {
     let painter = ui.painter().with_clip_rect(rect);
-    let layers = view.layers();
-    let color = |layer: &str| {
-        layers
-            .iter()
-            .find(|record| record.id.to_string() == layer)
-            .map_or(pcbcraft_chrome::Tokens::get().board_ink, |record| appearance.color(view, record))
-    };
     let mut tracks: Vec<_> = view.tracks().iter().filter(|track| !hidden.contains(&track.layer.to_string())).collect();
     tracks.sort_by_key(|track| active == Some(track.layer.to_string().as_str()));
-    let segment = |layer: &str, a: Point, b: Point, width_nm: i64, selected: bool| {
+    let segment = |layer: &str, a: Point, b: Point, width_nm: i64, selected: bool, emphasized| {
         pcbcraft_chrome::board::track(
             &painter,
             [camera.screen(a, rect), camera.screen(b, rect)],
             width_px(camera, rect, width_nm),
-            color(layer),
-            selected,
+            pcbcraft_chrome::board::copper_emphasis(layer_color(view, appearance, layer), emphasized),
+            selected && emphasized.is_none(),
             false,
         );
     };
+    let shift = state.shift();
+    let moved = |point: Point, selected: bool| match shift.filter(|_| selected) {
+        Some((dx, dy)) => Point { x_nm: point.x_nm.saturating_add(dx), y_nm: point.y_nm.saturating_add(dy) },
+        None => point,
+    };
+    // A segment drag in progress, or one just submitted, draws its tracks at their new ends.
+    let mut reshaped: Vec<(Uuid, Point, Point)> =
+        state.segment.as_ref().map_or_else(|| state.committed_ends.clone(), |drag| dragged_ends(view, drag.track, drag.offset));
+    reshaped.extend(carried.iter().map(|track| (track.id, track.start, track.end)));
     for track in tracks {
-        segment(&track.layer.to_string(), track.start, track.end, track.width_nm, state.selected.contains(&track.id));
+        let selected = state.selected.contains(&track.id);
+        let (start, end) = reshaped
+            .iter()
+            .find(|(id, _, _)| *id == track.id)
+            .map_or((moved(track.start, selected), moved(track.end, selected)), |(_, start, end)| (*start, *end));
+        segment(&track.layer.to_string(), start, end, track.width_nm, selected, focus.map(|focus| focus.contains_copper(&track.id)));
     }
-    let via = |at: Point, diameter_nm: i64, drill_nm: i64, selected: bool, preview: bool| {
+    let via = |at: Point, diameter_nm: i64, drill_nm: i64, selected: bool, emphasized| {
         pcbcraft_chrome::board::via(
             &painter,
             camera.screen(at, rect),
             width_px(camera, rect, diameter_nm) / 2.,
             width_px(camera, rect, drill_nm) / 2.,
             selected,
-            preview,
+            false,
+            emphasized,
         );
     };
     if let Some(committed) = &state.committed {
         for (layer, a, b) in &committed.segments {
             if !hidden.contains(layer) {
-                segment(layer, *a, *b, committed.width_nm, false);
+                pcbcraft_chrome::board::track(
+                    &painter,
+                    [camera.screen(*a, rect), camera.screen(*b, rect)],
+                    width_px(camera, rect, committed.width_nm),
+                    pcbcraft_chrome::Tokens::get().text_dim,
+                    false,
+                    true,
+                );
             }
         }
         for at in &committed.vias {
-            via(*at, committed.via_diameter_nm, committed.via_drill_nm, false, false);
+            pcbcraft_chrome::board::via(
+                &painter,
+                camera.screen(*at, rect),
+                width_px(camera, rect, committed.via_diameter_nm) / 2.,
+                width_px(camera, rect, committed.via_drill_nm) / 2.,
+                false,
+                true,
+                None,
+            );
         }
     }
     for item in view.vias() {
-        via(item.at, item.diameter_nm, item.drill_nm, state.selected.contains(&item.id), false);
+        let selected = state.selected.contains(&item.id);
+        via(moved(item.at, selected), item.diameter_nm, item.drill_nm, selected, focus.map(|focus| focus.contains_copper(&item.id)));
     }
 }
 
-/// Paint the unfinished route above footprints: fixed vertices on their layers, vias, the posture
-/// leg to the snapped pointer, and a target marker. The preview implies no clearance check.
-pub(super) fn paint_draft(ui: &Ui, rect: Rect, camera: &Camera, view: BoardView<'_>, state: &State, active: Option<&str>) {
-    let painter = ui.painter().with_clip_rect(rect);
-    let Some(pointer) = ui.input(|input| input.pointer.hover_pos()).filter(|point| rect.contains(*point)) else { return };
+/// Preview routing or standalone via placement while the tool owns the hovered canvas. Routing
+/// replaces the system pointer with a live crosshair and marks the target used by the route leg.
+/// While the menu is open the preview stays at its opening point and the system pointer returns.
+/// Paint the clearance envelope behind the draft copper at the same width used by DRC.
+pub(super) fn paint_draft(
+    painter: &egui::Painter,
+    response: &Response,
+    camera: &Camera,
+    view: BoardView<'_>,
+    state: &mut State,
+    active: Option<&str>,
+    appearance: &Appearance,
+) {
+    let rect = response.rect;
+    let menu_anchor = menu_anchor(response);
+    let Some(pointer) = menu_anchor.or_else(|| response.hover_pos()).filter(|point| rect.contains(*point)) else { return };
+    if state.via_tool {
+        let at = camera.screen(copper_target(pointer, camera, rect, view), rect);
+        pcbcraft_chrome::board::via(
+            painter,
+            at,
+            width_px(camera, rect, state.via_diameter_nm) / 2.,
+            width_px(camera, rect, state.via_drill_nm) / 2.,
+            false,
+            true,
+            None,
+        );
+        pcbcraft_chrome::board::drawing_target(painter, at);
+        return;
+    }
     let Some(layer) = state.draft.as_ref().map(|draft| draft.layer.as_str()).or(active.filter(|_| state.tool)) else { return };
-    let (at, _) = snapped(pointer, camera, rect, view, layer);
+    let snap_to_grid = !painter.ctx().input(|input| input.modifiers.ctrl);
+    let (at, contact) = route_target(pointer, camera, rect, view, layer, snap_to_grid, state.draft.is_none());
     if let Some(draft) = &state.draft {
         let path = extended(&draft.points, at, state.diagonal_first);
+        // Queue the exact geometry already resolved for painting; do not project every pad
+        // a second time merely to prepare the same pointer request.
+        if (2..=MAX_PATH_POINTS).contains(&path.len()) && Some(draft.layer.as_str()) == active {
+            let mut params = json!({"board":view.target.board,"layer":draft.start,"width_nm":state.width_nm,"points":path,"expected_revision":draft.source.revision});
+            if !draft.changes.is_empty() {
+                params["layer_changes"] = json!(draft.changes.iter().map(|(at, layer)| json!({"at":at,"layer":layer})).collect::<Vec<_>>());
+                params["via_diameter_nm"] = json!(state.via_diameter_nm);
+                params["via_drill_nm"] = json!(state.via_drill_nm);
+            }
+            let _ = state.preparation.request(
+                Command::new(draft.source, pcbcraft_engine::ADD_TRACKS, params),
+                active.map(str::to_owned),
+                (state.width_nm, state.via_diameter_nm, state.via_drill_nm),
+                false,
+            );
+        } else if !state.preparation.committing() {
+            state.preparation.cancel();
+        }
+        let layers = segment_layers(&draft.start, &draft.changes, path.len());
+        let path: Vec<_> = path.into_iter().map(|point| camera.screen(point, rect)).collect();
+        let width = width_px(camera, rect, state.width_nm);
+        let clearance = width_px(camera, rect, view.effective_rules().values.clearance_nm);
+        let via_width = width_px(camera, rect, state.via_diameter_nm);
         for pair in path.windows(2) {
+            pcbcraft_chrome::board::routing_clearance(painter, [pair[0], pair[1]], width, clearance);
+        }
+        for (index, _) in &draft.changes {
+            pcbcraft_chrome::board::routing_clearance(painter, [path[*index]; 2], via_width.max(4.0), clearance);
+        }
+        for (pair, layer) in path.windows(2).zip(layers) {
             pcbcraft_chrome::board::track(
-                &painter,
-                [camera.screen(pair[0], rect), camera.screen(pair[1], rect)],
-                width_px(camera, rect, state.width_nm),
-                pcbcraft_chrome::Tokens::get().accent,
+                painter,
+                [pair[0], pair[1]],
+                width,
+                if state.preparation.ready() { layer_color(view, appearance, layer) } else { pcbcraft_chrome::Tokens::get().text_dim },
                 false,
                 true,
             );
         }
         for (index, _) in &draft.changes {
-            pcbcraft_chrome::board::via(
-                &painter,
-                camera.screen(draft.points[*index], rect),
-                width_px(camera, rect, state.via_diameter_nm) / 2.,
-                width_px(camera, rect, state.via_drill_nm) / 2.,
-                false,
-                true,
-            );
+            pcbcraft_chrome::board::via(painter, path[*index], via_width / 2., width_px(camera, rect, state.via_drill_nm) / 2., false, true, None);
         }
     }
-    pcbcraft_chrome::board::drawing_target(&painter, camera.screen(at, rect));
+    if menu_anchor.is_none() {
+        painter.ctx().set_cursor_icon(egui::CursorIcon::None);
+        pcbcraft_chrome::cursor::track(painter, pointer, camera.screen(at, rect), contact.is_some());
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Board transitions reset local sizes without authored rules; initial synchronization and
+    /// ordinary edits on the same board preserve an explicitly selected upcoming size.
+    #[test]
+    fn board_target_changes_reset_sizes_and_same_board_edits_preserve_choices() {
+        let mut first = pcbcraft_engine::Session::default();
+        let mut second = pcbcraft_engine::Session::default();
+        for session in [&mut first, &mut second] {
+            session.apply("project.new", &json!({"create_board":true})).unwrap();
+        }
+        let mut state = State { width_nm: 750_000, via_diameter_nm: 800_000, via_drill_nm: 400_000, ..Default::default() };
+        let target = first.project().unwrap().board_target().unwrap();
+        state.sync_rules(first.project().unwrap().board_view(target).unwrap());
+        assert_eq!((state.width_nm, state.via_diameter_nm, state.via_drill_nm), (750_000, 800_000, 400_000));
+        first.apply("project.rename", &json!({"name":"Same board"})).unwrap();
+        state.sync_rules(first.project().unwrap().board_view(target).unwrap());
+        assert_eq!((state.width_nm, state.via_diameter_nm, state.via_drill_nm), (750_000, 800_000, 400_000));
+        let target = second.project().unwrap().board_target().unwrap();
+        state.sync_rules(second.project().unwrap().board_view(target).unwrap());
+        assert_eq!((state.width_nm, state.via_diameter_nm, state.via_drill_nm), (DEFAULT_WIDTH_NM, DEFAULT_VIA_DIAMETER_NM, DEFAULT_VIA_DRILL_NM));
+        state.width_nm = 500_000;
+        state.sync_rules(second.project().unwrap().board_view(target).unwrap());
+        assert_eq!(state.width_nm, 500_000);
+    }
 
     /// Legs are straight when aligned or exactly diagonal, and otherwise turn once at 45°.
     #[test]

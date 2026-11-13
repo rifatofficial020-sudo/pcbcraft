@@ -1,6 +1,7 @@
 //! Sheet ownership, immutable schematic projections and atomic sheet transactions.
 
 use super::*;
+use std::collections::BTreeSet;
 use std::ops::Deref;
 
 /// Bound metadata and navigation as well as per-sheet geometry.
@@ -27,6 +28,8 @@ impl SheetTarget {
 pub struct SchematicSheet {
     pub(crate) sheet_id: uuid::Uuid,
     pub(crate) sheet_name: String,
+    /// Occurrence identity in the adopted single-use format; legacy IDs are derived on inspection.
+    pub(crate) occurrence_id: Option<uuid::Uuid>,
     pub(crate) symbols: Arc<Vec<SymbolPlacement>>,
     pub(crate) wires: Arc<Vec<Wire>>,
     pub(crate) junctions: Arc<BTreeMap<u64, Point>>,
@@ -34,14 +37,20 @@ pub struct SchematicSheet {
     pub(crate) net_labels: Arc<Vec<crate::net_labels::Label>>,
     pub(crate) subsheets: Arc<Vec<crate::hierarchy::SheetSymbol>>,
     pub(crate) connectivity: Arc<OnceLock<Connectivity>>,
+    /// Provenance for legs drawn by retained named-contact poses; live records persist in sheet/7.
+    pub(crate) generated_legs: Arc<Vec<crate::wire::GeneratedLeg>>,
+    /// Explicit no-connect intent on project-unique wire-end junction identities.
+    pub(crate) no_connect_ends: Arc<BTreeSet<u64>>,
 }
 
 impl SchematicSheet {
     /// Create an empty sheet after identity/name validation by the owning command or codec.
+    /// Occurrence adoption is separate; new authored sheets use `Project::new_sheet_record`.
     pub(crate) fn empty(sheet_id: uuid::Uuid, sheet_name: String) -> Self {
         Self {
             sheet_id,
             sheet_name,
+            occurrence_id: None,
             labels: Arc::default(),
             net_labels: Arc::default(),
             subsheets: Arc::default(),
@@ -49,7 +58,14 @@ impl SchematicSheet {
             wires: Arc::default(),
             junctions: Arc::default(),
             connectivity: Arc::default(),
+            generated_legs: Arc::default(),
+            no_connect_ends: Arc::default(),
         }
+    }
+
+    /// Whether a recorded generated leg still exactly describes a wire on this sheet.
+    pub(crate) fn has_live_generated_legs(&self) -> bool {
+        self.generated_legs.iter().any(|leg| self.wires.iter().any(|wire| leg.matches(wire)))
     }
 }
 
@@ -91,7 +107,7 @@ impl Project {
     /// Internal commands clone only the addressed sheet's metadata and touched geometry.
     pub(crate) fn sheet_mut(&mut self) -> &mut SchematicSheet {
         // Labels can contact geometry and join other sheets, including in pure previews.
-        if self.has_named_nets() {
+        if self.requires_project_graph() {
             self.named_graph = Arc::default();
             for sheet in Arc::make_mut(&mut self.sheets) {
                 sheet.connectivity = Arc::default();
@@ -160,14 +176,18 @@ impl Project {
             .max()
             .unwrap_or_default()
             .max(self.components.last_key_value().map_or(0, |(&id, _)| id))
+            .max(self.net_registry.highest_object_id())
             .max(self.board.baseline.as_ref().and_then(|baseline| baseline.components.keys().next_back().copied()).unwrap_or(0))
             .max(self.board.footprints().last().map_or(0, |f| f.id))
     }
 }
 
-/// Only geometry commands take a schematic target; sheet lifecycle and board setup are project operations.
+/// Authored schematic geometry takes a sheet target; portable text preparation is independent
+/// of any project/sheet. Logical no-connect intent, sheet lifecycle and board setup remain
+/// project operations; their targets do not depend on the current sheet projection.
 pub fn scoped_command(id: &str) -> bool {
-    id.starts_with("schematic.") || id == PLACE_FOOTPRINT
+    (id.starts_with("schematic.") && !matches!(id, crate::clipboard_text::LABELS | crate::no_connect::SET | crate::no_connect::CHECK))
+        || id == PLACE_FOOTPRINT
 }
 
 impl Session {
@@ -184,6 +204,7 @@ impl Session {
             project: Some(Arc::new(projected)),
             revision: self.revision,
             history_root_revision: self.history_root_revision,
+            defer_net_reconciliation: true,
             ..Self::default()
         };
         transaction.apply_inner(id, params)?;
@@ -193,7 +214,7 @@ impl Session {
                 return Err(CommandError::Unavailable("project exceeds the symbol or wire limit".into()));
             }
             project.sheet_index = 0;
-            self.change(project);
+            self.change(project)?;
         }
         Ok(self.revision)
     }
@@ -222,7 +243,8 @@ impl Session {
                     return Err(CommandError::Unavailable(format!("project already has {MAX_SHEETS} sheets")));
                 }
                 let name = name.ok_or_else(|| CommandError::InvalidParams("missing sheet name".into()))?;
-                Arc::make_mut(&mut project.sheets).push(SchematicSheet::empty(fresh_id()?, name));
+                let sheet = project.new_sheet_record(fresh_id()?, name)?;
+                Arc::make_mut(&mut project.sheets).push(sheet);
             }
             (RENAME_SHEET, Some(index)) => {
                 let name = name.ok_or_else(|| CommandError::InvalidParams("missing sheet name".into()))?;
@@ -251,14 +273,16 @@ impl Session {
                 }
                 let removed = Arc::make_mut(&mut project.sheets).remove(index);
                 for symbol in removed.symbols.iter() {
-                    project.retire_component(symbol.component);
+                    if !project.all_symbols().any(|other| other.component == symbol.component) {
+                        project.retire_component(symbol.component);
+                    }
                     Arc::make_mut(&mut project.units).remove(&(symbol.component, symbol.unit.clone()));
                 }
             }
             _ => return Err(CommandError::InvalidParams("unknown sheet operation or target".into())),
         }
         project.sheet_index = 0;
-        self.change(project);
+        self.change(project)?;
         Ok(())
     }
 }

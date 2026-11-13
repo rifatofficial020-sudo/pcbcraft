@@ -24,7 +24,7 @@ fn place(session: &mut Session, x_nm: i64) -> u64 {
 /// Reopen using each production persistence route, including retained single-document APIs.
 fn round_trips(project: Arc<Project>) -> Vec<Arc<Project>> {
     vec![
-        decode(&encode(project.clone()).unwrap()).unwrap(),
+        decode(&encode(persistence::diagnostic_snapshot(project.clone())).unwrap()).unwrap(),
         decode_documents(&encode_documents(project.clone()).unwrap()).unwrap(),
         decode_packed(&encode_packed(project).unwrap()).unwrap().project,
     ]
@@ -107,7 +107,7 @@ fn legacy_noop_and_nonallocating_edits_preserve_old_format() {
     s.open_snapshot(legacy);
     apply(&mut s, MOVE_SYMBOL, json!({"symbol":"symbol-2","x_nm":1_270_000,"y_nm":0}));
     assert_eq!(s.project().unwrap().numeric_id_high_water, None);
-    assert_eq!(encode_documents(s.snapshot().unwrap()).unwrap()["project.pc"], before["project.pc"]);
+    assert_eq!(encode_documents(s.snapshot().unwrap()).unwrap()["project.json"], before["project.json"]);
     let highest = s.project().unwrap().highest_id();
     apply(&mut s, DELETE_WIRE, json!({"wire":format!("wire-{highest}")}));
     assert_eq!(s.project().unwrap().numeric_id_high_water, Some(highest));
@@ -132,7 +132,7 @@ fn watermark_formats_are_strict_and_validate_every_retained_identity() {
         entry.as_object_mut().unwrap().remove("numeric_id_high_water");
     });
     assert!(decode_documents(&invalid).is_err());
-    let mut single: Value = serde_json::from_slice(&encode(s.snapshot().unwrap()).unwrap()).unwrap();
+    let mut single: Value = serde_json::from_slice(&encode(persistence::diagnostic_snapshot(s.snapshot().unwrap())).unwrap()).unwrap();
     single["format"] = json!("pcbcraft-project/4");
     assert!(decode(&serde_json::to_vec(&single).unwrap()).is_err());
 }
@@ -178,7 +178,7 @@ fn exhausted_watermark_still_allows_nonallocating_wire_removal() {
 
 /// Change only negative test input; positive fixtures are always command-built and encoded.
 fn edit_entry(documents: &mut Documents, edit: impl FnOnce(&mut Value)) {
-    let mut entry: Value = serde_json::from_slice(&documents["project.pc"]).unwrap();
+    let mut entry: Value = serde_json::from_slice(&documents["project.json"]).unwrap();
     edit(&mut entry);
-    documents.insert("project.pc".into(), serde_json::to_vec(&entry).unwrap());
+    documents.insert("project.json".into(), serde_json::to_vec(&entry).unwrap());
 }

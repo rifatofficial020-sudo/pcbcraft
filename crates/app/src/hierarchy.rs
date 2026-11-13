@@ -242,6 +242,17 @@ pub(super) fn paint_label(painter: &Painter, pos: Pos2, name: &str, direction: D
     );
 }
 
+/// Resolve an editor-local hierarchy hover for clipboard keys, using current view geometry and
+/// filters. The caller separately checks canvas input ownership and explicit selection priority.
+pub(super) fn clipboard_hover(project: &Project, camera: &Camera, ctx: &egui::Context, filters: crate::selection_filters::Filters) -> Option<String> {
+    let rect = camera.schematic_rect()?;
+    let pointer = ctx.input(|i| i.pointer.hover_pos())?;
+    if !rect.contains(pointer) {
+        return None;
+    }
+    hit(project, camera, rect, pointer, filters).map(|(kind, id, _)| format!("{}-{id}", if kind == Kind::Sheet { "sheet-symbol" } else { "label" }))
+}
+
 /// Hit label text before block interiors; pin anchors retain wire-target priority on plain clicks.
 fn hit(project: &Project, camera: &Camera, rect: Rect, pointer: Pos2, filters: crate::selection_filters::Filters) -> Option<(Kind, u64, Point)> {
     let t = Tokens::get();
@@ -366,8 +377,22 @@ pub(super) fn input(
             } else {
                 vec![("Properties…", "E", Action::Edit), ("Move", "M", Action::Move), ("Delete Hierarchical Label", "Del", Action::Delete)]
             };
-            rows.into_iter()
+            if let Some(action) = rows
+                .into_iter()
                 .find_map(|(name, key, action)| MenuItem::new(name).shortcut(key).show(ui).then_some(Click::HierarchyAction(kind, id, action)))
+            {
+                return Some(action);
+            }
+            pcbcraft_chrome::menu::separator(ui);
+            [
+                ("Copy", "Ctrl+C", crate::schematic_canvas::ToolAction::Copy),
+                ("Cut", "Ctrl+X", crate::schematic_canvas::ToolAction::Cut),
+                ("Duplicate", "Ctrl+D", crate::schematic_canvas::ToolAction::Duplicate),
+            ]
+            .into_iter()
+            .find_map(|(label, key, action)| {
+                MenuItem::new(label).shortcut(key).show(ui).then(|| Click::HierarchyClipboard(kind, id, action, ui.ctx().clone()))
+            })
         })
     {
         return Some(menu.inner);
@@ -541,7 +566,7 @@ impl PcbApp {
         let closing =
             shell::dialog(ctx, "hierarchy_dialog", if edit.kind == Kind::Sheet { "Hierarchical Sheet" } else { "Hierarchical Label" }, |ui| {
                 if edit.kind == Kind::Sheet {
-                    egui::ComboBox::from_label("Child sheet")
+                    pcbcraft_chrome::controls::Choice::from_label("Child sheet")
                         .selected_text(edit.child.and_then(|t| project.sheets().find(|s| s.target == t).map(|s| s.name)).unwrap_or("New sheet"))
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut edit.child, None, "New sheet");
@@ -561,7 +586,7 @@ impl PcbApp {
                     submit = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
                 }
                 if edit.kind == Kind::Label {
-                    egui::ComboBox::from_label("Direction").selected_text(direction_name(edit.direction)).show_ui(ui, |ui| {
+                    pcbcraft_chrome::controls::Choice::from_label("Direction").selected_text(direction_name(edit.direction)).show_ui(ui, |ui| {
                         for direction in Direction::ALL {
                             ui.selectable_value(&mut edit.direction, direction, direction_name(direction));
                         }
@@ -571,8 +596,8 @@ impl PcbApp {
                     ui.label(shell::error(error));
                 }
                 ui.horizontal(|ui| {
-                    submit |= ui.button("OK").clicked();
-                    cancel = ui.button("Cancel").clicked();
+                    submit |= pcbcraft_chrome::controls::button(ui, "OK").clicked();
+                    cancel = pcbcraft_chrome::controls::button(ui, "Cancel").clicked();
                 });
             });
         if submit {

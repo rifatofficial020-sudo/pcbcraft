@@ -103,7 +103,7 @@ fn native_power_contacts_follow_the_shared_move_command() {
             let end = sym.terminals()[0];
             let _ = p.electrical_connectivity();
             let to = Point { x_nm: 4 * GRID_NM, y_nm: 4 * GRID_NM };
-            let preview = p.transformed_symbol(&sym.id(), to, Some(1), disconnect, s.revision(), auto_heal).unwrap();
+            let preview = p.transformed_symbol(&sym.id(), to, Some(1), None, disconnect, s.revision(), auto_heal).unwrap();
             s.apply(MOVE_SYMBOL,&json!({"symbol":sym.id(),"x_nm":to.x_nm,"y_nm":to.y_nm,"rotation":90,"disconnect":disconnect,"auto_heal":auto_heal,"expected_revision":s.revision()})).unwrap();
             let after = s.snapshot().unwrap();
             assert_eq!(encode_documents(after.clone()).unwrap(), encode_documents(Arc::new(preview)).unwrap());
@@ -143,7 +143,7 @@ fn roles_and_defaults_are_versioned_validated_and_preserved_by_authoring() {
 }
 
 /// Bundled definitions participate in identical-copy collapse and immutable-revision quarantine.
-/// Omitted-library compatibility cannot bypass a conflicting or removed catalog definition.
+/// Omitted-library compatibility cannot bypass conflicts, and bundled registrations resist removal.
 #[test]
 fn bundled_selections_obey_normal_conflicts_and_content_authority() {
     let mut s = Session::default();
@@ -161,25 +161,26 @@ fn bundled_selections_obey_normal_conflicts_and_content_authority() {
     assert!(Arc::ptr_eq(&before, &s.snapshot().unwrap()));
     s.execute(sources::REMOVE, &json!({"source":"another-copy"})).unwrap();
     assert!(s.libraries().latest_symbol("starter", "resistor").is_some());
-    s.execute(sources::REMOVE, &json!({"source":"bundled-starter"})).unwrap();
-    assert!(s.apply(crate::PLACE_RESISTOR, &json!({"x_nm":0,"y_nm":0,"expected_revision":s.revision()})).is_err());
+    assert!(s.execute(sources::REMOVE, &json!({"source":"bundled-starter"})).unwrap_err().to_string().contains("read-only"));
     assert!(Arc::ptr_eq(&before, &s.snapshot().unwrap()));
+    s.apply(crate::PLACE_RESISTOR, &json!({"x_nm":0,"y_nm":0,"expected_revision":s.revision()})).unwrap();
 }
 
 /// A digest opts into exact selection even when the caller relies on the default library ID.
-/// Changed source content at the pinned revision is refused without changing history.
+/// Changed content from a replaceable external registration is refused without changing history.
 #[test]
 fn digest_without_library_cannot_bypass_pinned_content_authority() {
-    let mut s = Session::default();
+    let mut s = Session { libraries: Arc::new(sources::Catalog::default()), ..Session::default() };
     s.apply("project.new", &json!({})).unwrap();
+    let (_, mut docs) = bundled_documents().find(|(id, _)| *id == "starter").unwrap();
+    s.execute(sources::LOAD, &json!({"source":"external-starter","documents":docs})).unwrap();
     place(&mut s, "starter", "resistor", 0, 0, "1k");
     let before = s.snapshot().unwrap();
     let state = s.inspect();
-    let (_, mut docs) = bundled_documents().find(|(id, _)| *id == "starter").unwrap();
     let mut symbol: Value = serde_json::from_str(&docs["symbols/resistor.json"]).unwrap();
     symbol["default_value"] = json!("Changed source");
     docs.insert("symbols/resistor.json".into(), symbol.to_string());
-    s.execute(sources::REMOVE, &json!({"source":"bundled-starter"})).unwrap();
+    s.execute(sources::REMOVE, &json!({"source":"external-starter"})).unwrap();
     s.execute(sources::LOAD, &json!({"source":"replacement","documents":docs})).unwrap();
     let d = s.libraries().latest_symbol("starter", "resistor").unwrap();
     let params = json!({"definition":"resistor","definition_revision":d.revision(),"definition_digest":sources::symbol_digest(&d).unwrap(),"x_nm":10*GRID_NM,"y_nm":0,"expected_revision":s.revision()});
@@ -230,8 +231,8 @@ fn native_power_roundtrips_with_schematic_only_package_choices() {
     )
     .unwrap();
     let saved = encode_documents(s.snapshot().unwrap()).unwrap();
-    let entry: Value = serde_json::from_slice(&saved["project.pc"]).unwrap();
-    assert_eq!(entry["format"], "pcbcraft-project/13");
+    let entry: Value = serde_json::from_slice(&saved["project.json"]).unwrap();
+    assert_eq!(entry["format"], "pcbcraft-project/17");
     assert!(!saved.contains_key("board.json"));
     let reopened = decode_documents(&saved).unwrap();
     assert_eq!(encode_documents(reopened.clone()).unwrap(), saved);

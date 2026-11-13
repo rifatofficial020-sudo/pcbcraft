@@ -4,6 +4,7 @@
 //! catalog, the same ones MCP runs. Preferences belong to the person, not the project, so they live
 //! here and stay out of the command set.
 
+use pcbcraft_chrome::menu::CheckKind;
 use std::sync::Arc;
 
 mod app_workspace;
@@ -12,18 +13,27 @@ mod arrangements;
 mod assistant;
 mod board_appearance;
 mod board_canvas;
+mod board_clipboard;
 mod board_drawing;
+mod board_drc;
+mod board_measure;
+mod board_outputs;
 mod board_panels;
+mod board_presets;
+mod board_reference;
+mod board_rules;
 mod board_setup;
 mod board_tracks;
 mod board_update;
 mod board_workspace;
 mod canvas_camera;
+mod clipboard;
 mod definition_graphics;
 mod editor_layout;
 mod editor_view;
 mod editor_windows;
 mod editor_workspace;
+mod external_clipboard;
 mod field_actions;
 mod footprint_assignment;
 mod hierarchy;
@@ -31,12 +41,17 @@ mod home;
 mod inline_text;
 mod library_editors;
 mod library_preview;
+mod library_workspace;
 #[cfg(not(target_arch = "wasm32"))]
 mod live_control;
+mod native_part_properties;
 mod native_sources;
 mod net_inspector;
 mod net_labels;
+mod no_connect;
 mod parts_browser;
+#[cfg(feature = "performance-harness")]
+pub mod performance;
 mod preferences;
 mod project_browser;
 mod project_files;
@@ -47,6 +62,8 @@ mod ribbon;
 mod schematic_canvas;
 mod selection_filters;
 mod sheet_editing;
+#[cfg(not(target_arch = "wasm32"))]
+mod ui_automation;
 mod unsaved;
 mod window_commands;
 mod workspace_panels;
@@ -60,15 +77,18 @@ use window_commands::Panel;
 use eframe::Frame;
 use egui::{Key, KeyboardShortcut, Modifiers, RichText, Ui};
 use pcbcraft_chrome::{
-    MenuItem, Tokens, fonts, grid,
+    MenuItem, Tokens, grid,
     menu::{self, MenuIcon},
     shell::{self, dim},
     theme, units, workspace,
 };
 use pcbcraft_engine::selection::Selection;
-use pcbcraft_engine::{CONNECT_PINS, DELETE_SYMBOL, MOVE_SYMBOL, PLACE_SYMBOL, ROTATE_SYMBOL, Session, command, schematic::SymbolDefinition};
+use pcbcraft_engine::{
+    CONNECT_PINS, DELETE_SYMBOL, MIRROR_SYMBOL, MOVE_SYMBOL, PLACE_SYMBOL, ROTATE_SYMBOL, Session, command, schematic::SymbolDefinition,
+};
 use serde_json::{Value, json};
 
+pub use editor_windows::APP_TITLE;
 pub use preferences::{Navigation, Preferences, ScrollAction, ThemeChoice, ZoomAround};
 use project_files::SaveFormat;
 
@@ -98,8 +118,11 @@ const ADD_POWER: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::
 const ADD_SYMBOL: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::A);
 const ADD_SHEET: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::S);
 const ADD_HIERARCHICAL_LABEL: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::H);
+const PLACE_VIA: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::X);
 const ADD_WIRE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::W);
 const ROTATE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::R);
+const MIRROR_HORIZONTAL: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::X);
+const MIRROR_VERTICAL: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::Y);
 /// KiCad's keys for the next and previous grid: N for finer, Shift+N for coarser.
 const FINER_GRID: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::N);
 const COARSER_GRID: KeyboardShortcut = KeyboardShortcut::new(Modifiers::SHIFT, Key::N);
@@ -148,7 +171,13 @@ enum Help {
 enum Dialog {
     #[default]
     None,
-    LibrarySources,
+    NoConnects(Box<no_connect::Inspection>),
+    AddLibrary(Option<String>),
+    DeleteLibrary(native_sources::lifecycle::DeleteDraft),
+    NativePart(Box<native_part_properties::Edit>),
+    PasteOptions(Box<clipboard::Options>),
+    BoardPasteOptions(Box<board_clipboard::Options>),
+    ExternalPasteOptions(Box<external_clipboard::Options>),
     /// Asks for the name that `project.rename` takes.
     Name {
         command: &'static str,
@@ -167,8 +196,11 @@ enum Dialog {
     /// A captured engine-owned schematic-to-PCB update review.
     BoardUpdate(Box<board_update::Edit>),
     LayerColor(board_appearance::Edit),
+    /// Custom tool dimensions and optional reusable presets, independent of board setup.
+    RoutingSize(board_presets::Edit),
     /// Disposable layer/stackup edits retain their originating board and revision.
     BoardSetup(Box<board_setup::Edit>),
+    BoardRules(Box<board_rules::Edit>),
     /// Expanded selection properties retain their originating view and revision.
     EditFields(Box<properties::Edit>),
     /// Closing a definition or quitting protects authoring documents separately from the project.
@@ -199,6 +231,9 @@ enum Dialog {
 /// navigation and unfinished input separately; split panes share the project authority.
 #[derive(Debug, Default)]
 pub struct PcbApp {
+    #[cfg(not(target_arch = "wasm32"))]
+    automation: ui_automation::Automation,
+    clipboard_request: Option<(ViewInput, bool)>,
     library_sources: native_sources::Sources,
     arrangements: arrangements::Arrangements,
     views: EditorViews,
@@ -210,15 +245,22 @@ pub struct PcbApp {
     library_editors: library_editors::Editors,
     #[cfg(not(target_arch = "wasm32"))]
     live_control: Option<live_control::LiveControl>,
+    #[cfg(not(target_arch = "wasm32"))]
+    remote_check: live_control::RemoteCheck,
+    #[cfg(not(target_arch = "wasm32"))]
+    remote_copper: live_control::RemoteCopper,
     files: project_files::ProjectFiles,
     file_notice: Option<String>,
     preferences: Preferences,
     board_appearance: board_appearance::Appearance,
     board_profile_files: board_setup::profile_io::Files,
+    routing_presets: board_presets::Presets,
+    /// The one fabrication export that may be saving at a time.
+    fabrication_exports: board_outputs::Exports,
     net_inspector: net_inspector::NetInspector,
     parts: parts_browser::PartsBrowser,
     browser: project_browser::ProjectBrowser,
-    /// The ribbon tab shown, an index into [`RIBBON_TABS`].
+    /// The ribbon's stable saved slot, mapped to the active workspace's visual tab order.
     ribbon_tab: usize,
     dialog: Dialog,
     /// Whether the Home page replaces the ribbon and canvas. The project stays open behind it.
@@ -244,7 +286,8 @@ pub struct PcbApp {
 }
 
 /// The Schematic workspace's ribbon tabs, in order.
-const RIBBON_TABS: [&str; 5] = ["Capture", "Analyze", "Libraries", "Manage", "View"];
+const RIBBON_TABS: [&str; 5] = ["Capture", "Sheets", "Analyze", "Libraries", "View"];
+const BOARD_RIBBON_TABS: [&str; 6] = ["Layout", "Draw", "Analyze", "Manufacture", "Libraries", "View"];
 const VIEW_TAB: usize = 1;
 
 /// Built-in workspace contributions. The picker handles presentation only; each document
@@ -256,17 +299,26 @@ const WORKSPACES: workspace::Workspaces<'static> = workspace::Workspaces {
             multiple_views: true,
             title: "Schematic",
             description: "Capture circuits, place symbols and connect pins",
-            tabs: Some("Capture · Analyze · Libraries · Manage · View"),
+            tabs: Some("Capture · Sheets · Analyze · Libraries · View"),
             icon: workspace::WorkspaceIcon::Schematic,
             current: true,
         },
         workspace::Workspace {
             id: "board",
             multiple_views: true,
-            title: "PCB layout",
+            title: "PCB Layout",
             description: "Inspect footprint placements and linked schematic components",
-            tabs: Some("Layout · Libraries · View"),
+            tabs: Some("Layout · Draw · Analyze · Manufacture · Libraries · View"),
             icon: workspace::WorkspaceIcon::Layout,
+            current: false,
+        },
+        workspace::Workspace {
+            id: "library",
+            title: "Parts Library",
+            description: "Browse and manage native libraries",
+            tabs: Some("Manage · View"),
+            icon: workspace::WorkspaceIcon::Library,
+            multiple_views: true,
             current: false,
         },
         workspace::Workspace {
@@ -316,10 +368,10 @@ impl PcbApp {
     /// Successful New/Open actions enter the workspace; cancelling them leaves Home visible.
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         // Home uses custom fonts on its first frame; installing during that frame is too late.
-        fonts::install(&cc.egui_ctx);
+        pcbcraft_chrome::install(&cc.egui_ctx);
         let preferences = cc.storage.and_then(|s| s.get_string(PREFERENCES_KEY)).map(|text| Preferences::parse(&text)).unwrap_or_default();
         let mut views = EditorViews::default();
-        views.set_grid_everywhere(preferences.schematic_grid_nm);
+        views.set_grid_defaults(preferences.schematic_grid_nm, preferences.board_grid_nm);
         Self {
             library_sources: native_sources::Sources::restore(cc.storage.and_then(|s| s.get_string(native_sources::STORAGE_KEY))),
             home: true,
@@ -329,6 +381,7 @@ impl PcbApp {
             board_appearance: board_appearance::Appearance::from_storage(
                 cc.storage.and_then(|storage| storage.get_string(board_appearance::STORAGE_KEY)),
             ),
+            routing_presets: board_presets::Presets::from_storage(cc.storage.and_then(|storage| storage.get_string(board_presets::STORAGE_KEY))),
             views,
             #[cfg(not(target_arch = "wasm32"))]
             files: project_files::ProjectFiles::with_recent(cc.storage.and_then(|storage| storage.get_string(RECENT_PROJECTS_KEY)).as_deref()),
@@ -385,13 +438,23 @@ impl PcbApp {
         }
         self.views.sync(&self.session);
         self.message = None;
-        self.views.active.schematic.tool =
-            Some(Tool::PlaceSymbol { value: definition.default_value().to_owned(), definition, revision: self.session.revision(), turns: 0 });
+        self.views.active.schematic.tool = Some(Tool::PlaceSymbol {
+            unit: definition.unit_id().to_owned(),
+            component: None,
+            part: None,
+            value: definition.default_value().to_owned(),
+            definition,
+            revision: self.session.revision(),
+            turns: 0,
+        });
     }
 
     /// Arm the ordinary placement tool with an instance Value captured by any catalog gesture.
     fn begin_template(&mut self, placement: parts_browser::Placement) {
         self.begin_placement(placement.definition);
+        if let Some(Tool::PlaceSymbol { part, .. }) = &mut self.views.active.schematic.tool {
+            *part = placement.part;
+        }
         if let Some(Tool::PlaceSymbol { value, .. }) = &mut self.views.active.schematic.tool {
             *value = placement.value;
         }
@@ -565,6 +628,7 @@ impl PcbApp {
                 }
             }
             SymbolAction::Rotate => self.run(ROTATE_SYMBOL, &json!({"symbol": id, "expected_revision": revision})),
+            SymbolAction::Mirror(axis) => self.run(MIRROR_SYMBOL, &json!({"symbol": id, "axis": axis.as_str(), "expected_revision": revision})),
             SymbolAction::Delete => {
                 self.run(DELETE_SYMBOL, &json!({"symbol": id, "expected_revision": revision}));
                 if self.message.is_none() {
@@ -628,7 +692,8 @@ impl PcbApp {
 
     /// Commit a finished reshape drag through the matching shared command at the revision the
     /// drag began on, so an edit made meanwhile makes it fail visibly. Segments rebind to the
-    /// new geometry when unambiguous, otherwise clear; corner/junction edits keep the wire selected.
+    /// new geometry when unambiguous, otherwise clear; corner/junction edits retain the
+    /// grabbed wire or marker selection.
     /// Dropping a junction on an explicit endpoint attaches it; free positions only reshape it.
     fn reshape_wire(&mut self, drag: &schematic_canvas::ReshapeDrag, to: pcbcraft_engine::wire::Anchor, revision: u64) {
         use pcbcraft_engine::wire::{Anchor, Reshape};
@@ -818,16 +883,16 @@ impl PcbApp {
         !self.home && self.assistant.shortcuts(ctx)
     }
 
-    /// Render the workspace toolbar using ported schematic groups and upstream PCB/View controls.
-    /// Saved tab slots stay stable while visual ordering follows Next; quick actions use the focused view.
-    fn ribbon(&mut self, ui: &mut Ui) {
+    /// Render task-oriented tabs for the focused workspace, preserving stable saved slots.
+    /// Unsupported slots fall back to its first tab; quick actions use the focused view.
+    fn ribbon(&mut self, ui: &mut Ui) -> Option<workspace::RibbonBackground> {
         use workspace::{RibbonTool, ToolIcon};
         let current = self.views.active.workspace;
         let board = current == Workspace::Board;
         let order: &[usize] = if board { &ribbon::BOARD_TAB_ORDER } else { &ribbon::TAB_ORDER };
         let mut tab = order.iter().position(|slot| *slot == self.ribbon_tab).unwrap_or(0);
         let entries = self.workspace_entries();
-        let tabs: &[&str] = if board { &["Layout", "Libraries", "View"] } else { &RIBBON_TABS };
+        let tabs: &[&str] = if board { &BOARD_RIBBON_TABS } else { &RIBBON_TABS };
         let has_project = self.session.project().is_some();
         let mut quick = Vec::new();
         if self.ribbon_tab != VIEW_TAB {
@@ -839,7 +904,7 @@ impl PcbApp {
                     shortcut: "",
                     enabled: has_project,
                     active: has_project && self.net_inspector.open,
-                    toggle: true,
+                    menu_check: Some(CheckKind::Toggle),
                 });
             }
             quick.push(RibbonTool {
@@ -849,20 +914,34 @@ impl PcbApp {
                 shortcut: "",
                 enabled: has_project,
                 active: false,
-                toggle: false,
+                menu_check: None,
             });
         }
-        let response =
-            workspace::ribbon(ui, current.title(), tabs, &mut tab, workspace::Workspaces { entries: &entries, ..WORKSPACES }, &quick, |ui, shown| {
-                let slot = order[shown];
-                if slot == VIEW_TAB {
-                    self.view_tab(ui);
-                } else if board && slot == 0 {
-                    self.board_tab(ui);
-                } else {
-                    self.ported_ribbon_tab(ui, slot);
+        let response = workspace::ribbon_with_controls(
+            ui,
+            current.title(),
+            tabs,
+            &mut tab,
+            workspace::RibbonLayout {
+                workspaces: workspace::Workspaces { entries: &entries, ..WORKSPACES },
+                quick: &quick,
+                pinned_fields: if board { 3 } else { 0 },
+                controls_label: "Layer & sizes",
+            },
+            |ui, section| match section {
+                workspace::RibbonSection::Commands(shown) => {
+                    let slot = order[shown];
+                    if slot == VIEW_TAB {
+                        self.view_tab(ui);
+                    } else if board && slot != 3 {
+                        self.board_tab(ui, slot);
+                    } else {
+                        self.ported_ribbon_tab(ui, slot);
+                    }
                 }
-            });
+                workspace::RibbonSection::Controls { compact } => self.board_ribbon_controls(ui, compact),
+            },
+        );
         self.ribbon_tab = order[tab];
         if let Some(action) = response.quick {
             if !board && action == 0 {
@@ -876,9 +955,10 @@ impl PcbApp {
         if let Some(pick) = response.workspace {
             self.pick_workspace(ui.ctx(), pick);
         }
+        response.background
     }
 
-    /// The View tab: show or hide contextual panels, fit the active view, and toggle the split.
+    /// The View tab: control the workspace grid, contextual panels, navigation and editor layout.
     /// Each group's caption also lists its actions in a menu, with check marks for the panels.
     fn view_tab(&mut self, ui: &mut Ui) {
         use workspace::{RibbonTool, ToolIcon};
@@ -886,6 +966,19 @@ impl PcbApp {
         let has_project = self.session.project().is_some();
         let schematic = self.views.active.workspace == Workspace::Schematic;
         let parts = schematic && self.session.available(PLACE_SYMBOL);
+        let grid = [RibbonTool {
+            icon: ToolIcon::Grid,
+            label: "Grid",
+            description: "Show grid",
+            shortcut: "",
+            enabled: has_project,
+            active: self.preferences.grid_visible(!schematic),
+            menu_check: Some(pcbcraft_chrome::menu::CheckKind::Toggle),
+        }];
+        if workspace::ribbon_group(ui, "Display", &grid).is_some() {
+            self.preferences.set_grid_visible(!schematic, !self.preferences.grid_visible(!schematic));
+        }
+        workspace::ribbon_separator(ui);
         let panels = [
             RibbonTool {
                 icon: ToolIcon::Browser,
@@ -894,7 +987,7 @@ impl PcbApp {
                 shortcut: "",
                 enabled: has_project,
                 active: has_project && self.browser.open,
-                toggle: true,
+                menu_check: Some(CheckKind::Toggle),
             },
             RibbonTool {
                 icon: ToolIcon::Symbol,
@@ -903,7 +996,7 @@ impl PcbApp {
                 shortcut: "",
                 enabled: parts,
                 active: parts && self.parts.open,
-                toggle: true,
+                menu_check: Some(CheckKind::Toggle),
             },
             RibbonTool {
                 icon: ToolIcon::Nets,
@@ -912,7 +1005,7 @@ impl PcbApp {
                 shortcut: "",
                 enabled: has_project && schematic,
                 active: has_project && self.net_inspector.open,
-                toggle: true,
+                menu_check: Some(CheckKind::Toggle),
             },
             RibbonTool {
                 icon: ToolIcon::Settings,
@@ -921,7 +1014,7 @@ impl PcbApp {
                 shortcut: "",
                 enabled: has_project && schematic,
                 active: self.properties_open,
-                toggle: true,
+                menu_check: Some(CheckKind::Toggle),
             },
             RibbonTool {
                 icon: ToolIcon::Select,
@@ -930,7 +1023,7 @@ impl PcbApp {
                 shortcut: "",
                 enabled: has_project,
                 active: self.views.active.filters_open,
-                toggle: true,
+                menu_check: Some(CheckKind::Toggle),
             },
         ];
         let toggled = match workspace::ribbon_group(ui, "Panels", &panels) {
@@ -954,10 +1047,27 @@ impl PcbApp {
             shortcut: "",
             enabled: has_project,
             active: false,
-            toggle: false,
+            menu_check: None,
         }];
-        if workspace::ribbon_group(ui, "Navigate", &navigate).is_some() {
-            self.fit_view(self.views.active.id());
+        let mut navigate = navigate.to_vec();
+        if !schematic {
+            navigate.push(RibbonTool {
+                icon: ToolIcon::FlipView,
+                label: "Flip view",
+                description: "View the board from below",
+                shortcut: "",
+                enabled: self.session.project().and_then(|project| project.board_target()).is_some(),
+                active: self.views.active.camera.mirrored(),
+                menu_check: Some(pcbcraft_chrome::menu::CheckKind::Toggle),
+            });
+        }
+        match workspace::ribbon_group(ui, "Navigate", &navigate) {
+            Some(0) => self.fit_view(self.views.active.id()),
+            Some(1) => {
+                let camera = &mut self.views.active.camera;
+                camera.set_mirrored(!camera.mirrored());
+            }
+            _ => {}
         }
         workspace::ribbon_separator(ui);
         let mut editors = vec![
@@ -968,7 +1078,7 @@ impl PcbApp {
                 shortcut: "",
                 enabled: has_project,
                 active: self.views.is_split(),
-                toggle: true,
+                menu_check: Some(CheckKind::Toggle),
             },
             RibbonTool {
                 icon: ToolIcon::Settings,
@@ -977,7 +1087,7 @@ impl PcbApp {
                 shortcut: "",
                 enabled: true,
                 active: false,
-                toggle: false,
+                menu_check: None,
             },
         ];
         if !IN_BROWSER {
@@ -988,7 +1098,7 @@ impl PcbApp {
                 shortcut: "",
                 enabled: has_project,
                 active: false,
-                toggle: false,
+                menu_check: None,
             });
             editors.push(RibbonTool {
                 icon: ToolIcon::EditorWindow,
@@ -997,7 +1107,7 @@ impl PcbApp {
                 shortcut: "",
                 enabled: has_project,
                 active: false,
-                toggle: false,
+                menu_check: None,
             });
         }
         match workspace::ribbon_group(ui, "Editors", &editors) {
@@ -1081,13 +1191,15 @@ impl PcbApp {
     /// the focused view's grid spacing, which can be changed there. Home has no canvas, so it
     /// shows no grid. Density annotations follow the visible grid style, independently of snapping.
     /// PCB views report their active tool/layer and explicitly label a hidden active layer.
+    /// A mirrored board keeps its orientation label alongside action hints and errors.
     fn status(&mut self, ui: &mut Ui) {
         let name = self.session.project().map_or("No project open", |p| p.name.as_str()).to_owned();
         let message = self.message.clone();
         let grid_view = (!self.home && self.session.project().is_some()).then(|| self.views.active.id());
         let mut spacing = self.views.active.camera.snap_nm();
+        let grid_workspace = self.views.active.workspace;
         let every = grid::shown_every(self.views.active.camera.snap_step()).unwrap_or(1);
-        let grid_style = if self.preferences.grid_opacity_percent == 0 {
+        let grid_style = if !self.preferences.grid_visible(self.views.active.workspace == Workspace::Board) {
             grid::Style::Off
         } else if self.views.active.workspace == Workspace::Board {
             self.preferences.board_grid_style
@@ -1134,19 +1246,58 @@ impl PcbApp {
             ui,
             |ui| {
                 ui.label(dim(name));
+                if !self.home
+                    && self.views.active.workspace == Workspace::Board
+                    && self.views.active.board.target.is_some()
+                    && self.views.active.camera.mirrored()
+                {
+                    ui.label(dim("Bottom view"));
+                }
                 if let Some(message) = message {
                     ui.label(shell::error(message));
+                } else if self.views.active.board.clipboard.active() {
+                    ui.label(dim("Paste · Click to place · R rotate · Esc cancel"));
                 } else if self.views.active.workspace == Workspace::Board && self.views.active.board.placement.is_some() {
                     ui.label(dim("Place footprints · Click to place · R rotate · Esc cancel"));
                 } else if self.views.active.workspace == Workspace::Board {
                     let empty = self.session.project().is_some_and(|project| project.board_target().is_none());
                     ui.label(dim(board_status.as_deref().unwrap_or(if empty { "No board" } else { "Board" })));
+                    if let Some(net) = &self.views.active.board.highlight_net {
+                        ui.label(dim(format!("Net {net} highlighted · ` over empty space clears")));
+                    }
+                    if self.views.active.board.measure.tool {
+                        ui.label(dim("Measure · Click a start point, then an end point · Esc clears"));
+                    }
+                    if let Some(status) = self.views.active.board.tracks.preparation_status() {
+                        ui.label(dim(status));
+                    }
+                    if !empty {
+                        ui.label(dim(self.views.active.board.drc.status(self.views.active.board.target, self.session.revision())));
+                    }
+                    // File results, such as a saved fabrication archive, would otherwise be hidden
+                    // behind the board status in this workspace.
+                    if let Some(notice) = &self.file_notice {
+                        ui.label(dim(notice.as_str()));
+                    }
+                } else if self.views.active.schematic.clipboard.active() || self.views.active.board.clipboard.active() {
+                    ui.label(dim(if self.views.active.schematic.clipboard.can_rotate() {
+                        "Paste · Click to place · R rotate · Esc cancel"
+                    } else {
+                        "Paste · Click to place · Esc cancel"
+                    }));
+                } else if self.views.active.schematic.tool.is_none()
+                    && !self.views.active.schematic.selection.no_connects.is_empty()
+                    && self.views.active.schematic.selection.len() == self.views.active.schematic.selection.no_connects.len()
+                {
+                    let count = self.views.active.schematic.selection.len();
+                    ui.label(dim(format!("{count} no-connect marker{} selected · Del delete", if count == 1 { "" } else { "s" })));
                 } else if self.views.active.schematic.tool.is_none() && self.views.active.schematic.selection.len() > 1 {
                     ui.label(dim(format!("{} items selected · Drag to move · Del delete", self.views.active.schematic.selection.len())));
                 } else if let (None, Some(reference)) = (&self.views.active.schematic.tool, self.selected_reference()) {
                     ui.label(dim(format!("{reference} selected · R rotate · E edit fields · Del delete")));
                 } else if let Some(tool) = &self.views.active.schematic.tool {
                     ui.label(match tool {
+                        Tool::NoConnect { .. } => dim("No connect · Esc cancel"),
                         Tool::Field { .. } => dim("Move symbol field · Esc to cancel"),
                         Tool::SheetGesture { drag, .. } => {
                             dim(if drag.corner.is_some() { "Resize sheet · Esc to cancel" } else { "Move sheet · Esc to cancel" })
@@ -1157,7 +1308,9 @@ impl PcbApp {
                         Tool::Move { disconnect: true, .. } => dim("Disconnect and move symbol · R rotate · Esc cancel"),
                         Tool::Move { pickup: true, .. } => dim("Grab symbol · R rotate · Click to place · Esc cancel"),
                         Tool::Move { .. } => dim("Move symbol · R rotate · Esc cancel"),
-                        Tool::MoveItems { .. } => dim("Move selection · Esc to cancel"),
+                        Tool::MoveItems { pickup: true, disconnect: true, .. } => dim("Move selection · Click to place · Esc cancel"),
+                        Tool::MoveItems { pickup: true, .. } => dim("Grab selection · Click to place · Esc cancel"),
+                        Tool::MoveItems { .. } => dim("Grab selection · Esc to cancel"),
                         Tool::Reshape { drag, .. } if drag.pickup => dim("Grab wire · Click to place · Esc cancel"),
                         Tool::Reshape { .. } => dim("Reshape wire · Esc to cancel"),
                         Tool::BoxSelect { .. } => dim("Select items · Esc to cancel"),
@@ -1186,8 +1339,8 @@ impl PcbApp {
                     grid_changed = grid::spacing_menu(
                         ui,
                         &mut spacing,
-                        &grid::SCHEMATIC_SPACING_PRESETS_NM,
-                        grid::SCHEMATIC_SPACING_DEFAULT_NM,
+                        grid_workspace.grid_presets(),
+                        grid_workspace.grid_default_nm(),
                         every,
                         unit,
                         grid_style,
@@ -1210,9 +1363,10 @@ impl PcbApp {
     }
 
     /// Draw the schematic and send completed edits through the shared command catalog using each
-    /// gesture's starting revision to reject stale actions. M picks up the selected symbol or,
-    /// without a selection, the hovered symbol for disconnected movement. G picks up the hovered
-    /// symbol with its wires attached, or a wire handle. Pickup stays view-only until a click commits it.
+    /// gesture's starting revision to reject stale actions. M picks up a multi-item selection or a
+    /// selected wire for disconnected translation, or a sole selected/otherwise hovered symbol
+    /// for disconnected movement. G grabs a multi-item selection, hovered symbol or wire handle
+    /// while retaining external attachments. Pickup stays view-only until a click commits it.
     /// Cancel clears only the local preview, and an unfinished tool cannot be replaced by a queued shortcut.
     /// R rotates an active symbol/field preview, otherwise targeting hovered text before its body.
     /// D opens a component's saved datasheet
@@ -1260,8 +1414,9 @@ impl PcbApp {
                             }
                         }
                     }
-                    let moving = std::mem::take(&mut self.views.active.schematic.move_requested);
+                    let mut moving = std::mem::take(&mut self.views.active.schematic.move_requested);
                     let rotating = std::mem::take(&mut self.views.active.schematic.rotate_requested);
+                    let mirroring = self.views.active.schematic.mirror_requested.take();
                     let datasheet = std::mem::take(&mut self.views.active.schematic.datasheet_requested);
                     if datasheet
                         && input_enabled
@@ -1270,7 +1425,26 @@ impl PcbApp {
                     {
                         self.open_datasheet(ui, project);
                     }
-                    if (moving || rotating)
+                    // Group and wire selections take M before hovered symbol handling, including
+                    // when a wire segment was highlighted. Reuse the same group translation tool.
+                    if moving
+                        && input_enabled
+                        && self.views.active.schematic.tool.is_none()
+                        && (self.views.active.schematic.selection.len() > 1 || self.views.active.schematic.selection.single_wire().is_some())
+                    {
+                        moving = false;
+                        let rect = ui.available_rect_before_wrap();
+                        let mut items = self.views.active.schematic.selection.clone();
+                        self.views.active.filters.retain(&mut items, snapshot.as_deref());
+                        if items == self.views.active.schematic.selection
+                            && let Some(source) = source
+                            && let Some(pointer) = ui.input(|input| input.pointer.hover_pos()).filter(|point| rect.contains(*point))
+                        {
+                            let origin = self.views.active.camera.snap(pointer, rect);
+                            self.view_click(source, Click::MoveItems { items, origin, pickup: true, disconnect: true });
+                        }
+                    }
+                    if (moving || rotating || mirroring.is_some())
                         && input_enabled
                         && self.views.active.schematic.tool.is_none()
                         && self.views.active.filters.symbols
@@ -1301,11 +1475,19 @@ impl PcbApp {
                             let target = if moving { selected.or(hovered) } else { hovered.or(selected) };
                             if let Some(symbol) = target {
                                 self.select(Selection::one_symbol(symbol));
-                                self.edit_selected(if moving { SymbolAction::DisconnectMove } else { SymbolAction::Rotate });
+                                let action = match (moving, mirroring) {
+                                    (true, _) => SymbolAction::DisconnectMove,
+                                    (false, Some(axis)) => SymbolAction::Mirror(axis),
+                                    (false, None) => SymbolAction::Rotate,
+                                };
+                                self.edit_selected(action);
                             }
                         }
                     }
                     if let Some(project) = snapshot.as_deref() {
+                        if self.schematic_clipboard_canvas(ui, project, &label, input_enabled) {
+                            return None;
+                        }
                         let highlight = self.views.highlight_for(self.views.active.id(), &self.session);
                         let edited = self.views.active.schematic.text_edit.as_ref().map(|edit| edit.target.clone());
                         let click = schematic_canvas::show(
@@ -1313,6 +1495,7 @@ impl PcbApp {
                             project,
                             self.session.revision(),
                             &mut self.views.active.camera,
+                            &mut self.views.active.schematic.overlap_cache,
                             self.views.active.schematic.tool.clone(),
                             &self.views.active.schematic.selection,
                             self.views.active.schematic.selected_leg.as_ref(),
@@ -1321,8 +1504,9 @@ impl PcbApp {
                             &highlight,
                             self.views.active.filters,
                             input_enabled,
+                            input_enabled,
                             self.preferences.navigation,
-                            self.preferences.grid_opacity_percent,
+                            self.preferences.grid_opacity(false),
                             self.preferences.auto_heal_wires,
                             self.parts.repeats(),
                             self.preferences.units,
@@ -1363,7 +1547,21 @@ impl PcbApp {
         {
             return;
         }
+        if let Click::WirePoint(anchor, _) | Click::StartWire(anchor) = &click
+            && let Some(project) = self.views.active.snapshot(&self.session)
+            && let Some(at) = anchor.position(&project)
+            && let Err(error) = project.wire_attachment_policy().check(at)
+        {
+            self.message = Some(error.to_string());
+            return;
+        }
         match (self.views.active.schematic.tool.clone(), click) {
+            (None, Click::BeginNoConnect) => self.begin_no_connect(),
+            (None | Some(Tool::NoConnect { .. }), Click::NoConnect(target, marked)) => self.set_no_connect(source, target, marked),
+            (Some(Tool::NoConnect { .. }), Click::CancelNoConnect) => self.views.active.schematic.tool = None,
+            (Some(Tool::NoConnect { .. }), Click::InvalidNoConnect) => {
+                self.message = Some("No-connect marks attach to a pin lead or an open wire end.".into())
+            }
             (_, Click::ToolAction(action, ctx)) => self.canvas_tool_action(&ctx, action),
             (None, Click::GrabField(drag)) => {
                 self.select(Selection::one_symbol(drag.symbol.clone()));
@@ -1420,14 +1618,24 @@ impl PcbApp {
             }
             (Some(Tool::Hierarchy { kind, id, .. }), Click::HierarchyPlace(at)) => self.hierarchy_place(source, kind, id, at),
             (None, Click::HierarchyAction(kind, id, action)) => self.hierarchy_action(source, kind, id, action),
-            (Some(Tool::PlaceSymbol { definition, value, revision, turns }), Click::Place(point)) => {
+            (None, Click::HierarchyClipboard(kind, id, action, ctx)) => self.hierarchy_clipboard_action(&ctx, kind, id, action),
+            (Some(Tool::PlaceSymbol { definition, unit, component, part, value, revision, turns }), Click::Place(point)) => {
                 self.views.active.schematic.tool = None;
-                self.place_catalog_symbol(
-                    &definition,
-                    json!({"x_nm": point.x_nm, "y_nm": point.y_nm, "expected_revision": revision, "rotation": u16::from(turns) * 90, "value":value}),
-                );
-                if self.parts.repeats() && self.message.is_none() && self.session.revision() > revision {
-                    self.views.active.schematic.tool = Some(Tool::PlaceSymbol { definition, value, revision: self.session.revision(), turns });
+                let mut params =
+                    json!({"x_nm": point.x_nm, "y_nm": point.y_nm, "expected_revision": revision, "rotation": u16::from(turns) * 90, "unit":unit});
+                if let Some(component) = component {
+                    params["component"] = json!(component);
+                    self.run(pcbcraft_engine::PLACE_UNIT, &params);
+                } else {
+                    params["value"] = json!(value);
+                    self.place_native_template(
+                        &parts_browser::Placement { definition: definition.clone(), value: value.clone(), part: part.clone() },
+                        params,
+                    );
+                    if self.parts.repeats() && self.message.is_none() && self.session.revision() > revision {
+                        self.views.active.schematic.tool =
+                            Some(Tool::PlaceSymbol { definition, unit, component: None, part, value, revision: self.session.revision(), turns });
+                    }
                 }
             }
             (Some(Tool::Wire { revision, start: None }), Click::WirePoint(anchor, _)) => {
@@ -1475,20 +1683,25 @@ impl PcbApp {
                 self.select(symbol.map(Selection::one_symbol).unwrap_or_default());
             }
             (None, Click::SelectLeg(leg)) => self.select_leg(leg),
-            (None, Click::GrabItems(items, origin)) => {
-                let whole_wire_drag = self.views.active.schematic.whole_wire_drag && items.single_wire().is_some();
+            (None | Some(Tool::Wire { start: None, .. }), Click::MoveItems { items, origin, pickup, disconnect }) => {
+                let whole_wire_drag = (pickup || self.views.active.schematic.whole_wire_drag) && items.single_wire().is_some();
                 self.select(items.clone());
                 self.views.active.schematic.whole_wire_drag = whole_wire_drag;
-                self.views.active.schematic.tool = Some(Tool::MoveItems { items, origin, revision: self.session.revision() });
+                self.views.active.schematic.tool = Some(Tool::MoveItems { items, origin, revision: self.session.revision(), pickup, disconnect });
             }
-            (Some(Tool::MoveItems { items, revision, .. }), Click::FinishItems(delta)) => {
+            (Some(Tool::MoveItems { items, revision, disconnect, .. }), Click::FinishItems(delta)) => {
                 self.views.active.schematic.tool = None;
                 if let Some(delta) = delta {
-                    self.run(pcbcraft_engine::MOVE_ITEMS, &json!({"items":items,"dx_nm":delta.x_nm,"dy_nm":delta.y_nm,"expected_revision":revision}));
+                    self.run(
+                        pcbcraft_engine::MOVE_ITEMS,
+                        &json!({"items":items,"dx_nm":delta.x_nm,"dy_nm":delta.y_nm,"disconnect":disconnect,"expected_revision":revision}),
+                    );
                 }
             }
             (None | Some(Tool::Wire { start: None, .. }), Click::GrabReshape(drag)) => {
-                if let pcbcraft_engine::wire::Reshape::Segment { wire, at } = &drag.edit {
+                if let Some(marker) = &drag.marker {
+                    self.select(Selection::one_no_connect(pcbcraft_engine::no_connect::Attachment::WireEnd(marker.clone())));
+                } else if let pcbcraft_engine::wire::Reshape::Segment { wire, at } = &drag.edit {
                     if let Some(leg) = self
                         .views
                         .active
@@ -1517,8 +1730,8 @@ impl PcbApp {
                 }
                 let revision = drag_source.revision;
                 self.views.active.schematic.tool = None;
-                self.place_catalog_symbol(
-                    &placement.definition,
+                self.place_native_template(
+                    &placement,
                     json!({"x_nm": point.x_nm, "y_nm": point.y_nm, "expected_revision": revision, "value":placement.value}),
                 );
                 if self.parts.repeats() && self.message.is_none() && self.session.revision() > revision {
@@ -1552,10 +1765,13 @@ impl PcbApp {
     }
 
     /// Context menus share the same catalog, drawing and preview handlers as ribbon actions.
-    /// These actions never publish authored data; placement still uses validated canvas input.
+    /// Clipboard edits use shared commands; placement still uses validated canvas input.
     fn canvas_tool_action(&mut self, ctx: &egui::Context, action: schematic_canvas::ToolAction) {
         use schematic_canvas::ToolAction;
         match action {
+            ToolAction::Copy | ToolAction::Cut => self.copy_schematic_clipboard(ctx, matches!(action, ToolAction::Cut)),
+            ToolAction::Paste | ToolAction::PasteOptions => self.request_clipboard(ctx, matches!(action, ToolAction::PasteOptions)),
+            ToolAction::Duplicate => self.duplicate_schematic_clipboard(),
             ToolAction::Symbols => self.parts.focus_search(),
             ToolAction::Wire => self.begin_wire(),
             ToolAction::Ground => self.begin_ground(ctx),
@@ -1588,6 +1804,7 @@ impl PcbApp {
             symbols: project.symbols().iter().map(|symbol| symbol.id()).collect(),
             wires: project.wires().iter().map(|wire| wire.id()).collect(),
             net_labels: project.net_labels().iter().map(|label| label.object_id()).collect(),
+            no_connects: project.no_connect_appearances().map(|(target, _)| target).collect(),
         };
         self.views.active.filters.retain(&mut selected, Some(&project));
         self.select(selected);
@@ -1603,11 +1820,13 @@ impl PcbApp {
             return;
         }
         self.views.active.schematic.rotate_requested = false;
+        self.views.active.schematic.mirror_requested = None;
         self.views.active.schematic.edit_requested = false;
         self.views.active.schematic.datasheet_requested = false;
         self.views.active.schematic.move_requested = false;
         self.views.active.board.move_requested = false;
         self.views.active.board.rotate_requested = 0;
+        self.views.active.board.flip_requested = false;
         if self.views.active.schematic.text_edit.is_some() {
             return;
         }
@@ -1630,10 +1849,12 @@ impl PcbApp {
             && !egui::Popup::is_any_open(ctx)
             && !ctx.text_edit_focused()
         {
+            let routing = self.views.active.board.tracks.routing();
+            let page_keys = Modifiers { ctrl: routing && ctx.input(|i| i.modifiers.ctrl), ..Modifiers::NONE };
             let layer_direction = ctx.input_mut(|input| {
-                if input.consume_key(Modifiers::NONE, Key::PageUp) {
+                if input.consume_key(page_keys, Key::PageUp) {
                     Some("front")
-                } else if input.consume_key(Modifiers::NONE, Key::PageDown) {
+                } else if input.consume_key(page_keys, Key::PageDown) {
                     Some("back")
                 } else if input.consume_key(Modifiers::NONE, Key::Plus)
                     || input.consume_key(Modifiers::SHIFT, Key::Plus)
@@ -1646,11 +1867,32 @@ impl PcbApp {
                     None
                 }
             });
+            // Mid-route, PgUp and PgDn drop a via and continue on front or back copper, as in
+            // KiCad, instead of changing layer by abandoning the route.
+            let layer_direction = match layer_direction {
+                Some(side @ ("front" | "back")) if routing => {
+                    if let Some(state) = self.views.view_mut(view) {
+                        state.board.tracks.via_side_requested = Some(if side == "front" {
+                            pcbcraft_engine::board::setup::Side::Front
+                        } else {
+                            pcbcraft_engine::board::setup::Side::Back
+                        });
+                    }
+                    None
+                }
+                other => other,
+            };
             if let Some(direction) = layer_direction {
                 let _ = self.navigate_board_layer(view, direction);
             }
         }
         if self.parts.is_modal() || ctx.egui_wants_keyboard_input() || !matches!(self.dialog, Dialog::None) {
+            return;
+        }
+        if self.clipboard_shortcuts(ctx, assistant_keys) {
+            return;
+        }
+        if self.views.active.schematic.clipboard.active() || self.views.active.board.clipboard.active() {
             return;
         }
         let pressed = |shortcut: &KeyboardShortcut| ctx.input_mut(|i| i.consume_shortcut(shortcut));
@@ -1659,32 +1901,52 @@ impl PcbApp {
                 self.home = false;
             }
         } else if !assistant_keys && !egui::Popup::is_any_open(ctx) && self.views.active.workspace == Workspace::Board {
-            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
-                && !self.views.active.board.tracks.escape()
-                && !self.views.active.board.drawing.escape()
-                && self.views.active.board.draft.take().is_none()
-                && self.views.active.board.placement.take().is_none()
-                && self.views.active.board.box_drag.take().is_none()
+            if self.views.active.board.drc.pending() && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+                self.views.active.board.drc.cancel();
+                return;
+            }
+            // Ctrl temporarily bypasses the routing grid while these tool controls stay available.
+            let route_keys = Modifiers { ctrl: self.views.active.board.tracks.tool && ctx.input(|i| i.modifiers.ctrl), ..Modifiers::NONE };
+            if ctx.input_mut(|i| i.consume_key(route_keys, Key::Escape))
+                && (!board_clipboard::busy(&self.views.active.board)
+                    || (!self.views.active.board.measure.escape()
+                        && !self.views.active.board.tracks.escape()
+                        && !self.views.active.board.drawing.escape()
+                        && self.views.active.board.draft.take().is_none()
+                        && self.views.active.board.reference_drag.take().is_none()
+                        && self.views.active.board.placement.take().is_none()
+                        && self.views.active.board.box_drag.take().is_none()))
             {
-                self.views.select_board(Default::default(), &self.session, self.preferences.selection_follow);
+                self.select_board_items(Default::default());
             }
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Delete)) {
-                if !self.views.active.board.tracks.selected.is_empty() {
+                if !board_clipboard::busy(&self.views.active.board) {
+                    self.delete_board_items();
+                } else if !self.views.active.board.tracks.selected.is_empty() {
                     self.views.active.board.tracks.delete_requested = true;
                 } else if self.views.active.board.drawing.selected.is_some() {
                     self.views.active.board.drawing.delete_requested = true;
-                } else {
-                    self.delete_board_footprints(ctx, self.views.active.id());
                 }
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::A)) && !board_clipboard::busy(&self.views.active.board) {
+                self.select_all_board();
             }
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::X)) {
                 self.start_route();
             }
+            if pressed(&PLACE_VIA) {
+                self.start_via();
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::M)) {
+                self.start_measure();
+            }
+            self.views.active.board.tracks.connected_requested = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::U));
+            self.views.active.board.tracks.drag_segment_requested = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::D));
             if self.views.active.board.tracks.tool {
                 let tracks = &mut self.views.active.board.tracks;
-                tracks.finish_requested = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
-                tracks.backspace_requested = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Backspace));
-                tracks.posture_requested = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Slash));
+                tracks.finish_requested = ctx.input_mut(|i| i.consume_key(route_keys, Key::Enter));
+                tracks.backspace_requested = ctx.input_mut(|i| i.consume_key(route_keys, Key::Backspace));
+                tracks.posture_requested = ctx.input_mut(|i| i.consume_key(route_keys, Key::Slash));
                 tracks.via_requested = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::V));
             }
             if self.views.active.board.drawing.tool == Some(board_drawing::Tool::Lines) {
@@ -1692,6 +1954,8 @@ impl PcbApp {
                 self.views.active.board.drawing.backspace_requested = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Backspace));
             }
             self.views.active.board.move_requested = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::M));
+            self.views.active.board.flip_requested = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F));
+            self.views.active.board.net_highlight_requested = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Backtick));
             self.views.active.board.rotate_requested = if ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::R)) {
                 270
             } else if pressed(&ROTATE) {
@@ -1735,7 +1999,7 @@ impl PcbApp {
             }
             let selected_net_label = self.views.active.schematic.selection.single_net_label().is_some();
             let hierarchy_hovered = self.views.active.schematic.selection.len() <= 1
-                && ctx.input(|i| [Key::E, Key::Delete, Key::Backspace, Key::R, Key::M].into_iter().any(|key| i.key_pressed(key)))
+                && ctx.input(|i| [Key::E, Key::Delete, Key::Backspace, Key::R, Key::M, Key::X, Key::Y].into_iter().any(|key| i.key_pressed(key)))
                 && self.views.active.snapshot(&self.session).is_some_and(|project| {
                     selected_net_label
                         || ctx.input(|i| i.pointer.hover_pos()).is_some_and(|pointer| {
@@ -1792,6 +2056,15 @@ impl PcbApp {
                     self.views.active.schematic.rotate_requested = true;
                 }
             }
+            // X/Y reflect the hovered or selected symbol across its center without changing which
+            // pins are attached. Placement and move tools own orientation while they are active.
+            if !hierarchy_hovered && self.views.active.schematic.tool.is_none() {
+                if pressed(&MIRROR_HORIZONTAL) {
+                    self.views.active.schematic.mirror_requested = Some(pcbcraft_engine::schematic::MirrorAxis::Horizontal);
+                } else if pressed(&MIRROR_VERTICAL) {
+                    self.views.active.schematic.mirror_requested = Some(pcbcraft_engine::schematic::MirrorAxis::Vertical);
+                }
+            }
             if !hierarchy_hovered && self.views.active.schematic.tool.is_none() && pressed(&EDIT_FIELDS) {
                 self.views.active.schematic.edit_requested = true;
             }
@@ -1846,7 +2119,10 @@ impl PcbApp {
     /// Draw the open dialog and retain it until the person finishes or dismisses it.
     fn dialogs(&mut self, ctx: &egui::Context) {
         match std::mem::take(&mut self.dialog) {
-            Dialog::LibrarySources => self.library_sources_dialog(ctx),
+            Dialog::NoConnects(inspection) => self.no_connect_dialog(ctx, inspection),
+            Dialog::NativePart(edit) => self.native_part_properties_dialog(ctx, *edit),
+            Dialog::AddLibrary(source) => self.add_library_dialog(ctx, source),
+            Dialog::DeleteLibrary(draft) => self.delete_library_dialog(ctx, draft),
             Dialog::None => {}
             Dialog::Arrangement(edit) => self.arrangement_dialog(ctx, edit),
             Dialog::Name { command: id, mut text, mut error, mut focused } => {
@@ -1864,8 +2140,8 @@ impl PcbApp {
                         ui.label(shell::error(error.as_str()));
                     }
                     ui.horizontal(|ui| {
-                        submit |= ui.button("OK").clicked();
-                        cancel = ui.button("Cancel").clicked();
+                        submit |= pcbcraft_chrome::controls::button(ui, "OK").clicked();
+                        cancel = pcbcraft_chrome::controls::button(ui, "Cancel").clicked();
                     });
                 });
                 if submit {
@@ -1887,11 +2163,16 @@ impl PcbApp {
             Dialog::EditFields(edit) => self.symbol_properties_dialog(ctx, *edit),
             Dialog::LibraryClose(id) => self.library_close_dialog(ctx, id),
             Dialog::LibraryProperties(id, view) => self.library_properties_dialog(ctx, id, view),
+            Dialog::PasteOptions(draft) => self.paste_options_dialog(ctx, draft),
+            Dialog::BoardPasteOptions(draft) => self.board_paste_options_dialog(ctx, draft),
+            Dialog::ExternalPasteOptions(draft) => self.external_paste_options_dialog(ctx, draft),
             Dialog::LibraryArray(draft) => self.library_array_dialog(ctx, draft),
             Dialog::Footprint(edit) => self.footprint_assignment_dialog(ctx, *edit),
             Dialog::BoardUpdate(edit) => self.board_update_dialog(ctx, edit),
             Dialog::LayerColor(edit) => self.layer_color_dialog(ctx, edit),
+            Dialog::RoutingSize(edit) => self.routing_size_dialog(ctx, edit),
             Dialog::BoardSetup(edit) => self.board_setup_dialog(ctx, edit),
+            Dialog::BoardRules(edit) => self.board_rules_dialog(ctx, edit),
             Dialog::Sheet(edit) => self.sheet_dialog(ctx, edit),
             Dialog::Hierarchy(edit) => self.hierarchy_dialog(ctx, edit),
             Dialog::NetLabel(edit) => self.net_label_dialog(ctx, *edit),
@@ -1901,13 +2182,13 @@ impl PcbApp {
                 let mut cancel = false;
                 let closing = shell::dialog(ctx, "open_location", "Open Project", |ui| {
                     ui.vertical(|ui| {
-                        if ui.button("Project file or archive…").clicked() {
+                        if pcbcraft_chrome::controls::button(ui, "Project file or archive…").clicked() {
                             selected = Some(false);
                         }
-                        if ui.button("Project folder…").clicked() {
+                        if pcbcraft_chrome::controls::button(ui, "Project folder…").clicked() {
                             selected = Some(true);
                         }
-                        cancel = ui.button("Cancel").clicked();
+                        cancel = pcbcraft_chrome::controls::button(ui, "Cancel").clicked();
                     });
                 });
                 if let Some(folder) = selected {
@@ -1922,13 +2203,13 @@ impl PcbApp {
                 let title = if IN_BROWSER { "Download Project" } else { "Save Project As" };
                 let closing = shell::dialog(ctx, "save_encoding", title, |ui| {
                     ui.vertical(|ui| {
-                        if !IN_BROWSER && ui.button("Project folder…").clicked() {
+                        if !IN_BROWSER && pcbcraft_chrome::controls::button(ui, "Project folder…").clicked() {
                             selected = Some(SaveFormat::Folder);
                         }
-                        if ui.button("Packed project (.pc.zip)…").clicked() {
+                        if pcbcraft_chrome::controls::button(ui, "Packed project (.pc)…").clicked() {
                             selected = Some(SaveFormat::Archive);
                         }
-                        cancel = ui.button("Cancel").clicked();
+                        cancel = pcbcraft_chrome::controls::button(ui, "Cancel").clicked();
                     });
                 });
                 if let Some(encoding) = selected {
@@ -1973,8 +2254,9 @@ impl PcbApp {
                     ui.label("Electronics design for people and AI agents working together on the same board.");
                     ui.label(dim("MIT OR Apache-2.0. Third-party notices are in ATTRIBUTION.md."));
                     workspace::ribbon_licenses(ui);
+                    pcbcraft_chrome::fonts::licenses(ui);
                     ui.hyperlink_to("Report a bug", BUG_REPORT_URL);
-                    close = ui.button("Close").clicked();
+                    close = pcbcraft_chrome::controls::button(ui, "Close").clicked();
                 });
                 if !(closing || close) {
                     self.dialog = Dialog::About;
@@ -1987,7 +2269,7 @@ impl PcbApp {
         let dark = self.preferences.is_dark(ctx.system_theme());
         let zoom = self.preferences.zoom();
         if self.applied.is_none() {
-            fonts::install(ctx);
+            pcbcraft_chrome::install(ctx);
         }
         if self.applied != Some((dark, zoom)) {
             theme::apply(ctx, dark);
@@ -1996,7 +2278,8 @@ impl PcbApp {
         }
     }
 
-    /// Enable or revoke a connection for this window and copy its client configuration on request.
+    /// Require human input to enable a connection or export its credential-bearing configuration.
+    /// Synthetic input may still revoke the endpoint or close this dialog.
     #[cfg(not(target_arch = "wasm32"))]
     fn local_mcp_dialog(&mut self, ctx: &egui::Context, mut error: Option<String>, mut copied: bool) {
         let mut close = false;
@@ -2005,11 +2288,18 @@ impl PcbApp {
                 ui.label("Clients with this configuration can inspect and edit this project and control its editor windows.");
                 let disable = ui
                     .horizontal(|ui| {
-                        if ui.button(if copied { "Configuration copied" } else { "Copy configuration" }).clicked() {
+                        if pcbcraft_chrome::controls::enabled_button(
+                            ui,
+                            pcbcraft_chrome::automation::human_input(ctx),
+                            if copied { "Configuration copied" } else { "Copy configuration" },
+                        )
+                        .clicked()
+                            && pcbcraft_chrome::automation::human_input(ctx)
+                        {
                             ctx.copy_text(control.client_configuration());
                             copied = true;
                         }
-                        ui.button("Disable connection").clicked()
+                        pcbcraft_chrome::controls::button(ui, "Disable connection").clicked()
                     })
                     .inner;
                 if disable {
@@ -2018,7 +2308,9 @@ impl PcbApp {
                 }
             } else {
                 ui.label("Let a local MCP client inspect and edit this project and control its editor windows.");
-                if ui.button("Enable local connection").clicked() {
+                if pcbcraft_chrome::controls::enabled_button(ui, pcbcraft_chrome::automation::human_input(ctx), "Enable local connection").clicked()
+                    && pcbcraft_chrome::automation::human_input(ctx)
+                {
                     match live_control::LiveControl::start(ctx) {
                         Ok(control) => {
                             self.live_control = Some(control);
@@ -2031,7 +2323,7 @@ impl PcbApp {
             if let Some(error) = &error {
                 ui.label(shell::error(error.as_str()));
             }
-            close = ui.button("Close").clicked();
+            close = pcbcraft_chrome::controls::button(ui, "Close").clicked();
         });
         if !(close || dismissed) {
             self.dialog = Dialog::LocalMcp { error, copied };
@@ -2053,8 +2345,19 @@ impl PcbApp {
             }
             Some(Ok(Some(request))) => request,
         };
+        if self.defer_design_check(ctx, request.body()) {
+            self.start_remote_check(ctx, request, false);
+            return;
+        }
+        if self.defer_copper(request.body()) {
+            self.start_remote_copper(ctx, request, false);
+            return;
+        }
         let revision = self.session.revision();
         let result = pcbcraft_mcp::live::call_editor(&mut live_control::LiveEditor { app: self, ctx }, request.body());
+        if let Some(live) = &self.live_control {
+            self.automation.authorize(live.automation_owner(false, request.generation()));
+        }
         if self.session.revision() != revision {
             self.views.sync(&self.session);
             let title = request.body()["params"]["command"].as_str().and_then(command).map_or("Edit", |command| command.title);
@@ -2077,6 +2380,11 @@ impl PcbApp {
         self.library_editors.poll();
         self.adopt_opened_library(&ctx);
         self.sync_library_bindings();
+        match self.fabrication_exports.poll() {
+            Some(Ok(board_outputs::Outcome::Saved)) => self.file_notice = Some("Saved fabrication outputs".into()),
+            Some(Ok(board_outputs::Outcome::Cancelled)) | None => {}
+            Some(Err(error)) => self.message = Some(error),
+        }
         if let Some(update) = self.files.poll(&mut self.session, &ctx) {
             match update {
                 project_files::Update::Opened => {
@@ -2099,14 +2407,26 @@ impl PcbApp {
         self.views.sync(&self.session);
         self.sync_arrangements(&ctx);
         #[cfg(not(target_arch = "wasm32"))]
-        self.poll_live_control(&ctx);
+        {
+            self.poll_remote_check(&ctx);
+            self.poll_remote_copper(&ctx);
+            self.poll_live_control(&ctx);
+        }
         if self.views.hosts.contains_key(&editor_layout::HostId::ROOT) {
             self.editor_host_frame(ui, self.integrated_titlebar);
         }
         #[cfg(not(target_arch = "wasm32"))]
+        self.root_window_title(&ctx);
+        #[cfg(not(target_arch = "wasm32"))]
         self.detached_editor(&ctx);
         self.finish_editor_drag(&ctx);
         self.finish_view_actions(&ctx);
+        self.poll_copper_preparations(&ctx);
+        for view in self.views.all_mut() {
+            if view.board.drc.poll(&self.session, view.board.target) {
+                ctx.request_repaint_after(std::time::Duration::from_millis(8));
+            }
+        }
         self.finish_arrangement_action(&ctx);
         self.checkpoint_arrangements();
         if let Some(notice) = self.arrangements.notice.take() {
@@ -2124,6 +2444,25 @@ impl PcbApp {
     /// enabled above project dialogs and still route Close through the shared lifecycle policy.
     fn editor_host_frame(&mut self, ui: &mut Ui, integrated_titlebar: bool) {
         let ctx = ui.ctx().clone();
+        #[cfg(not(target_arch = "wasm32"))]
+        let observing = self.automation.observing;
+        #[cfg(target_arch = "wasm32")]
+        let observing = false;
+        pcbcraft_chrome::automation::begin(ui.ctx(), observing);
+        self.editor_host_contents(ui, integrated_titlebar);
+        // Native host gestures remain outside every workspace's early return,
+        // while automation publishes only after the complete host pass.
+        if integrated_titlebar {
+            shell::resize_window_edges(ui);
+        }
+        self.editor_drag_cursor(&ctx);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.automation_painted(ui.ctx());
+    }
+
+    /// Dispatch workspace content without bypassing the common native-host epilogue.
+    fn editor_host_contents(&mut self, ui: &mut Ui, integrated_titlebar: bool) {
+        let ctx = ui.ctx().clone();
         self.observe_editor_drag(&ctx);
         self.editor_window_geometry(&ctx);
         let main = self.views.host == self.views.main;
@@ -2131,9 +2470,13 @@ impl PcbApp {
         self.views.sync(&self.session);
         self.editor_pointer_focus(&ctx);
         self.sync_library_focus();
+        self.pending_clipboard_response(&ctx);
+        if self.views.active.library.is_some() && !(main && self.home) {
+            self.library_workspace_frame(ui, integrated_titlebar);
+            return;
+        }
         if self.views.active.definition.is_some() && !(main && self.home) {
             self.library_frame(ui, integrated_titlebar);
-            self.editor_drag_cursor(&ctx);
             return;
         }
         let before = (self.session.revision(), self.preferences, std::mem::discriminant(&self.dialog), self.home, self.library_editors.stamp());
@@ -2156,7 +2499,7 @@ impl PcbApp {
                 self.home_page(ui);
                 None
             } else {
-                self.ribbon(ui);
+                let ribbon = self.ribbon(ui);
                 self.views.sync(&self.session);
                 if !matches!(self.dialog, Dialog::None) {
                     self.views.cancel_gestures();
@@ -2167,6 +2510,7 @@ impl PcbApp {
                 self.status(ui);
                 let workspace = ui.available_rect_before_wrap();
                 self.editor_workspace(ui, workspace);
+                self.paint_ribbon_background(ribbon);
                 Some(workspace)
             };
             #[cfg(not(target_arch = "wasm32"))]
@@ -2187,14 +2531,16 @@ impl PcbApp {
             let _ = workspace;
         });
         self.integrated_titlebar = integrated;
-        let dialog_host = self.arrangement_dialog_host().unwrap_or(self.views.main);
+        let dialog_host = self
+            .arrangement_dialog_host()
+            .or_else(|| self.paste_options_host())
+            .or_else(|| self.board_paste_options_host())
+            .or_else(|| self.external_paste_options_host())
+            .unwrap_or(self.views.main);
         if self.views.host == dialog_host {
             self.project_dialogs(&ctx);
         } else if (!had_dialog && !matches!(self.dialog, Dialog::None)) || (!was_home && self.home) {
             ctx.send_viewport_cmd_to(editor_windows::viewport(dialog_host), egui::ViewportCommand::Focus);
-        }
-        if integrated_titlebar {
-            shell::resize_window_edges(ui);
         }
         self.views.sync(&self.session);
         if ctx.viewport_id() != egui::ViewportId::ROOT && self.pointer != self.pointer_next {
@@ -2205,7 +2551,6 @@ impl PcbApp {
             self.repaint_editors(&ctx);
             ctx.request_repaint_of(egui::ViewportId::ROOT);
         }
-        self.editor_drag_cursor(&ctx);
     }
 }
 
@@ -2242,6 +2587,7 @@ fn shortcut_list(ctx: &egui::Context) -> Vec<(&'static str, &'static str, String
     list.push(("Schematic", "Place power/ground", key(&ADD_POWER)));
     list.push(("Schematic", "Place hierarchical label", key(&ADD_HIERARCHICAL_LABEL)));
     list.push(("Schematic", "Draw wire", key(&ADD_WIRE)));
+    list.push(("Schematic", "Mark pin or wire end no connect", "Q".to_owned()));
     list.push(("Schematic", "Disconnect and move symbol", "M".to_owned()));
     list.push(("Schematic", "Grab connected symbol or wire", "G".to_owned()));
     list.push(("Schematic", "Rotate symbol or hovered field", key(&ROTATE)));
@@ -2249,19 +2595,29 @@ fn shortcut_list(ctx: &egui::Context) -> Vec<(&'static str, &'static str, String
     list.push(("Schematic", "Edit the selected symbol's fields", key(&EDIT_FIELDS)));
     list.push(("Schematic", "Delete selected items or segment", "Del".to_owned()));
     list.push(("Schematic", "Cancel the current tool", "Esc".to_owned()));
-    list.push(("PCB layout", "Move footprint", "M or left drag".to_owned()));
-    list.push(("PCB layout", "Rotate footprint counterclockwise", "R".to_owned()));
-    list.push(("PCB layout", "Rotate footprint clockwise", "Shift+R".to_owned()));
-    list.push(("PCB layout", "Cancel placement", "Esc or right click".to_owned()));
-    list.push(("PCB layout", "Route track", "X".to_owned()));
-    list.push(("PCB layout", "Flip track posture", "/".to_owned()));
-    list.push(("PCB layout", "Place via and switch layer while routing", "V".to_owned()));
-    list.push(("PCB layout", "Finish track", "Click a pad, double-click or Enter".to_owned()));
-    list.push(("PCB layout", "Remove last track vertex", "Backspace".to_owned()));
-    list.push(("PCB layout", "Next layer", "+".to_owned()));
-    list.push(("PCB layout", "Previous layer", "−".to_owned()));
-    list.push(("PCB layout", "Front copper layer", "PgUp".to_owned()));
-    list.push(("PCB layout", "Back copper layer", "PgDn".to_owned()));
+    list.push(("PCB Layout", "Move footprint", "M or left drag".to_owned()));
+    list.push(("PCB Layout", "Move reference designator", "M or left drag over the reference".to_owned()));
+    list.push(("PCB Layout", "Rotate footprint counterclockwise", "R".to_owned()));
+    list.push(("PCB Layout", "Rotate footprint clockwise", "Shift+R".to_owned()));
+    list.push(("PCB Layout", "Flip footprint to the other side", "F".to_owned()));
+    list.push(("PCB Layout", "Cancel placement", "Esc or right click".to_owned()));
+    list.push(("PCB Layout", "Route track", "X".to_owned()));
+    list.push(("PCB Layout", "Bypass the routing grid", "Hold Ctrl".to_owned()));
+    list.push(("PCB Layout", "Place via", key(&PLACE_VIA)));
+    list.push(("PCB Layout", "Measure distance", "Ctrl+Shift+M".to_owned()));
+    list.push(("PCB Layout", "Select connected copper", "U".to_owned()));
+    list.push(("PCB Layout", "Drag a track segment, keeping it attached", "D".to_owned()));
+    list.push(("PCB Layout", "Highlight the net under the pointer", "`".to_owned()));
+    list.push(("PCB Layout", "Move selected tracks and vias", "M or left drag".to_owned()));
+    list.push(("PCB Layout", "Flip track posture", "/".to_owned()));
+    list.push(("PCB Layout", "Place via and switch layer while routing", "V".to_owned()));
+    list.push(("PCB Layout", "Via to front or back copper while routing", "PgUp / PgDn".to_owned()));
+    list.push(("PCB Layout", "Finish track", "Click a pad, double-click or Enter".to_owned()));
+    list.push(("PCB Layout", "Remove last track vertex", "Backspace".to_owned()));
+    list.push(("PCB Layout", "Next layer", "+".to_owned()));
+    list.push(("PCB Layout", "Previous layer", "−".to_owned()));
+    list.push(("PCB Layout", "Front copper layer", "PgUp".to_owned()));
+    list.push(("PCB Layout", "Back copper layer", "PgDn".to_owned()));
     list.push(("View", "Zoom", "Mouse wheel".to_owned()));
     list.push(("View", "Pan", "Middle-button drag".to_owned()));
     list.push(("View", "Finer grid", key(&FINER_GRID)));
@@ -2272,6 +2628,11 @@ fn shortcut_list(ctx: &egui::Context) -> Vec<(&'static str, &'static str, String
 }
 
 impl eframe::App for PcbApp {
+    /// Deliver authenticated synthetic input before egui builds its pointer/keyboard state.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn raw_input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+        self.automation_input(ctx, input);
+    }
     /// Run shared project logic and visible hosts, then release a dismissed native root and
     /// flush changed presentation settings and desktop history without an electrical edit or save.
     fn ui(&mut self, ui: &mut Ui, frame: &mut Frame) {
@@ -2282,7 +2643,7 @@ impl eframe::App for PcbApp {
             // Release the native surface after the frame; surviving host/window IDs stay put.
             frame.retire_root_window();
         }
-        let changed = self.preferences != before || self.board_appearance.dirty;
+        let changed = self.preferences != before || self.board_appearance.dirty || self.routing_presets.dirty;
         #[cfg(not(target_arch = "wasm32"))]
         let changed = self.assistant.take_settings_changed() || changed;
         #[cfg(not(target_arch = "wasm32"))]
@@ -2308,6 +2669,10 @@ impl eframe::App for PcbApp {
             storage.set_string(arrangements::STORAGE_KEY, text);
         }
         storage.set_string(PREFERENCES_KEY, self.preferences.to_text());
+        if let Some(text) = self.routing_presets.storage_text() {
+            storage.set_string(board_presets::STORAGE_KEY, text);
+            self.routing_presets.dirty = false;
+        }
         if let Some(text) = self.board_appearance.storage_text() {
             storage.set_string(board_appearance::STORAGE_KEY, text);
         }

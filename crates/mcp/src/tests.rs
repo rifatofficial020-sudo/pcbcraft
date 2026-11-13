@@ -5,6 +5,86 @@ use serde_json::{Value, json};
 
 use crate::{Headless, Server, tool_definitions};
 
+/// Shared MCP dispatch preserves focused query data with inspect:false and uses the same edit.
+#[test]
+fn no_connect_commands_and_focused_check_are_shared_with_mcp() {
+    let mut s = Session::default();
+    s.apply("project.new", &json!({})).unwrap();
+    s.apply(PLACE_RESISTOR, &json!({"x_nm":0,"y_nm":0,"expected_revision":s.revision()})).unwrap();
+    let p = s.snapshot().unwrap();
+    let target = p.no_connect_target(p.symbols()[0].terminals()[0]).unwrap();
+    let revision = s.revision();
+    crate::backend::call_session(
+        &mut s,
+        "engine.execute",
+        &json!({"command":pcbcraft_engine::no_connect::SET,"params":{"target":target,"marked":true,"expected_revision":revision},"inspect":false}),
+    )
+    .unwrap();
+    let revision = s.revision();
+    let before = s.snapshot().unwrap();
+    let report =
+        crate::backend::call_session(&mut s, "engine.execute", &json!({"command":pcbcraft_engine::no_connect::CHECK,"params":{},"inspect":false}))
+            .unwrap();
+    assert_eq!(report["revision"], revision);
+    assert_eq!(report["no_connect_check"]["markers"].as_array().unwrap().len(), 1);
+    assert!(std::sync::Arc::ptr_eq(&before, &s.snapshot().unwrap()));
+}
+
+/// The same public command accepts wire-end identity and returns termination findings even
+/// when callers omit the general inspection payload. No private GUI-only edit is involved.
+#[test]
+fn no_connect_wire_end_commands_are_shared_with_mcp() {
+    let mut s = Session::default();
+    s.apply("project.new", &json!({})).unwrap();
+    s.apply(
+        pcbcraft_engine::DRAW_WIRE,
+        &json!({"from":{"x_nm":0,"y_nm":0},"to":{"x_nm":25_400_000,"y_nm":0},"bends":[],"expected_revision":s.revision()}),
+    )
+    .unwrap();
+    let target = s.project().unwrap().wire_end_targets().next().unwrap().0;
+    let revision = s.revision();
+    crate::backend::call_session(
+        &mut s,
+        "engine.execute",
+        &json!({"command":pcbcraft_engine::no_connect::SET,"params":{"target":target,"marked":true,"expected_revision":revision},"inspect":false}),
+    )
+    .unwrap();
+    let report =
+        crate::backend::call_session(&mut s, "engine.execute", &json!({"command":pcbcraft_engine::no_connect::CHECK,"params":{},"inspect":false}))
+            .unwrap();
+    assert_eq!(report["no_connect_check"]["wire_markers"].as_array().unwrap().len(), 1);
+    assert_eq!(report["no_connect_check"]["wire_findings"].as_array().unwrap().len(), 1, "the other open end remains unmarked");
+    let inspected = s.inspect();
+    assert!(
+        inspected["project"]["schematic"]["junctions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|end| end["id"] == target.junction && end["no_connect"] == true)
+    );
+    let before = s.snapshot().unwrap();
+    let revision = s.revision();
+    let rejected = crate::backend::call_session(
+        &mut s,
+        "engine.execute",
+        &json!({"command":pcbcraft_engine::DRAW_WIRE,
+        "params":{"from":{"junction":target.junction},"to":{"x_nm":-25_400_000,"y_nm":0},"bends":[],"expected_revision":revision},"inspect":false}),
+    );
+    assert!(rejected.unwrap_err().contains(pcbcraft_engine::no_connect::WIRE_BLOCKED));
+    assert!(std::sync::Arc::ptr_eq(&before, &s.snapshot().unwrap()));
+    crate::backend::call_session(
+        &mut s,
+        "engine.execute",
+        &json!({"command":pcbcraft_engine::DELETE_ITEMS,
+        "params":{"items":{"symbols":[],"wires":[],"no_connects":[target]},"expected_revision":revision},"inspect":false}),
+    )
+    .unwrap();
+    assert_eq!(s.project().unwrap().check_no_connects(s.revision()).total_markers, 0);
+    assert_eq!(s.project().unwrap().wires(), before.wires());
+    s.apply("edit.undo", &json!({})).unwrap();
+    assert_eq!(s.project().unwrap().check_no_connects(s.revision()).total_markers, 1);
+}
+
 fn server() -> Server {
     Server::new(Box::new(Headless::default()))
 }
@@ -21,6 +101,60 @@ fn call(server: &mut Server, name: &str, arguments: Value) -> Value {
 
 fn body(result: &Value) -> Value {
     serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap()
+}
+
+/// The catalog exposes saved defaults and provenance through real MCP dispatch. Bad bounds
+/// and attempts to weaken saved limits preserve the project and history.
+#[test]
+fn board_rules_mcp_discovery_authorship_and_diagnostics_agree() {
+    let mut s = server();
+    let created = body(&call(&mut s, "execute", json!({"command":"project.new","params":{"create_board":true}})));
+    let board = created["project"]["boards"][0]["id"].clone();
+    let values = pcbcraft_engine::board::rules::Values { clearance_nm: 400_000, ..Default::default() };
+    let changed = call(
+        &mut s,
+        "execute",
+        json!({"command":pcbcraft_engine::SET_RULES,"params":{"board":board,"expected_revision":created["revision"],"rules":values}}),
+    );
+    assert_ne!(changed["isError"], true, "{changed}");
+    let changed = body(&changed);
+    assert_eq!(changed["project"]["boards"][0]["rules"]["effective"]["values"]["clearance_nm"], 400_000);
+    let report = body(&call(&mut s, "execute", json!({"command":pcbcraft_engine::CHECK_DESIGN,"params":{"board":board}})));
+    assert_eq!(report["design_check"]["rules"]["clearance_nm"], 400_000);
+    assert_eq!(report["design_check"]["sources"]["clearance_nm"]["kind"], "board");
+    let invalid = call(&mut s, "execute", json!({"command":pcbcraft_engine::CHECK_DESIGN,"params":{"board":board,"clearance_nm":0}}));
+    assert_eq!(invalid["isError"], true);
+    assert_eq!(body(&call(&mut s, "inspect_project", json!({}))), changed);
+    let description = call(&mut s, "describe_command", json!({"command":pcbcraft_engine::SET_RULES}));
+    assert_ne!(description["isError"], true, "{description}");
+}
+
+/// MCP uses the native record resolver and exact quantity normalizer without an open project.
+#[test]
+fn native_part_resolution_and_units_are_available_through_mcp() {
+    let mut server = server();
+    let documents = json!({
+        "library.json":include_str!("../../../examples/native-parts/library.json"),
+        "symbols/resistor.json":include_str!("../../../examples/native-parts/symbols/resistor.json"),
+        "footprints/resistor-0603.json":include_str!("../../../examples/native-parts/footprints/resistor-0603.json"),
+        "categories/resistor.json":include_str!("../../../examples/native-parts/categories/resistor.json"),
+        "parts/resistor.json":include_str!("../../../examples/native-parts/parts/resistor.json")
+    });
+    let loaded = call(&mut server, "execute", json!({"command":"library.load_source","params":{"source":"demo","documents":documents}}));
+    assert_ne!(loaded["isError"], true);
+    let result = body(&call(
+        &mut server,
+        "execute",
+        json!({"command":"library.resolve_part","inspect":false,"params":{"library":"parts-demo","definition":"resistor","definition_revision":1}}),
+    ));
+    assert_eq!(result["part"]["format"], "pcbcraft-part/1");
+    assert_eq!(result["symbol"]["format"], "pcbcraft-symbol/3");
+    let normalized = body(&call(
+        &mut server,
+        "execute",
+        json!({"command":"library.parse_quantity","inspect":false,"params":{"quantity":"resistance","value":"100 mΩ"}}),
+    ));
+    assert_eq!(normalized, json!({"type":"quantity","value":"0.1","unit":"Ohm"}));
 }
 
 /// Headless and live clients share preview/apply capability validation, including
@@ -268,7 +402,19 @@ fn execute_gives_the_same_state_as_running_the_command_on_a_session() {
 /// Independent project.new commands generate different UUIDs. Check each sheet's path and
 /// retain its other metadata while comparing commands from these separate projects.
 /// Empty boards also expose a compatibility layer derived from their distinct board IDs.
+/// Check each occurrence's sheet/use references before normalizing its independently allocated IDs.
 fn without_sheet_identity(mut state: Value) -> Value {
+    let circuit_use = state["project"]["sheet_instances"]["circuit_uses"][0]["id"].clone();
+    let definitions: Vec<_> = state["project"]["sheets"].as_array().unwrap().iter().map(|sheet| sheet["id"].clone()).collect();
+    for occurrence in state["project"]["sheet_instances"]["sheet_occurrences"].as_array_mut().unwrap() {
+        assert!(definitions.contains(&occurrence["definition"]));
+        assert_eq!(occurrence["circuit_use"], circuit_use);
+        for field in ["id", "definition", "circuit_use"] {
+            assert_eq!(occurrence[field].as_str().unwrap().len(), 36);
+            occurrence[field] = Value::Null;
+        }
+    }
+    state["project"]["sheet_instances"]["circuit_uses"][0]["id"] = Value::Null;
     for board in state["project"]["boards"].as_array_mut().unwrap() {
         assert_eq!(board["id"].as_str().unwrap().len(), 36);
         board["id"] = Value::Null;
@@ -322,7 +468,7 @@ fn native_source_search_and_placement_share_the_mcp_session() {
     let manifest = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/native-library/library.json"));
     let documents = json!({"library.json":manifest,"symbols/resistor.json":definitions});
     let commands = body(&call(&mut s, "list_commands", json!({"filter":"library."})));
-    assert_eq!(commands.as_array().unwrap().iter().filter(|c| c["id"].as_str().is_some_and(|id| id.starts_with("library."))).count(), 4);
+    assert_eq!(commands.as_array().unwrap().iter().filter(|c| c["id"].as_str().is_some_and(|id| id.starts_with("library."))).count(), 6);
     let initial = body(&call(&mut s, "execute", json!({"command":"project.new","params":{}})));
     let loaded = call(&mut s, "execute", json!({"command":"library.load_source","params":{"source":"workshop-source","documents":documents}}));
     assert_ne!(loaded["isError"], true);
@@ -760,6 +906,7 @@ fn headless_sessions_say_window_commands_need_a_live_editor() {
     let before = body(&call(&mut server, "inspect_project", json!({})));
     for (tool, arguments) in [
         ("execute", json!({"command": "view.split", "params": {"view": 0, "split": true}})),
+        ("execute", json!({"command": "ui.click", "params": {"window":0,"target":{"handle":"toolbar:Connect:Wire"}}})),
         ("execute", json!({"command": "app.set_preferences", "params": {"theme": "light"}})),
         ("describe_command", json!({"command": "window.set_panel"})),
         ("inspect_editor", json!({})),
@@ -937,4 +1084,307 @@ fn populated_setup_and_footprint_deletion_are_discoverable_shared_commands() {
     assert_eq!(removed["project"]["board"]["assignments"][0]["placed"], false);
     assert_eq!(removed["project"]["schematic"], original["project"]["schematic"]);
     assert_eq!(execute(&mut s, "edit.undo", json!({}))["project"], configured["project"]);
+}
+
+/// The shared dispatcher retains clipboard payloads with inspect:false, while paste remains
+/// a single ordinary revision-checked edit.
+#[test]
+fn clipboard_payloads_survive_suppressed_project_inspection() {
+    use pcbcraft_engine::clipboard::{COPY, CUT, PASTE};
+    let mut server = server();
+    let created = body(&call(&mut server, "execute", json!({"command":"project.new","params":{}})));
+    let placed =
+        body(&call(&mut server, "execute", json!({"command":PLACE_RESISTOR,"params":{"x_nm":0,"y_nm":0,"expected_revision":created["revision"]}})));
+    let symbol = placed["project"]["schematic"]["symbols"][0]["id"].clone();
+    let selection = json!({"symbols":[symbol],"wires":[]});
+    for command in [COPY, CUT] {
+        let result = body(&call(
+            &mut server,
+            "execute",
+            json!({"command":command,"inspect":false,"params":{"items":selection,"expected_revision":placed["revision"]}}),
+        ));
+        assert!(result["clipboard"].as_str().is_some_and(|s| pcbcraft_engine::clipboard::Fragment::from_text(s).is_ok()));
+        if command == COPY {
+            assert_eq!(result["revision"], placed["revision"]);
+        } else {
+            let pasted = body(&call(
+                &mut server,
+                "execute",
+                json!({"command":PASTE,"inspect":false,"params":{"text":result["clipboard"],"x_nm":12_700_000,"y_nm":0,"expected_revision":result["revision"]}}),
+            ));
+            assert!(pasted.get("project").is_none());
+        }
+    }
+    let state = body(&call(&mut server, "inspect_project", json!({})));
+    assert_eq!(state["project"]["schematic"]["symbols"].as_array().unwrap().len(), 1);
+    assert_eq!(state["project"]["schematic"]["symbols"][0]["x_nm"], 12_700_000);
+}
+
+/// Suppressing project inspection still returns the DRC report without changing the project,
+/// alongside the clipboard payload exceptions in the shared dispatcher.
+#[test]
+fn design_check_report_survives_suppressed_project_inspection() {
+    let mut server = server();
+    let created = body(&call(&mut server, "execute", json!({"command":"project.new","params":{"create_board":true}})));
+    let before = body(&call(&mut server, "inspect_project", json!({})));
+    let response = call(&mut server, "execute", json!({"command":pcbcraft_engine::CHECK_DESIGN,"params":{"clearance_nm":250_000},"inspect":false}));
+    assert_ne!(response["isError"], true, "{response}");
+    let result = body(&response);
+    assert_eq!(result["revision"], created["revision"]);
+    assert_eq!(result["design_check"]["rules"]["clearance_nm"], 250_000);
+    assert_eq!(body(&call(&mut server, "inspect_project", json!({}))), before);
+}
+
+/// Fabrication files survive inspect:false through the shared dispatcher without changing the
+/// project, revision or history, alongside clipboard preparation and DRC report results.
+#[test]
+fn fabrication_files_survive_suppressed_project_inspection() {
+    let mut setup = Session::default();
+    setup.apply("project.new", &json!({"create_board":true})).unwrap();
+    setup.apply(pcbcraft_engine::INITIALIZE_BOARD_SETUP, &json!({"copper_layers":2,"expected_revision":setup.revision()})).unwrap();
+    let project = setup.project().unwrap();
+    let board = project.board_target().unwrap();
+    let layer = project
+        .board_view(board)
+        .unwrap()
+        .layers()
+        .into_iter()
+        .find(|layer| layer.purpose == pcbcraft_engine::board::setup::LayerPurpose::Outline)
+        .unwrap()
+        .id;
+    setup.apply(pcbcraft_engine::ADD_DRAWING, &json!({"board":board.board,"layer":layer,"closed":true,"points":[{"x_nm":0,"y_nm":0},{"x_nm":10_000_000,"y_nm":0},{"x_nm":10_000_000,"y_nm":10_000_000},{"x_nm":0,"y_nm":10_000_000}],"expected_revision":setup.revision()})).unwrap();
+    let mut server = Server::new(Box::new(Headless::with_project(setup.snapshot().unwrap())));
+    let before = body(&call(&mut server, "inspect_project", json!({})));
+    let response =
+        call(&mut server, "execute", json!({"command":pcbcraft_engine::EXPORT_FABRICATION,"params":{"board":board.board},"inspect":false}));
+    assert_ne!(response["isError"], true, "{response}");
+    let result = body(&response);
+    let files = result["fabrication"]["files"].as_array().unwrap();
+    assert!(files.iter().any(|file| file["name"].as_str().unwrap().ends_with("-Outline.gbr")));
+    assert!(files.iter().any(|file| file["name"].as_str().unwrap().ends_with("-PTH.drl")));
+    assert_eq!(result["revision"], before["revision"]);
+    assert!(result.get("project").is_none());
+    assert_eq!(body(&call(&mut server, "inspect_project", json!({}))), before);
+}
+
+/// Board Copy/Cut return native payloads with inspect:false, and a same-project cut can relocate
+/// its existing logical component through the ordinary shared paste transaction.
+#[test]
+fn pcb_clipboard_payloads_and_component_reuse_share_the_dispatcher() {
+    use pcbcraft_engine::board::clipboard::{BoardFragment, COPY, CUT, PASTE};
+    let mut server = server();
+    let initial = body(&call(&mut server, "execute", json!({"command":"project.new","params":{"create_board":true}})));
+    let symbol =
+        body(&call(&mut server, "execute", json!({"command":PLACE_RESISTOR,"params":{"x_nm":0,"y_nm":0,"expected_revision":initial["revision"]}})));
+    let symbol_id = symbol["project"]["schematic"]["symbols"][0]["id"].clone();
+    let placed = body(&call(
+        &mut server,
+        "execute",
+        json!({"command":pcbcraft_engine::PLACE_FOOTPRINT,"params":{"symbol":symbol_id,"definition":"generic-through-hole-2","pin_1_pad":1,"x_nm":0,"y_nm":0,"expected_revision":symbol["revision"]}}),
+    ));
+    let footprint = placed["project"]["board"]["footprints"][0]["id"].clone();
+    let items = json!({"footprints":[footprint]});
+    for command in [COPY, CUT] {
+        let copied = body(&call(
+            &mut server,
+            "execute",
+            json!({"command":command,"inspect":false,"params":{"items":items,"expected_revision":placed["revision"]}}),
+        ));
+        assert!(BoardFragment::from_text(copied["clipboard"].as_str().unwrap()).is_ok());
+        if command == COPY {
+            assert_eq!(copied["revision"], placed["revision"]);
+        } else {
+            let pasted = call(
+                &mut server,
+                "execute",
+                json!({"command":PASTE,"inspect":false,"params":{"text":copied["clipboard"],"reuse_components":true,"x_nm":7_000_000,"y_nm":3_000_000,"expected_revision":copied["revision"]}}),
+            );
+            assert_ne!(pasted["isError"], true, "{pasted}");
+        }
+    }
+    let state = body(&call(&mut server, "inspect_project", json!({})));
+    assert_eq!(state["project"]["schematic"]["symbols"].as_array().unwrap().len(), 1);
+    assert_eq!(state["project"]["board"]["footprints"].as_array().unwrap().len(), 1);
+    assert_eq!(state["project"]["board"]["footprints"][0]["x_nm"], 7_000_000);
+}
+
+/// Text preparation returns the portable payload when inspection is suppressed; a client can
+/// review/relay it without editing a project or invoking the OS clipboard.
+#[test]
+fn external_clipboard_preparation_preserves_payload_without_inspection() {
+    let mut session = pcbcraft_engine::Session::default();
+    for (id, params) in [
+        (pcbcraft_engine::clipboard_text::LABELS, json!({"text":"A\nB","style":"local","spacing_nm":2_540_000,"expected_revision":0})),
+        (pcbcraft_engine::clipboard_text::OUTLINE, json!({"text":"0,0\n10,0\n10,10","units":"mm","closed":true,"expected_revision":0})),
+    ] {
+        let result = crate::backend::call_session(&mut session, "engine.execute", &json!({"command":id,"params":params,"inspect":false})).unwrap();
+        assert!(result["clipboard"].as_str().is_some());
+        assert_eq!(session.revision(), 0);
+        assert!(session.project().is_none());
+    }
+}
+
+/// Extended hierarchy payloads and Cut relocation use the same public dispatcher and retain
+/// clipboard results when callers suppress unrelated project inspection.
+#[test]
+fn hierarchical_clipboard_commands_preserve_payload_and_child_identity() {
+    let mut s = pcbcraft_engine::Session::default();
+    s.apply("project.new", &json!({})).unwrap();
+    s.apply(pcbcraft_engine::hierarchy::CREATE_CHILD, &json!({"name":"Child","x_nm":0,"y_nm":0,"expected_revision":s.revision()})).unwrap();
+    let p = s.project().unwrap();
+    let root = p.sheet_target();
+    let child = p.sheets().find(|p| p.name == "Child").unwrap().target;
+    let block = p.sheet_symbols()[0].id;
+    let cut = json!({"command":pcbcraft_engine::clipboard::CUT,"inspect":false,"params":{"sheet":root.id(),"items":{"symbols":[],"wires":[]},"objects":[format!("sheet-symbol-{block}")],"expected_revision":s.revision()}});
+    let data = crate::backend::call_session(&mut s, "engine.execute", &cut).unwrap();
+    assert!(data["clipboard"].as_str().unwrap().contains("pcbcraft-clipboard/2"));
+    assert_eq!(s.project().unwrap().parent_sheet(child), None);
+    let paste = json!({"command":pcbcraft_engine::clipboard::PASTE,"inspect":false,"params":{"sheet":root.id(),"text":data["clipboard"],"reuse_sheets":true,"x_nm":1_270_000,"y_nm":1_270_000,"expected_revision":s.revision()}});
+    crate::backend::call_session(&mut s, "engine.execute", &paste).unwrap();
+    assert_eq!(s.project().unwrap().parent_sheet(child), Some(root));
+    assert_eq!(s.project().unwrap().sheets().len(), 2);
+}
+
+/// MCP advertises explicit pinned unit placement and shares one part instance across drawings.
+#[test]
+fn multiunit_placement_uses_shared_commands_and_part_identity() {
+    let mut s = server();
+    let schema = body(&call(&mut s, "describe_command", json!({"command":pcbcraft_engine::PLACE_UNIT})));
+    assert_eq!(schema["params"]["properties"]["unit"]["type"], "string");
+    let opened = body(&call(&mut s, "execute", json!({"command":"project.new","params":{}})));
+    let loaded = call(
+        &mut s,
+        "execute",
+        json!({"command":"library.load_source","params":{"source":"units","documents":{
+            "library.json":include_str!("../../../examples/native-parts/library.json"),
+            "symbols/dual.json":include_str!("../../../examples/native-parts/symbols/dual-amplifier.json")
+        }}}),
+    );
+    assert_ne!(loaded["isError"], true);
+    let found = body(&call(&mut s, "execute", json!({"command":"library.search","params":{"query":"dual-amplifier","kind":"symbol"}})));
+    assert_eq!(found[0]["units"], json!(["a", "b"]));
+    let first = body(&call(
+        &mut s,
+        "execute",
+        json!({"command":PLACE_SYMBOL,"params":{
+            "library":"parts-demo","definition":"dual-amplifier","definition_revision":1,"definition_digest":found[0]["digest"],
+            "unit":"b","x_nm":0,"y_nm":0,"expected_revision":opened["revision"]
+        }}),
+    ));
+    let symbol = &first["project"]["schematic"]["symbols"][0];
+    assert_eq!(symbol["display_reference"], "U1 B");
+    assert_eq!(symbol["available_units"], json!(["a"]));
+    let second = body(&call(
+        &mut s,
+        "execute",
+        json!({"command":pcbcraft_engine::PLACE_UNIT,"params":{
+            "component":symbol["component_id"],"unit":"a","x_nm":30_480_000,"y_nm":0,"expected_revision":first["revision"]
+        }}),
+    ));
+    assert_eq!(second["project"]["components"].as_array().unwrap().len(), 1);
+    let symbols = second["project"]["schematic"]["symbols"].as_array().unwrap();
+    assert_eq!(symbols.len(), 2);
+    assert_eq!(symbols[0]["component_id"], symbols[1]["component_id"]);
+}
+
+/// MCP places a central native part/MPN atomically and edits requirements offline through the same engine authority.
+#[test]
+fn native_part_selection_and_compatibility_are_available_through_mcp() {
+    let mut s = server();
+    let created = body(&call(&mut s, "execute", json!({"command":"project.new","params":{}})));
+    let loaded = call(
+        &mut s,
+        "execute",
+        json!({"command":"library.load_source","params":{"source":"native-parts","documents":{
+            "library.json":include_str!("../../../examples/native-parts/library.json"),
+            "symbols/resistor.json":include_str!("../../../examples/native-parts/symbols/resistor.json"),
+            "footprints/resistor.json":include_str!("../../../examples/native-parts/footprints/resistor-0603.json"),
+            "categories/resistor.json":include_str!("../../../examples/native-parts/categories/resistor.json"),
+            "parts/resistor.json":include_str!("../../../examples/native-parts/parts/resistor.json"),
+            "manufacturer-parts/test.json":include_str!("../../../examples/native-parts/manufacturer-parts/test-resistor-100m.json")
+        }}}),
+    );
+    assert_ne!(loaded["isError"], true);
+    let resolved = body(&call(
+        &mut s,
+        "execute",
+        json!({"command":"library.resolve_part","params":{"library":"parts-demo","definition":"resistor","definition_revision":1}}),
+    ));
+    let manufacturers =
+        body(&call(&mut s, "execute", json!({"command":"library.search","params":{"kind":"manufacturer_part","query":"TEST-R100M"}})));
+    let placed = body(&call(
+        &mut s,
+        "execute",
+        json!({"command":"schematic.place_part","params":{
+            "library":"parts-demo","definition":"resistor","definition_revision":1,"definition_digest":resolved["digest"],
+            "manufacturer":{"library":"parts-demo","id":"test-resistor-100m","revision":1},"manufacturer_digest":manufacturers[0]["digest"],
+            "x_nm":0,"y_nm":0,"expected_revision":created["revision"]
+        }}),
+    ));
+    let instance = &placed["project"]["components"][0];
+    assert_eq!(instance["part"]["manufacturer"]["mpn"], "TEST-R100M-0603");
+    assert_eq!(instance["part"]["compatibility"]["status"], "meets_requirements");
+    let removed = call(&mut s, "execute", json!({"command":"library.remove_source","params":{"source":"native-parts"}}));
+    assert_ne!(removed["isError"], true, "{removed}");
+    let params = json!({"component":instance["id"],"requirements":{
+        "pcbcraft:tolerance":{"operator":"at_most","value":{"type":"quantity","value":"0.005","unit":"1"}}
+    },"expected_revision":placed["revision"]});
+    let edited = call(&mut s, "execute", json!({"command":"part.set_selection","params":params}));
+    assert_ne!(edited["isError"], true);
+    let edited = body(&edited);
+    assert_eq!(edited["project"]["components"][0]["part"]["compatibility"]["status"], "does_not_meet_requirements");
+    let stale = call(&mut s, "execute", json!({"command":"part.set_selection","params":params}));
+    assert_eq!(stale["isError"], true);
+}
+
+/// MCP exposes explicit board lock intent and the same atomic protection as the editor.
+#[test]
+fn copper_lock_commands_and_protected_edits_share_mcp_inspection() {
+    let mut setup = Session::default();
+    setup.apply("project.new", &json!({"create_board":true})).unwrap();
+    setup.apply(pcbcraft_engine::INITIALIZE_BOARD_SETUP, &json!({"copper_layers":2,"expected_revision":setup.revision()})).unwrap();
+    let board = setup.project().unwrap().board_target().unwrap();
+    let layer = setup
+        .project()
+        .unwrap()
+        .board_view(board)
+        .unwrap()
+        .layers()
+        .into_iter()
+        .find(|layer| layer.purpose == pcbcraft_engine::board::setup::LayerPurpose::Copper)
+        .unwrap()
+        .id;
+    setup
+        .apply(
+            pcbcraft_engine::ADD_TRACKS,
+            &json!({"board":board.board,"layer":layer,"width_nm":250_000,
+        "points":[{"x_nm":0,"y_nm":0},{"x_nm":5_000_000,"y_nm":0}],"expected_revision":setup.revision()}),
+        )
+        .unwrap();
+    let track = setup.project().unwrap().board_view(board).unwrap().tracks()[0].id;
+    let mut server = Server::new(Box::new(Headless::with_project(setup.snapshot().unwrap())));
+    let before = body(&call(&mut server, "inspect_project", json!({})));
+    assert_eq!(before["project"]["boards"][0]["tracks"][0]["locked"], false);
+    let locked = call(
+        &mut server,
+        "execute",
+        json!({"command":pcbcraft_engine::SET_COPPER_LOCKED,
+        "params":{"board":board.board,"tracks":[track],"locked":true,"expected_revision":before["revision"]}}),
+    );
+    assert_ne!(locked["isError"], true, "{locked}");
+    let locked = body(&locked);
+    assert_eq!(locked["project"]["boards"][0]["tracks"][0]["locked"], true);
+    for command in [pcbcraft_engine::DELETE_TRACKS, pcbcraft_engine::MOVE_TRACKS] {
+        let mut params = json!({"board":board.board,"tracks":[track],"expected_revision":locked["revision"]});
+        if command == pcbcraft_engine::MOVE_TRACKS {
+            params["dx_nm"] = json!(1000);
+            params["dy_nm"] = json!(0);
+        }
+        let result = call(&mut server, "execute", json!({"command":command,"params":params}));
+        assert_eq!(result["isError"], true);
+        assert!(result["content"][0]["text"].as_str().unwrap().contains("locked"));
+        assert_eq!(body(&call(&mut server, "inspect_project", json!({}))), locked);
+    }
+    let undone = body(&call(&mut server, "execute", json!({"command":"edit.undo","params":{}})));
+    assert_eq!(undone["project"]["boards"][0]["tracks"][0]["locked"], false);
 }

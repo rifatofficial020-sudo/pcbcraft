@@ -1,10 +1,11 @@
 //! Document-addressed view state. Hosts own placement; the session owns authored data.
 
 use crate::{
-    canvas_camera::Camera,
+    canvas_camera::{Camera, MAX_BOARD_ZOOM, MAX_ZOOM},
     schematic_canvas::{Draft, LegTarget, Tool},
 };
 use pcbcraft_engine::{Session, SheetTarget, board::view::BoardTarget, selection::Selection};
+use std::sync::Arc;
 
 #[cfg(test)]
 mod tests;
@@ -30,7 +31,31 @@ impl Workspace {
     pub(super) fn title(self) -> &'static str {
         match self {
             Self::Schematic => "Schematic",
-            Self::Board => "PCB layout",
+            Self::Board => "PCB Layout",
+        }
+    }
+
+    /// Maximum manual camera zoom for this workspace.
+    pub(super) fn max_zoom(self) -> f32 {
+        match self {
+            Self::Schematic => MAX_ZOOM,
+            Self::Board => MAX_BOARD_ZOOM,
+        }
+    }
+
+    /// The spacing presets offered by this workspace's grid control.
+    pub(super) fn grid_presets(self) -> &'static [i64] {
+        match self {
+            Self::Schematic => &pcbcraft_chrome::grid::SCHEMATIC_SPACING_PRESETS_NM,
+            Self::Board => &pcbcraft_chrome::grid::BOARD_SPACING_PRESETS_NM,
+        }
+    }
+
+    /// The spacing used when this workspace has no remembered choice.
+    pub(super) fn grid_default_nm(self) -> i64 {
+        match self {
+            Self::Schematic => pcbcraft_chrome::grid::SCHEMATIC_SPACING_DEFAULT_NM,
+            Self::Board => pcbcraft_chrome::grid::BOARD_SPACING_DEFAULT_NM,
         }
     }
 }
@@ -62,6 +87,14 @@ pub(super) enum DocumentTarget {
 }
 
 impl DocumentTarget {
+    /// The workspace displaying this document or the project-scoped empty board.
+    fn workspace(self) -> Workspace {
+        match self {
+            Self::Sheet(_) => Workspace::Schematic,
+            Self::Board(_) | Self::BoardWorkspace(_) => Workspace::Board,
+        }
+    }
+
     /// Resolve an addressed document or project-scoped empty workspace; names are not identities.
     pub(super) fn available(self, session: &Session) -> bool {
         session.project().is_some_and(|project| match self {
@@ -106,10 +139,15 @@ fn filters_open_default() -> bool {
 impl ViewState {
     /// Bound layer data and validate transforms before replacing live views.
     pub(super) fn valid(&self) -> bool {
+        let workspace = self.target.workspace();
+        let parked = match workspace {
+            Workspace::Schematic => Workspace::Board,
+            Workspace::Board => Workspace::Schematic,
+        };
         self.title.len() <= 1024
             && self.panels.valid()
-            && self.camera.valid()
-            && self.parked_camera.valid()
+            && self.camera.valid(workspace.max_zoom())
+            && self.parked_camera.valid(parked.max_zoom())
             && self.hidden_layers.len() <= 128
             && self.hidden_layers.iter().chain(self.active_layer.iter()).all(|id| id.len() <= 128)
     }
@@ -138,9 +176,20 @@ impl Binding {
     }
 }
 
+/// Derived copper assignments belong to one board and captured view/revision authority.
+#[derive(Debug)]
+pub(super) struct CopperConnectivityCache {
+    source: ViewInput,
+    target: BoardTarget,
+    connectivity: Arc<crate::board_appearance::Connectivity>,
+}
+
 /// Schematic interaction state is separate from board selection and input handling.
 #[derive(Debug, Default)]
 pub(super) struct SchematicState {
+    /// Derived drawing warnings follow this view's lifetime, outside project files and history.
+    pub(super) overlap_cache: crate::schematic_canvas::OverlapCache,
+    pub(super) clipboard: crate::clipboard::State,
     pub(super) properties: crate::properties::State,
     pub(super) selection: Selection,
     pub(super) selected_sheet_symbol: Option<u64>,
@@ -149,6 +198,8 @@ pub(super) struct SchematicState {
     pub(super) tool: Option<Tool>,
     pub(super) wire_draft: Draft,
     pub(super) rotate_requested: bool,
+    /// A requested screen-axis reflection of the hovered or selected symbol.
+    pub(super) mirror_requested: Option<pcbcraft_engine::schematic::MirrorAxis>,
     pub(super) edit_requested: bool,
     pub(super) text_edit: Option<crate::inline_text::Edit>,
     pub(super) datasheet_requested: bool,
@@ -159,14 +210,32 @@ pub(super) struct SchematicState {
 /// New views hide fabrication/courtyard layers once setup exists; restores preserve user choices.
 #[derive(Debug, Default)]
 pub(super) struct BoardState {
+    pub(super) clipboard: crate::board_clipboard::State,
     pub(super) ratsnest_cache: Option<(ViewInput, std::sync::Arc<pcbcraft_engine::board::ratsnest::Ratsnest>)>,
     pub(super) drawing: crate::board_drawing::State,
     pub(super) tracks: crate::board_tracks::State,
+    /// The last design rules check run from this view, with its card and focused finding.
+    pub(super) drc: crate::board_drc::Drc,
+    /// The view-only ruler and whether its tool is armed.
+    pub(super) measure: crate::board_measure::Measure,
     pub(super) draft: Option<crate::board_canvas::Draft>,
+    pub(super) reference_drag: Option<crate::board_canvas::ReferenceDrag>,
+    pub(super) reference: crate::board_reference::State,
     pub(super) placement: Option<crate::board_canvas::Placement>,
     pub(super) box_drag: Option<crate::board_canvas::BoxDrag>,
+    /// Only an idle secondary press may open a context menu on release; tool cancellation cannot.
+    pub(super) context_menu_allowed: bool,
     pub(super) move_requested: bool,
+    /// Counterclockwise degrees on screen; the board camera converts this intent to model space.
     pub(super) rotate_requested: u16,
+    /// F: flip the hovered or selected footprint, or the footprint being moved, to the other side.
+    pub(super) flip_requested: bool,
+    /// `: highlight the net under the pointer, or clear the highlight over empty space.
+    pub(super) net_highlight_requested: bool,
+    /// The net whose pads and copper are drawn highlighted in this view.
+    pub(super) highlight_net: Option<String>,
+    /// Reuse derived copper connectivity while the addressed board and revision stay unchanged.
+    pub(super) copper_connectivity_cache: Option<CopperConnectivityCache>,
     pub(super) selection: std::collections::BTreeSet<String>,
     pub(super) hidden_layers: std::collections::BTreeSet<String>,
     pub(super) layer_defaults_applied: bool,
@@ -178,6 +247,35 @@ pub(super) struct BoardState {
 }
 
 impl BoardState {
+    /// Footprints used only for correspondence include a selected reference's owning placement.
+    pub(super) fn probe_footprints(&self) -> std::collections::BTreeSet<String> {
+        self.selection.iter().cloned().chain(self.reference.selected.iter().cloned()).collect()
+    }
+    /// Whether a footprint or its reference currently owns a placement gesture.
+    pub(super) fn editing_footprint(&self) -> bool {
+        self.draft.is_some() || self.reference_drag.is_some()
+    }
+
+    /// Reuse connectivity for the same board and view/revision authority. Missing authority
+    /// recomputes without caching, so disposable previews cannot borrow another opening's data.
+    pub(super) fn copper_connectivity(
+        &mut self,
+        board: pcbcraft_engine::board::view::BoardView<'_>,
+        source: Option<ViewInput>,
+    ) -> Arc<crate::board_appearance::Connectivity> {
+        if let Some(cache) = &self.copper_connectivity_cache
+            && Some(cache.source) == source
+            && cache.target == board.target
+        {
+            return cache.connectivity.clone();
+        }
+        let (copper, nets) = board.copper_with_nets();
+        let connectivity = Arc::new(crate::board_appearance::Connectivity { copper, nets });
+        self.copper_connectivity_cache =
+            source.map(|source| CopperConnectivityCache { source, target: board.target, connectivity: connectivity.clone() });
+        connectivity
+    }
+
     /// Share revision-keyed accepted geometry between frames; navigation never invalidates it.
     /// Missing input authority is recomputed rather than reusing a possibly foreign opening.
     pub(super) fn ratsnest(
@@ -251,6 +349,8 @@ pub(super) struct EditorView {
     pub(super) panels: [pcbcraft_chrome::workspace::panels::Panel; 3],
     /// Runtime definition document, independent of the parked project workspace/target.
     pub(super) definition: Option<u64>,
+    /// Library browsing is a view-local service presentation, never a project target.
+    pub(super) library: Option<crate::library_workspace::State>,
     pub(super) camera: Camera,
     parked_camera: Camera,
     pub(super) schematic: SchematicState,
@@ -269,19 +369,37 @@ impl Default for EditorView {
 }
 
 impl EditorView {
+    /// Service and definition panes own no project edit authority.
+    pub(super) fn auxiliary(&self) -> bool {
+        self.definition.is_some() || self.library.is_some()
+    }
+
     /// Return a project target only; definition panes and unavailable placeholders grant no project authority.
     pub(super) fn target(&self) -> Option<DocumentTarget> {
-        if self.definition.is_some() { None } else { self.binding.map(|binding| binding.target) }
+        if self.auxiliary() { None } else { self.binding.map(|binding| binding.target) }
+    }
+
+    /// Seed the active and parked workspace cameras from their remembered defaults. The workspace
+    /// currently showing takes its own spacing, so switching back later restores the other one.
+    pub(super) fn set_grid_defaults(&mut self, schematic_nm: i64, board_nm: i64) {
+        let (active, parked) = match self.workspace {
+            Workspace::Schematic => (schematic_nm, board_nm),
+            Workspace::Board => (board_nm, schematic_nm),
+        };
+        self.camera.set_snap_nm(active);
+        self.parked_camera.set_snap_nm(parked);
     }
 
     /// Start a successfully opened project's default document in this workspace. Runtime identity,
-    /// snap spacing and selection-filter choices survive, while old document addresses, navigation and edit authority expire.
+    /// each workspace's snap spacing and selection-filter choices survive, while old document
+    /// addresses, navigation and edit authority expire.
     /// Saved arrangements are restored separately afterward and still validate explicit targets.
     /// Definition panes retain their document while refreshing the parked project presentation.
     pub(super) fn bind_opened_project(&mut self, session: &Session) {
         let definition = self.definition.take();
+        let library = self.library.take();
         let workspace = self.workspace;
-        let snap_nm = self.camera.snap_nm();
+        let (snap_nm, parked_snap_nm) = (self.camera.snap_nm(), self.parked_camera.snap_nm());
         let filters = (self.filters, self.filters_collapsed, self.filters_open);
         let panels = self.panels.clone();
         *self = Self::new(self.id);
@@ -289,8 +407,10 @@ impl EditorView {
         self.panels = panels;
         self.workspace = workspace;
         self.camera.set_snap_nm(snap_nm);
+        self.parked_camera.set_snap_nm(parked_snap_nm);
         self.sync(session);
         self.definition = definition;
+        self.library = library;
     }
 
     /// Explicitly retarget a view after the host validates the document's existence.
@@ -318,7 +438,7 @@ impl EditorView {
     /// A cached immutable
     /// projection avoids rebuilding geometry caches on every frame; stale caches never authorize input.
     pub(super) fn snapshot(&self, session: &Session) -> Option<std::sync::Arc<pcbcraft_engine::Project>> {
-        if self.definition.is_some() {
+        if self.auxiliary() {
             return None;
         }
         let root = session.snapshot()?;
@@ -334,7 +454,7 @@ impl EditorView {
     /// Capture project presentation only; runtime definition views are excluded from project
     /// arrangements. Unresolved saved targets remain intact instead of being rebound.
     pub(super) fn saved_state(&self, session: &Session) -> Option<ViewState> {
-        if self.definition.is_some() {
+        if self.auxiliary() {
             return None;
         }
         if let Some(state) = &self.unavailable {
@@ -371,10 +491,7 @@ impl EditorView {
     /// Filter and card choices restore independently of selection, which always starts empty.
     pub(super) fn from_state(id: ViewId, state: &ViewState, session: &Session) -> Self {
         let mut view = Self::new(id);
-        view.workspace = match state.target {
-            DocumentTarget::Sheet(_) => Workspace::Schematic,
-            DocumentTarget::Board(_) | DocumentTarget::BoardWorkspace(_) => Workspace::Board,
-        };
+        view.workspace = state.target.workspace();
         view.board.target = state.board;
         view.sheet = state.schematic;
         if let DocumentTarget::Sheet(sheet) = state.target {
@@ -418,6 +535,7 @@ impl EditorView {
             filters_open: true,
             panels: crate::workspace_panels::defaults(),
             definition: None,
+            library: None,
             camera: Camera::default(),
             parked_camera: Camera::default(),
             schematic: SchematicState::default(),
@@ -443,6 +561,7 @@ impl EditorView {
             filters_open: self.filters_open,
             panels: self.panels.clone(),
             definition: self.definition,
+            library: self.library.clone(),
             camera: self.camera.fork_navigation(),
             parked_camera: self.parked_camera.fork_navigation(),
             unavailable: self.unavailable.clone(),
@@ -474,7 +593,8 @@ impl EditorView {
     /// Switch only this view and restore that workspace's navigation. Old input remains invalid
     /// even when switching back without any document edit.
     pub(super) fn switch(&mut self, workspace: Workspace, session: &Session) {
-        if self.definition.take().is_some() {
+        let library = self.library.take().is_some();
+        if self.definition.take().is_some() || library {
             self.release_input();
         }
         if self.unavailable.is_some() {
@@ -527,12 +647,12 @@ impl EditorView {
 
     /// Scope widgets to their document; captured actions separately validate the input epoch.
     pub(super) fn widget_id(&self) -> egui::Id {
-        egui::Id::new((self.id, self.binding))
+        egui::Id::unique((self.id, self.binding))
     }
 
     /// Capture input only while this view is bound to its current document opening.
     pub(super) fn input(&self, session: &Session) -> Option<ViewInput> {
-        if self.definition.is_some() {
+        if self.auxiliary() {
             return None;
         }
         let binding = self.binding.filter(|binding| Some(*binding) == Binding::current(session, self.workspace, self.board.target, self.sheet))?;
@@ -542,6 +662,9 @@ impl EditorView {
     /// Permit layout controls for definition and unavailable views without granting project edit
     /// authority. Definition tokens include runtime document identity and the view's input epoch.
     pub(super) fn control_input(&self, session: &Session) -> Option<ViewInput> {
+        if self.library.is_some() {
+            return Some(ViewInput { view: self.id, target: None, definition: None, input_epoch: self.input_epoch, revision: 0 });
+        }
         if let Some(document) = self.definition {
             return Some(ViewInput { view: self.id, target: None, definition: Some(document), input_epoch: self.input_epoch, revision: 0 });
         }
@@ -563,25 +686,35 @@ impl EditorView {
 
     /// Drop unfinished gestures without altering selection or the document.
     pub(super) fn cancel_gesture(&mut self) {
+        self.board.drc.cancel();
+        self.schematic.clipboard = crate::clipboard::State::default();
+        self.board.clipboard = crate::board_clipboard::State::default();
         self.board.drawing.cancel();
         self.board.tracks.cancel();
+        self.board.measure.cancel();
         self.board.draft = None;
+        self.board.reference_drag = None;
         self.board.placement = None;
         self.board.box_drag = None;
         self.board.move_requested = false;
         self.board.rotate_requested = 0;
+        self.board.flip_requested = false;
         self.schematic.tool = None;
         self.schematic.wire_draft = Draft::default();
         self.schematic.rotate_requested = false;
+        self.schematic.mirror_requested = None;
         self.schematic.edit_requested = false;
         self.schematic.text_edit = None;
         self.schematic.datasheet_requested = false;
         self.schematic.move_requested = false;
     }
 
-    /// Invalidate captured input on focus or host transitions, retaining both cameras.
+    /// Invalidate captured input and stop wheel animation on focus or host transitions,
+    /// retaining the displayed transforms of both cameras.
     pub(super) fn release_input(&mut self) {
         self.cancel_gesture();
+        self.camera.cancel_zoom();
+        self.parked_camera.cancel_zoom();
         for panel in &mut self.panels {
             panel.cancel_drag();
         }
@@ -594,7 +727,7 @@ impl EditorView {
     /// sheet/board targets that no longer resolve become unavailable, closeable placeholders;
     /// undo restores their address and navigation. Only omitted targets use compatibility defaults.
     pub(super) fn sync(&mut self, session: &Session) -> bool {
-        if self.definition.is_some() {
+        if self.auxiliary() {
             return false;
         }
         if let Some(state) = &self.unavailable {
@@ -636,12 +769,13 @@ impl EditorView {
             self.binding = None;
             self.schematic = SchematicState::default();
             self.board.selection.clear();
+            self.board.reference = Default::default();
             return true;
         }
         let binding = Binding::current(session, self.workspace, board_target, self.sheet);
         let changed = self.binding != binding;
         if changed {
-            let snap_nm = self.camera.snap_nm();
+            let (snap_nm, parked_snap_nm) = (self.camera.snap_nm(), self.parked_camera.snap_nm());
             let workspace = self.workspace;
             let sheet = self.sheet;
             let filters = (self.filters, self.filters_collapsed, self.filters_open);
@@ -652,9 +786,20 @@ impl EditorView {
             self.sheet = sheet;
             self.workspace = workspace;
             self.camera.set_snap_nm(snap_nm);
+            self.parked_camera.set_snap_nm(parked_snap_nm);
             self.binding = binding;
         }
         self.board.target = board_target;
+        // A highlighted net that no pad carries any more (after an edit, undo or rename) clears,
+        // so the status bar never names a net that nothing on the board shows.
+        if let Some(net) = &self.board.highlight_net
+            && !root
+                .as_ref()
+                .and_then(|p| board_target.and_then(|target| p.board_view(target)))
+                .is_some_and(|board| board.footprints().any(|footprint| footprint.pads.iter().any(|pad| pad.net.as_deref() == Some(net.as_str()))))
+        {
+            self.board.highlight_net = None;
+        }
         if !self.snapshot_root.as_ref().zip(root.as_ref()).is_some_and(|(old, new)| std::sync::Arc::ptr_eq(old, new))
             || self.sheet_snapshot.as_ref().map(|p| p.sheet_target()) != self.sheet
         {
@@ -672,6 +817,9 @@ impl EditorView {
         }
         if self.board.draft.as_ref().is_some_and(|draft| !self.accepts(draft.source, session)) {
             self.cancel_gesture();
+        }
+        if self.board.reference_drag.as_ref().is_some_and(|draft| !self.accepts(draft.source, session)) {
+            self.board.reference_drag = None;
         }
         if self.board.drawing.source().is_some_and(|source| !self.accepts(source, session)) {
             self.cancel_gesture();
@@ -704,6 +852,9 @@ impl EditorView {
                 .map(|footprint| footprint.id)
                 .collect();
             self.board.selection.retain(|id| placed.contains(id));
+            if self.board.reference.selected.as_ref().is_some_and(|id| !placed.contains(id)) {
+                self.board.reference = Default::default();
+            }
             let setup = self.board.target.and_then(|target| project.board_view(target)).and_then(|board| board.setup());
             let layers: std::collections::BTreeSet<_> = self
                 .board

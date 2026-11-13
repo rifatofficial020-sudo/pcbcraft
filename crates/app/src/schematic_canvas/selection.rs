@@ -23,7 +23,9 @@ pub(super) fn at(
     point: Pos2,
     filters: crate::selection_filters::Filters,
 ) -> Selection {
-    if let Some(label) = project
+    if let Some(target) = filters.no_connects.then(|| crate::no_connect::marker_at(project, camera, canvas, point)).flatten() {
+        Selection::one_no_connect(target)
+    } else if let Some(label) = project
         .net_labels()
         .iter()
         .rev()
@@ -57,7 +59,7 @@ pub(super) fn boxed(
     let crossing = end.x < start.x;
     let mut hits = Selection::default();
     for symbol in project.symbols().iter().filter(|_| filters.symbols) {
-        let body = super::body(&symbol.definition, symbol.turns());
+        let body = super::body(symbol.unit_definition(), symbol.turns(), symbol.is_mirrored());
         let center = camera.screen(symbol.position, canvas);
         let body = Rect::from_min_max(center + body.min.to_vec2() * camera.unit_step(), center + body.max.to_vec2() * camera.unit_step());
         if if crossing { window.intersects(body) } else { window.contains_rect(body) } {
@@ -81,7 +83,47 @@ pub(super) fn boxed(
             hits.wires.insert(wire.id());
         }
     }
+    if filters.no_connects {
+        let extent = crate::no_connect::radius(camera.unit_step());
+        for (target, at) in project.no_connect_appearances() {
+            let center = camera.screen(at, canvas);
+            let bounds = Rect::from_center_size(center, egui::vec2(2. * extent, 2. * extent));
+            let hit = if crossing {
+                window.intersects(bounds)
+                    && [-1., 1.].into_iter().any(|sign| {
+                        segment_intersects(window, center - egui::vec2(extent, sign * extent), center + egui::vec2(extent, sign * extent))
+                    })
+            } else {
+                window.contains_rect(bounds)
+            };
+            if hit {
+                hits.no_connects.insert(target);
+            }
+        }
+    }
     hits
+}
+
+/// Clip a straight X stroke against a selection rectangle; its empty bounding-box corners
+/// must not count as crossing hits. Parallel axes are tested without dividing by zero.
+fn segment_intersects(rect: Rect, a: Pos2, b: Pos2) -> bool {
+    let (mut near, mut far) = (0f32, 1f32);
+    for (start, end, min, max) in [(a.x, b.x, rect.min.x, rect.max.x), (a.y, b.y, rect.min.y, rect.max.y)] {
+        let delta = end - start;
+        if delta.abs() < f32::EPSILON {
+            if start < min || start > max {
+                return false;
+            }
+        } else {
+            let (t1, t2) = ((min - start) / delta, (max - start) / delta);
+            near = near.max(t1.min(t2));
+            far = far.min(t1.max(t2));
+            if near > far {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 #[cfg(test)]

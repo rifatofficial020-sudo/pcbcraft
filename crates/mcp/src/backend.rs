@@ -4,10 +4,10 @@ use pcbcraft_engine::{Project, Session, board::Pad, catalog, schematic::Terminal
 use serde_json::{Value, json};
 
 /// Command namespaces that act on an open editor window instead of the project document.
-/// Only a live editor can run them, and they never change the project, its revision or its undo
-/// history; only `file.save` changes the unsaved state, by saving. The editor publishes their
-/// catalog during live discovery.
-pub const WINDOW_NAMESPACES: &[&str] = &["view.", "window.", "arrangement.", "app.", "file."];
+/// Only a live editor can run them. Presentation commands retain document history; `file.save`
+/// saves and `ui.` can invoke any ordinary UI action, including authored edits or file controls.
+/// The editor publishes their catalog during live discovery.
+pub const WINDOW_NAMESPACES: &[&str] = &["view.", "window.", "arrangement.", "app.", "file.", "ui."];
 
 /// Whether `id` names a window command, which only an open editor can run.
 pub fn is_window_command(id: &str) -> bool {
@@ -60,7 +60,8 @@ impl Backend for Headless {
 
 /// Run an operation against the supplied session. Its owner controls execution policy.
 /// Window commands and editor inspection fail with a reason instead of silently succeeding,
-/// because a bare session has no window to act on.
+/// because a bare session has no window to act on. Clipboard/export queries retain their
+/// requested data even when project inspection is suppressed.
 pub(crate) fn call_session(session: &mut Session, method: &str, params: &Value) -> Result<Value, String> {
     match method {
         "engine.commands" => Ok(json!(catalog().iter().map(|c| c.to_json()).collect::<Vec<_>>())),
@@ -69,7 +70,23 @@ pub(crate) fn call_session(session: &mut Session, method: &str, params: &Value) 
             if is_window_command(id) {
                 return Err(needs_live_editor(&format!("`{id}`")));
             }
-            if params["inspect"].as_bool() == Some(false) && id != pcbcraft_engine::PREVIEW_UPDATE {
+            if params["inspect"].as_bool() == Some(false)
+                && !matches!(
+                    id,
+                    pcbcraft_engine::PREVIEW_UPDATE
+                        | pcbcraft_engine::no_connect::CHECK
+                        | pcbcraft_engine::CHECK_DESIGN
+                        | pcbcraft_engine::EXPORT_FABRICATION
+                        | pcbcraft_engine::clipboard::COPY
+                        | pcbcraft_engine::clipboard::CUT
+                        | pcbcraft_engine::board::clipboard::COPY
+                        | pcbcraft_engine::board::clipboard::CUT
+                        | pcbcraft_engine::clipboard_text::LABELS
+                        | pcbcraft_engine::clipboard_text::OUTLINE
+                        | pcbcraft_engine::library::sources::RESOLVE_PART
+                        | pcbcraft_engine::library::sources::PARSE_QUANTITY
+                )
+            {
                 session.apply(id, &params["params"]).map(|revision| json!({"revision": revision})).map_err(|e| e.to_string())
             } else {
                 session.execute(id, &params["params"]).map_err(|e| e.to_string())

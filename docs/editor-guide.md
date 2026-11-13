@@ -40,7 +40,25 @@ exactly on a pin or wire contacts it. The Browser, Net Inspector and PCB pad
 annotations show the resolved name. [Named nets](net-labels.md) explains scope,
 aliases, shared commands and limits.
 
+## Overlapping symbols
+
+Overlapping symbol drawing bounds show a **Symbol overlap** notice during
+placement and a compact amber count badge on the canvas, with affected references
+on hover. Placement remains allowed. The check excludes separate pin leads and
+instance fields, so it provides a visual bounds warning rather than an electrical
+rule or exact stroke-intersection test. Finish any active placement with **Esc**,
+then right-click over stacked bodies and use **Select symbol** to choose a reference
+before dragging that part away. Warnings update after edits, undo and reopen
+without changing saved files or document history.
+
 ## Preferences and grid
+
+Wheel zoom moves through intermediate scales over a short transition in schematic,
+PCB and library editor canvases. Pinch gestures and panning remain direct. The
+chosen pointer or center anchor stays fixed during the transition, while the
+snap spacing stays unchanged. Clicking, leaving the canvas, losing focus, or
+using Fit or an explicit view command stops pending wheel movement. Fine grid
+marks fade near density changes while the coarser marks remain visible.
 
 The app bar shows the project name and an unsaved marker beside **Undo**, **Redo**, and **Save** (**Download** in the
 browser). The gear (or **Ctrl+,**) opens **Preferences**, with
@@ -53,6 +71,10 @@ between sessions and leaves snapping unchanged. **Grid opacity** fades visible g
 from 100% down to hidden at 0%, with **Reset** to go back; parts still snap to the
 same points. The opacity applies across views and windows and is kept with your
 preferences, not in the project.
+
+In PCB layout, wheel and pinch zoom go up to 64× for close inspection of copper
+and clearances. **Fit board** returns to the whole board.
+
 The right end of the bottom status bar shows the grid point under the pointer (**X**, **Y**,
 with Y increasing down), the **Grid** button and the display unit. Click the unit, or press
 **Ctrl+U** (**⌘U** on macOS), to switch between **mil** and **mm**; the Appearance page
@@ -67,7 +89,9 @@ or rescales anything already drawn, and pins stay reachable at any spacing becau
 wires attach to them by clicking. When zooming out thins the dots, the button says
 how far apart the drawn dots are (for example *Grid 10 mil · dots 50 mil*). Each pane
 keeps its own spacing through focus changes, splitting and reopening files; the last
-one chosen is kept with your preferences, not in the project.
+one chosen is kept with your preferences, not in the project. Schematic and PCB panes
+remember their spacing separately, so changing the board grid does not replace the
+schematic's startup choice (and the reverse). Both start at 50 mil until changed.
 Search finds any setting; changes show at once, and **Cancel** puts them back. The house button beside the brand opens
 **Home**, with New Project, Open, Save, Preferences and About in its rail. Press
 **Esc** or choose **Back to** the project to return to the schematic, which stays
@@ -76,13 +100,14 @@ project's direction.
 
 ## Tools and parts
 
-The schematic ribbon follows PCBcraft Next: **Capture**, **Analyze**, **Libraries**,
-**Manage** and **View**. Capture holds drawing and editing tools, including subsheets and hierarchical
-labels. Analyze holds checks and reports, Libraries holds source management,
-Manage holds independent sheet creation and project operations, and View holds
-panels and editor layout. Unavailable tools are disabled;
-compact windows keep them in the group caption menus. **Fit** and **Net Inspector**
-are also available beside the tabs; View contains their full controls.
+The schematic ribbon has **Capture**, **Sheets**, **Analyze**, **Libraries** and
+**View** tabs. Capture groups placement, connections, clipboard, selection edits
+and PCB synchronization. Sheets keeps independent sheet creation, subsheet
+placement and hierarchical labels together. Analyze contains checks, annotation
+and reports; Libraries contains editors and source management; View contains
+panels, navigation and editor layout. Unavailable tools are disabled and appear
+in caption menus on compact windows. **Fit** and **Net Inspector** also have
+quick actions beside the tabs.
 
 Choose **Capture → Symbol** or press **A** to open the **Parts Catalog** and
 focus search. The large form has library navigation, searchable results and a
@@ -134,6 +159,17 @@ New resistors, capacitors, LEDs and two-pin connectors use shorter leads from
 revision 2 of the starter symbols; saved revision 1 parts retain their original
 geometry.
 
+## Copy and paste
+
+The schematic canvas uses the system clipboard across split panes, detached
+windows, projects and running instances. **Ctrl+C**, **Ctrl+X** and **Ctrl+V**
+(**⌘** on macOS) also appear in the canvas context menu and Capture → Modify.
+Paste previews at the pointer, **R** rotates the group, a click places it and
+**Esc** cancels. **Ctrl+D** duplicates without replacing the clipboard, while
+**Ctrl+Shift+V** opens reference, named-net and original-position options.
+The [clipboard guide](clipboard.md) describes preserved definitions and wiring,
+cut behavior, browser gestures, shared commands and supported limits.
+
 ## Moving symbols
 
 Hover a symbol and press **G**, or choose **Grab (keep connected)** from its context
@@ -149,7 +185,45 @@ movement and rotation commit together as one undo step, while cancellation chang
 The move and disconnection share one undo step; placing a replacement at the vacated
 pins connects it to the preserved wire ends.
 
+With multiple items selected, **M** moves the selection while disconnecting contacts
+to unselected objects. Selected symbols, wire routes and named-net labels move
+together; connections within the selection remain intact, and no-connect markers
+follow their selected owners. Unselected wires stay in place. **G** grabs the group
+while keeping external wires connected, as ordinary group dragging does. Click to
+place, or press **Esc** or right-click to cancel; placement is one undo step.
+
 ## Drawing and editing wires
+
+### Intentionally unused pins and wire ends
+
+Hover a pin lead or open wire endpoint and press **Q**, or choose
+**Capture → No connect** and click the targets to mark. A larger X replaces the
+arrow, snapping its center to the attachment. The placed X follows the pin or
+wire end as it moves. **Esc** or right-click cancels the placement tool;
+empty-space and wire-interior clicks cannot create detached marks. Right-click
+a marked target and choose **Delete**, or click the X and press **Delete** or
+**Backspace**. Marker selection takes precedence over starting a wire, and its
+outline identifies the selected X. Shift/Ctrl, window/crossing selection and
+Select All include markers; the **No connects** selection filter controls them
+independently. Deleting selected marks clears only their intent, preserving the
+pin or wire. Drag a wire-end X to stretch its attached wire; the X stays selected
+and follows the same endpoint. **Esc** cancels that drag, and dropping onto a
+connection is refused while the mark remains. Q/Capture clears the previous
+selection and highlights. These edits support Undo/Redo and travel with copied
+parts and wires. Normal marks use dedicated blue theme ink; conflicts remain red.
+
+**Analyze → Electrical menu → No-connect check** lists intentional no-connects,
+unmarked unconnected pins and open wire ends, plus connected, missing or
+type-changed marker targets. Use **Show** to navigate to a target. Error ink
+identifies conflicting intent. A marker suppresses only its own unconnected-pin
+or dangling-end warning; it never removes wires, changes the netlist or clears
+physical DRC violations. New wires and endpoint attachments at an X are blocked,
+including with **W**; remove the mark first. Hovering or quickly clicking near
+an X does not start a wire. Older saved conflicts remain visible in the check.
+This focused check does not implement the remaining type-conflict and power-driver
+ERC rules. See the [identity and storage contract](no-connect-markers.md).
+
+### Wires
 
 Click an unconnected symbol pin or free wire end to start directly. Press **W** to
 start immediately at the pointer, including on a connected pin, junction, wire segment
@@ -171,7 +245,11 @@ the wire first. Hover a handle and press **G**, or right-click the wire and choo
 **Grab**, to pick it up without holding a button, then click to place it. Moving a
 shared junction adjusts all its attached routes; terminal pins stay on their symbols.
 Right-click → **Select Wire** selects the whole route for dragging or deletion; box and
-modifier selections continue to select whole wires. Crossings stay disconnected.
+modifier selections continue to select whole wires. With one wire or segment selected,
+**M** picks up its whole route, including its bends and free-end no-connect markers;
+click to place, or press **Esc** or right-click to cancel. Pins outside the selection
+stay fixed and disconnect from the moved wire.
+Crossings stay disconnected.
 Select a wire segment, then use Capture → **Modify** for **Slice**, **Heal**
 or **Delete** in the group caption menu.
 Right-click a wire for these edits and whole-wire selection/deletion:
@@ -243,8 +321,8 @@ local cleanup does not route around obstacles or resolve conflicting net names
 ## Symbol properties and selection
 
 The **Selection filters** card sits below Properties in schematic and PCB views.
-Its checkboxes control symbols (including power/ground), wires, local/global and hierarchical labels, and sheets in the
-schematic, and footprints and board graphics in PCB layout. **All items** toggles
+Its checkboxes control symbols (including power/ground), wires, no-connect
+markers, local/global and hierarchical labels, and sheets in the schematic, and footprints and board graphics in PCB layout. **All items** toggles
 the supported categories together; **Reset** enables them all. Categories without
 individual selection support are disabled. Filtering does not hide geometry or
 change connectivity. Turning a category off clears its edit selection and cancels
@@ -331,9 +409,16 @@ Power symbols use these same properties and independent fields. Value supplies
 the global net name, while drawing and terminal behavior belong to the pinned
 definition. There is no separate power-marker form or glyph-style selector.
 
-Press **R** over a symbol to rotate it, or select it first. With a symbol selected,
-**E** opens its expanded properties and **Delete** removes it with its wires.
-Right-click a symbol for the same actions, and press **Esc** to clear the selection.
+Press **R** over a symbol to rotate it, or select it first. Press **X** or **Y**
+to mirror the hovered or selected symbol about its center: **X** flips it left to
+right and **Y** flips it top to bottom. The same actions are in the symbol's
+right-click menu and in **Capture → Mirror X**/**Mirror Y**. Mirroring composes
+with the current rotation, rotating afterwards turns the mirrored drawing, and
+applying the same axis twice restores the original pose. Attached wires stay on
+their terminals, and reference/value text remains upright and editable. With a
+symbol selected, **E** opens its expanded properties and **Delete** removes it
+with its wires. Right-click a symbol for the same actions, and press **Esc** to
+clear the selection.
 New generic resistor and capacitor placements show neutral `R` and `C` values.
 Set their actual ratings in Properties; existing projects and pinned library
 revisions keep their original values.
@@ -378,17 +463,17 @@ pins; inspecting them does not change the project. Each ribbon group's caption, 
 **Place ⌄**, opens a menu of the same actions.
 
 A project supports up to 64 sheets, either at the project root or nested under a parent. Right-click **Sheets** or a sheet row
-to create a sheet, or use **Manage → Sheets → New sheet**; a sheet row also offers **Rename Sheet…** and **Delete Sheet…**.
+to create a sheet, or use **Sheets → New sheet**; a sheet row also offers **Rename Sheet…** and **Delete Sheet…**.
 Deleting a sheet removes its symbols, wires and associated board footprints in
 one undo step, and the project always retains at least one sheet. Each pane keeps
 its sheet target, camera and selection independently.
 
-Use **S** or **Capture → Sheets → Subsheet** to place a hierarchical sheet symbol,
+Use **S** or **Sheets → Subsheet** to place a hierarchical sheet symbol,
 then choose a new child or an existing unparented sheet. Double-click inside the
 symbol to enter its child; **Alt+Backspace** returns to the parent. The sheet name
 sits above the outline; drag either to move it, or select it and drag a corner
 handle to resize. Attached wires follow, and each gesture is one undo step. **H** or
-**Capture → Sheets → Hierarchical label** places a hierarchical label inside a child. Its matching pin
+**Sheets → Hierarchical label** places a hierarchical label inside a child. Its matching pin
 appears on the parent symbol automatically, with the same name and direction;
 **W** connects wires to either end. The Browser nests child sheets beneath their
 parent. Each child has one parent, and repeated names on different sheets do not
@@ -414,7 +499,9 @@ position. **Dock** in a detached window moves its focused pane beside the main
 window's focused pane, preserving the other panes and windows. Closing a native
 window while another remains dismisses only its views, without a save prompt or
 an implicit split elsewhere. Each window uses the same title-bar style and has
-its own panels.
+its own panels. Every window's operating-system title, which the taskbar and
+window switcher show, names its focused document, such as
+`Dual LED · editing demo › Main — PCBCraft`; Home shows `PCBCraft` alone.
 
 Right-click a split pane's header for **Open beside**, **Open in new window**, **Detach
 view**, **Dock in main window** or **Close view**, as applicable. These actions
@@ -468,24 +555,66 @@ successful save. See the [arrangement persistence details](board-workspace-plan.
 
 ## PCB layout
 
+The PCB ribbon separates **Layout**, **Draw**, **Analyze**, **Manufacture**,
+**Libraries** and **View**. Layout contains footprint placement, Route, clipboard,
+Modify and board setup/synchronization. Alignment and distribution are available
+in the Modify menu. Draw contains Line and Rectangle, which use the active layer.
+Analyze contains checks, measurement and cross-probing; Manufacture contains
+fabrication outputs; Libraries contains library editors and sources; View contains
+panels, navigation, Flip view and window layout.
+
+**Active layer**, **Track / line width** and **Via pad / drill** stay visible as
+you switch PCB tabs. They sit at the right of a wide ribbon and wrap below the
+commands on narrow windows, while each tab's commands scroll independently.
+Choose a width or paired via size from its dropdown, or choose **Custom…** to
+enter a value in the display units (explicit units such as `20 mil` also work).
+**Save as preset** remembers a custom choice in local application settings.
+These choices are separate from Board Setup profiles; shareable or project-pinned
+routing profiles are not implemented yet.
+
 Left-drag empty canvas or right-drag to select footprints with the same Window/Crossing
 box used in the schematic. Only visible footprint geometry contributes to selection;
 Shift adds and Ctrl/Command toggles. Escape cancels the box, and Delete removes
-the selected footprints in one undo step. Footprint moves and rotation operate on one placement at a time.
+the selected footprints in one undo step. Footprint moves, rotation and flips operate on one
+placement at a time. With nothing selected, Properties summarizes the board: the Board Outline's overall
+**Size** in the display units (or **No outline**), copper layers, footprints, tracks, vias
+and, once connections are accepted, the number still **Unrouted**.
+
+With two or more footprints selected, the **Modify** menu aligns them by their physical
+bounds (pads, courtyard and fabrication outlines, not silkscreen): **Align to Left**,
+**Right**, **Top** or **Bottom**, or **Align to Vertical Center** and **Horizontal Center**
+(the middle of the selection). With three or more, **Distribute Horizontally** or
+**Vertically** keeps the physical outermost parts fixed and makes the gaps between
+them equal to nanometer precision. Overlapping selections are refused if distribution
+would move an outermost part or change the selection's span. Each is one
+undo step. With one footprint selected, Properties edits its **X**, **Y** and
+**Rotation** exactly (in the display units and whole degrees) and switches its **Side**
+between Top and Bottom; each change is one undo step through the same transform command
+as M, R and F, keeping the other values. **F** (or **Layout → Modify → Flip**) moves the hovered or selected
+footprint to the other side of the board in one undo step, and F during an M move flips the
+part being moved. A bottom-side footprint is mirrored as seen from the top, its surface pads
+use the back copper, mask and paste, and its silkscreen, courtyard and fabrication graphics
+use the back technical layers; through-hole pads stay on every copper layer. Properties shows
+its **Side**, DRC compares courtyards only on the same side, and Outputs adds a bottom
+silkscreen file.
 
 Browser builds support panes within one tab; native window actions are desktop
 only. The workspace tile can switch to PCB layout, open it beside
 the schematic or create a board window directly. Physical SMD placements render rounded rectangular copper pads, body outlines,
 courtyards and silkscreen, with component counterpart highlights, grouped Layers
-and read-only Properties. Legacy placements retain pad-center markers. The editor
+and Properties. Legacy placements retain pad-center markers. The editor
 supports up to 64 flat or hierarchical schematic sheets sharing one board. Existing footprints can be moved by left-dragging or by
 hovering/selecting one and pressing **M**, then clicking to place it. **R** rotates
 90° counterclockwise and **Shift+R** clockwise, including during a move. **Esc**
 or a right-click cancels a move; releasing a drag over a panel also cancels it.
 The Layout ribbon offers **Move** and **Rotate** for a single selection, and
-Properties reports the saved orientation. Moves snap the footprint origin to the
+Properties shows the saved position, rotation and side as editable fields. Moves snap the footprint origin to the
 view's grid, independently of grid visibility; each completed move and its
-preview rotations form one undo step. A conflicting edit, focus/workspace change
+preview rotations form one undo step. Routed tracks come along: each track end on one of
+the footprint's pads stays on that pad while the rest of the track stretches, in the
+preview and in the same undo step. A flip leaves an end behind when its SMD pad moves to
+the other side, and its airwire returns. A move, rotation, flip or alignment that would put
+a pad or a carried track onto another net's copper is refused, leaving the board unchanged. A conflicting edit, focus/workspace change
 or project reopen cancels the draft. The [starter footprints](footprint-library.md) include 0402/0603
 resistors and capacitors, 0402 LEDs, SOT-23 and a two-pin plated header, pinned
 into projects with explicit terminal mappings. New views hide fabrication and
@@ -494,14 +623,30 @@ stages physical text height, stroke width and pad clearance alongside the layer
 and stackup settings. Apply commits them in one undoable board change; Cancel
 discards the draft. Defaults are 1 mm, 0.15 mm and 0.25 mm respectively; lengths accept mil/mm
 input and save with the project. **Assign Footprint…** in a schematic symbol's
-context menu, or **Footprints** in the PCB Layout ribbon, opens package selection
+context menu, or **Layout → Place → Footprint** in PCB layout, opens package selection
 and explicit terminal-to-pad mapping. Assigning pins the package without placing
 it. In PCB layout, **Place on board** places an assigned component at unit-aware
 X/Y coordinates, as a separate undo step; it then uses the ordinary M/R tools.
 Changing an already placed package awaits reviewed board updates. Native-folder
-registration, arcs, slots and routing remain planned.
+registration, arcs and slots remain planned.
 
-**Layout → Board → Setup** and **Layers → Board setup…** share a revision-bound
+Drag a reference designator or hover over it and press **M**, then click to
+place it. The reference position is stored on that footprint and follows its
+rotation and side. The board view and silkscreen export use the moved position.
+Clicking the lettering selects the text, highlights its owning footprint and
+shows remaining airwires and text Properties. A dashed leader connects selected
+or moving lettering to its footprint even when the board is fully routed. Pad,
+silkscreen and reference highlights lighten their existing layer colors. **R** rotates the selected text;
+**Delete** hides it. Local printed words, font, paired height/stroke, rotation,
+alignment, visibility and offsets are undoable placement edits. Clear **Use
+component reference** to enter literal printed words; **Rename…** explicitly
+renames the shared component in the schematic and outputs. **Reset silkscreen**
+removes local appearance and position overrides. A footprint body's **Edit
+silkscreen text** button opens these controls even when its text is hidden.
+To author the default for future placements, edit the definition's reference
+offset in the Footprint Editor.
+
+**Layout → Board → Board setup** and **Layers → Board setup…** share a revision-bound
 Craft settings form, including on a board with no saved stackup. The first opening
 shows a complete editable two-layer 1.6 mm FR-4/1 oz draft; nothing changes until Apply.
 Existing setups retain their own dimensions and materials. Board editor layers provides names and optional membership;
@@ -519,7 +664,7 @@ retain physical surface identities and resolve existing front/all-copper binding
 occupied drawings and authored stratum data are protected against removal.
 
 Left-click footprints to select them, then press **Delete** to remove only their
-board placements. **Layout → Placement menu → Delete** provides the same action. Components, schematic wiring and physical
+board placements. **Layout → Modify menu → Delete** provides the same action. Components, schematic wiring and physical
 package assignments are retained for re-placement, and undo restores the original
 placements. Active drawing tools and movement previews keep keyboard ownership.
 
@@ -540,39 +685,160 @@ color patch. **+** and **−** cycle through the picker order, wrapping through
 technical and hidden layers without changing visibility. **PgUp** selects front
 copper and **PgDn** selects back copper when that side exists. Text fields,
 menus and dialogs keep their normal keys; switching layers cancels an unfinished
-Board Outline gesture or route. The keys are also listed in Keyboard Shortcuts.
+Board Outline gesture or route, except that PgUp and PgDn during a route place a via and
+keep routing on that side. The keys are also listed in Keyboard Shortcuts.
 
-For a board boundary, select **Board Outline** in the selector or Layers card and
-use **Layout → Draw → Line** or **Rectangle**. Line accepts successive clicked
-vertices, closes when you click the first vertex, and finishes an open path with
-Enter. Rectangle uses two opposite corners. Both snap to the grid and nearby edge
-vertices, and Esc cancels unfinished geometry before exiting the tool. After
-exiting, click an edge to select it, drag a vertex to reshape it, drag a segment
-or press M to move the drawing, and Delete to remove it. These edits share project
-Undo; Fit and layer visibility include the edge geometry. A Board Outline layer is
-available independently of copper setup, including on older populated boards.
-Open paths remain valid editing state; no closure, clearance or manufacturing
-validation is implemented yet.
+Use **Draw → Line** or **Rectangle** on the active, visible layer. Line accepts
+successive vertices, closes when you click the first vertex, and finishes an
+open path with Enter. Rectangle uses two opposite corners. Both use the grid
+and nearby graphic vertices, with the current Track / line width as the physical
+stroke. Esc cancels unfinished geometry before exiting the tool.
+
+On copper, these tools create conductive linework: a rectangle outline becomes
+four connected segments. It participates in connectivity, short checks, DRC and
+fabrication and uses the ordinary copper selection/editing tools. Filled copper
+zones remain a planned Route subtool. Non-copper shapes remain independent
+editable graphics: select a line, drag a vertex or segment, use M to move it, or
+Delete to remove it. Silkscreen, mask and paste artwork reaches its matching
+fabrication surface. Mechanical, fabrication, courtyard and user-layer graphics
+remain documentation in the native board.
+
+Select **Board Outline** when drawing the physical boundary. Its centerline
+continues to define the board edge; a closed boundary is required for fabrication.
+Board Outline is also available without a copper setup. Fit and layer visibility
+include these graphics, while DRC reports a missing closed outline and copper
+outside it or too close to the edge.
 
 To route copper, select a copper layer such as **Top** and press **X** or use
-**Layout → Route → Track**. Set **Track width** beside it in the display units
-(0.25 mm by default). Click a pad or a grid point to start; each click adds a run with one
-45° bend, and **/** flips whether the diagonal comes first. Clicking a pad or a
-track end on the same layer finishes the route, as do a double-click and Enter.
+**Layout → Route → Track**. Set **Track / line width** in the persistent controls in the display units
+(0.25 mm by default). The crosshair follows the pointer, while a dot marks where a
+click will land in free space or a ring marks a nearby copper connection. Free
+points snap when the grid point is close to the cursor. Hold **Ctrl** to bypass
+the grid while pads, track ends and vias still snap to their exact positions.
+Click to start a route or add a run with one 45° bend. Use **/**
+to flip whether the diagonal comes first. Click a copper connection, double-click
+or press **Enter** to finish.
+
+The route preview uses a lighter shade of each segment's copper layer color. A
+halo shows the default copper clearance (0.2 mm) around the draft tracks and vias.
 Press **V** while routing to drop a through via at the pointer and continue on the
 other side: front copper leads to back, any other layer to front, and the view's
-active layer follows. **Via diameter** and **Via drill** sit beside the width field
-(0.6 mm and 0.3 mm by default). Backspace removes the last via, returning to the
-previous layer, or else the last vertex. Esc or right-click drops the unfinished
-route, and a second Esc exits the tool. The whole route is one Undo step. When copper
+active layer follows. While routing, **PgUp** and **PgDn** switch to front or back
+copper, adding a via only when the layer changes. Hold **Ctrl** with either page
+key to place the via off-grid in free space. The **Via pad / drill** field beside the
+width field sets the pad diameter and drill (0.6 mm and 0.3 mm by default).
+**Backspace** removes the last via, returning to the previous layer, or else the
+last vertex. Right-click opens the route menu with Finish track, Remove last
+vertex, Place through via, Flip track posture, and Cancel. **Esc** or **Cancel**
+drops the unfinished route, and a second **Esc** exits the tool. The whole route
+is one Undo step. When copper
 joins two terminals of a net, their airwire disappears. A route that would connect
 pads on two different nets is refused with a message, leaving the board unchanged.
+**Analyze → Checks → DRC** starts a read-only snapshot check and opens a DRC card
+listing up to 1,000 findings. It reports a short when one copper island joins pads from
+different intended nets, copper of different nets closer than the clearance
+(0.2 mm), tracks narrower than 0.15 mm, via annular rings under 0.1 mm, each unrouted
+connection, a missing closed Board Outline, copper outside the outline or within 0.3 mm
+of its edge, and overlapping footprint courtyards. Short checks include direct pad
+contact and via-mediated connections, even with a zero clearance rule. A board with
+reviewed connectivity uses its accepted terminal membership; pending schematic edits
+do not change that intent until accepted. Clearance remains a separate check, so
+direct pad contact can produce both a short and a clearance finding. Click a finding
+to center the view on its marker; the
+status bar shows the result, and an edit marks it out of date until **Run again**.
+The card shows stage progress and **Cancel check** while work is pending. Pan and
+zoom remain usable. **Esc** cancels unfinished work when the canvas owns keyboard
+input; closing the card or leaving its view also cancels it. **Run again** keeps
+only the latest queued request. An edit, rule change or
+project reopening discards obsolete completions, and stale findings stop drawing
+canvas markers. Desktop checks run on bounded workers; the browser advances the
+same engine checker in cooperative batches. Live MCP `pcb.check_design` waits for
+its report without blocking editor input, and fails if its source changes or its
+request expires. A headless command still returns its report directly. Both the
+card and headless report list at most 1,000 violations, while `counts` and `total`
+cover every finding.
+These rule values are fixed defaults until net classes and board rules arrive (#77);
+zones, hole spacing, silkscreen and solder mask are not checked, so a clean result is
+not a manufacturing sign-off.
+
+**Manufacture → Fabrication → Outputs** saves one `<project>-fabrication.zip` with Gerber X2
+files for each copper layer, the top and bottom solder mask, paste and silkscreen,
+and the Board Outline, plus an Excellon drill file for every plated hole (vias and
+through-hole pads). Coordinates are in millimeters with Y up, as seen from the top. Mask
+and paste openings match the pads exactly, leaving any expansion to the fabricator, and
+vias are tented. It needs a board setup and a closed Board Outline, says so otherwise,
+and never edits the project; the same board always produces the same archive. Run DRC
+first: outputs do not check the design.
+
+Copper filenames receive numeric suffixes when sanitized names collide with
+another output, including names that differ only in case. Fixed mask, paste,
+silkscreen and outline filenames retain their names. On Unix, replacement saves
+preserve the existing file's permission bits and new archives follow the process
+umask. The archive is flushed before replacement and its directory is flushed
+afterward on Unix. If that last flush fails, the error states that the complete
+archive was published but its directory sync failed.
+
+Press **Backtick** over a visible pad, track or via to highlight its net. Visible
+pads, tracks and vias on that net brighten in their own colors while the rest
+of the board dims. The status bar names the net. Each copper island takes the
+net of its first netted pad, and each pad keeps its own net. Press **Backtick**
+over empty space to clear the highlight. Starting a route on existing copper
+temporarily emphasizes its net or, for an unassigned trace or via, the connected
+copper. The previous view returns when the draft ends.
+
+**Analyze → Measure** (**Ctrl+Shift+M**) is a ruler that never edits the board.
+Click a start point, then an end point; both snap to a nearby pad center, track end or
+via, otherwise to the grid. The ruler shows the length and its horizontal and vertical
+parts (Y up) in the display units, follows the pointer until the second click, and a
+third click starts again. Esc clears the ruler, a second Esc or right-click leaves the
+tool. Measurements are not saved.
+
+**View → Navigate → Flip view** shows the board from below in this view: model X runs
+right to left around the centered point, at the same zoom, and the status bar says
+**Bottom view**. Selection, routing and moves work as usual, mapped through the mirror;
+the board, its layers and its files are unchanged, and the button toggles back. Fit
+includes tracks and vias. Rotation follows the screen: **R** and the Rotate button
+turn counterclockwise, and **Shift+R** turns clockwise, whether the view is flipped
+or not. This also applies to move, footprint placement and PCB paste previews.
+
+To stitch layers or start a route from a via, choose **Layout → Place → Via** or press
+**Ctrl+Shift+X** (macOS: **Command+Shift+X**). Each click places one through via with the current pad and drill,
+snapping to a nearby pad center or track end on any copper layer, otherwise to the grid;
+the tool stays armed until Esc or right-click, and each via is its own undo step. A via
+that would join pads on two different nets is refused, as is a second via on the same
+spot. The tool needs a board setup with at least two copper layers.
+
 Without a tool, click a track or via to select it (Shift adds, Ctrl or ⌘ toggles) and
-press Delete to remove it; deleting a via keeps its tracks. The **Tracks** selection
-filter turns track picking off. Tracks stay on their layer, so a back-side track does
-not reach front-only SMD pads, while a via joins copper on every layer. Dragging
-tracks, standalone vias, blind or buried vias, and clearance or DRC checks are not
-implemented yet. PgUp and PgDn still change layer by cancelling the route.
+press Delete to remove it; deleting a via keeps its tracks. Selected copper brightens
+in its layer color, like footprint pads, without adding an outline or changing its
+displayed width. A selection box also picks
+tracks and vias, with the same Window/Crossing rules as footprints. **U** selects every
+track and via joined by copper to the one under the pointer, or to the current copper
+selection. With copper selected and no footprint selected, **M** (or **Layout → Modify → Move**)
+moves the selection
+with the pointer until the next click, and dragging a track or via moves it directly;
+both snap to the grid, Esc or right-click cancels, and each completed move is one undo
+step. Properties shows the selected tracks and vias, with editable **Width**, **Via
+pad** and **Via drill** fields in the display units; a value applies to every selected
+item when you release a drag or press Enter. Copper Properties stays read-only while
+an accepted edit prepares, then becomes editable against its published values. A move or resize whose copper would reach
+another net's pad is refused, leaving the board unchanged. The **Lock** choice in copper Properties locks or unlocks the selected tracks
+and vias together; it shows **Mixed** when their states differ. Locked objects
+remain selectable, with size fields read-only. Moving, resizing, reshaping,
+segment-dragging or deleting protected copper is refused for the whole edit,
+including changes carried by a footprint move or alignment. Unlock it first.
+Copy/duplicate/paste retain locks on the new objects; Cut refuses protected
+objects. Undo/redo and native saves preserve lock state.
+
+The **Tracks** and **Vias**
+selection filters turn picking of each off, by click, drag, U or box, and drop that kind
+from the current selection. Tracks stay on their layer, so a back-side track does
+not reach front-only SMD pads, while a via joins copper on every layer. With the pointer over a segment and no tool armed, **D** drags that segment with the
+pointer while segments touching it on the same layer stretch to stay attached. An end
+that meets the middle of another track holds there, so the segment pivots on that
+junction. A click commits them all as one undo step, and Esc or right-click cancels. Vias
+at its ends stay put. Blind or buried vias are not implemented yet. Routing does not check
+clearance; run **Analyze → Checks → DRC** for that.
 Live MCP reaches the transform command and these view, workspace and window
 controls too (see the [MCP guide](mcp.md#live-mcp-in-the-desktop-editor)). See the
 [board inspection walkthrough](quickstart.md#inspect-a-board-beside-its-schematic).
@@ -590,14 +856,15 @@ arrangement retained while definition panes are open.
 
 ## Opening and saving projects
 
-Open `project.pc`, its project folder, or a `.pc.zip` archive from **File → Open…**. Opening from PCB layout binds the incoming project's board before restoring
+Open `project.json`, its project folder, or a `.pc` archive from **File → Open…**. Opening from PCB layout binds the incoming project's board before restoring
 its saved views, including split panes and detached windows.
 Desktop projects default to a folder containing separate project, schematic,
 board and saved symbol documents. **Save** keeps the opened form, and
-**File → Save As…** offers **Project folder…** and **Packed project (.pc.zip)…**.
+**File → Save As…** offers **Project folder…** and **Packed project (.pc)…**.
 Commit the folder to Git; use the archive to share the complete project.
 Ordinary hand-zipped project folders open too, including those without a manifest.
-The browser uploads archives and legacy files and downloads `.pc.zip` archives.
+The browser uploads and downloads current `.pc` archives. Version 0.1.0 breaks
+older project layouts; see the [release notes](../CHANGELOG.md).
 The [native storage notes](native-project-storage.md) describe the formats,
 file safety and performance checks.
 
@@ -609,3 +876,13 @@ Value names the global rail; the definition declares which terminal names it.
 The catalog's Value input is available for every symbol, in both presentations.
 The former power-marker annotation styles are unsupported; there is no automatic
 migration of those old records.
+
+## Board rules
+
+**Analyze → Rules** edits the board's dimensional limits and preferred routing
+sizes through the same revision-checked command as MCP. Preferences must fit the
+hard bounds. Apply creates one undo step; Cancel leaves the board untouched, and
+**Use built-in defaults** removes the saved record. DRC reports the effective rules
+and any violations in existing copper. Rule edits make previous checks and route
+drafts out of date. See [board-rules.md](board-rules.md) for units, local size
+choices, provenance and file compatibility.

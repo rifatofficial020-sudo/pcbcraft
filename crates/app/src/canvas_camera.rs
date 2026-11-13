@@ -10,7 +10,22 @@ use crate::preferences::{Navigation, ScrollAction, ZoomAround};
 use crate::schematic_canvas::grid_bounds;
 
 const MIN_ZOOM: f32 = 0.005;
-const MAX_ZOOM: f32 = 8.0;
+pub(super) const MAX_ZOOM: f32 = 8.0;
+/// Board navigation needs to show fine copper and clearance at a useful scale.
+pub(super) const MAX_BOARD_ZOOM: f32 = 64.0;
+/// A wheel notch settles within this interval; live pinch gestures remain immediate.
+const WHEEL_ZOOM_SECONDS: f32 = 0.14;
+
+/// Transient wheel motion belongs to one camera and is never saved in an arrangement.
+#[derive(Clone, Debug)]
+struct WheelZoom {
+    from: f32,
+    target: f32,
+    elapsed: f32,
+    anchor: Vec2,
+    navigation: Navigation,
+    max_zoom: f32,
+}
 
 /// Persistent navigation excludes viewport geometry and pending input.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -22,9 +37,9 @@ pub(super) struct CameraState {
 }
 
 impl CameraState {
-    /// Validate navigation before adopting a saved arrangement.
-    pub(super) fn valid(&self) -> bool {
-        (MIN_ZOOM..=MAX_ZOOM).contains(&self.zoom)
+    /// Validate navigation against the saved workspace's zoom limit before restoring it.
+    pub(super) fn valid(&self, max_zoom: f32) -> bool {
+        (MIN_ZOOM..=max_zoom).contains(&self.zoom)
             && grid::SPACING_RANGE_NM.contains(&self.snap_nm)
             && self.center_nm.iter().all(|n| n.is_finite() && n.abs() <= (MAX_CENTER_NM + MAX_PIN_OFFSET_NM) as f64 + 1.0)
     }
@@ -36,7 +51,11 @@ impl CameraState {
 #[derive(Clone, Debug)]
 pub(crate) struct Camera {
     zoom: f32,
+    wheel_zoom: Option<WheelZoom>,
+    navigation_frame: Option<(egui::ViewportId, u64)>,
     schematic_rect: Option<Rect>,
+    #[cfg(feature = "performance-harness")]
+    pub(super) performance_rect: Option<Rect>,
     offset: Vec2,
     fit_requested: bool,
     /// A Browser destination waits for its own panel geometry before centering.
@@ -46,18 +65,26 @@ pub(crate) struct Camera {
     /// Spacing of the points the pointer snaps to, in nanometres. It never changes the scale:
     /// drawing is always in [`GRID_NM`] units, so a new spacing leaves everything where it is.
     snap_nm: i64,
+    /// View the board from below: model X is drawn right-to-left. Only board views set this; it
+    /// changes presentation and picking, never the model, and is not saved with the arrangement.
+    mirrored: bool,
 }
 
 impl Default for Camera {
     fn default() -> Self {
         Self {
             zoom: 1.0,
+            wheel_zoom: None,
+            navigation_frame: None,
             schematic_rect: None,
+            #[cfg(feature = "performance-harness")]
+            performance_rect: None,
             offset: Vec2::ZERO,
             fit_requested: false,
             center_requested: None,
             uncovered: None,
             snap_nm: grid::SCHEMATIC_SPACING_DEFAULT_NM,
+            mirrored: false,
         }
     }
 }
@@ -75,7 +102,8 @@ impl Camera {
         // The runtime offset is f32; rounding at the navigation boundary must not invalidate
         // an otherwise valid snapshot when converted back to nanometres.
         let limit = (MAX_CENTER_NM + MAX_PIN_OFFSET_NM) as f64;
-        let center_nm = [self.offset.x, self.offset.y].map(|offset| (-f64::from(offset) / scale).clamp(-limit, limit));
+        let mut center_nm = [self.offset.x, self.offset.y].map(|offset| (-f64::from(offset) / scale).clamp(-limit, limit));
+        center_nm[0] *= self.sign() as f64;
         CameraState { zoom: self.zoom, center_nm, snap_nm: self.snap_nm }
     }
 
@@ -88,12 +116,40 @@ impl Camera {
     }
 
     /// Seed another view from the currently displayed transform and grid, leaving its host
-    /// geometry unset. Splitting supersedes unpainted Fit and centering requests so both views start at
-    /// this zoom.
+    /// geometry unset. Splitting cancels wheel motion, Fit and centering requests so both
+    /// views start at the displayed zoom without inheriting pending movement.
     pub(crate) fn fork_navigation(&mut self) -> Self {
+        self.cancel_zoom();
         self.fit_requested = false;
         self.center_requested = None;
-        Self { zoom: self.zoom, offset: self.offset, snap_nm: self.snap_nm, ..Self::default() }
+        Self { zoom: self.zoom, offset: self.offset, snap_nm: self.snap_nm, mirrored: self.mirrored, ..Self::default() }
+    }
+
+    /// Whether this view shows the board from below.
+    pub(crate) fn mirrored(&self) -> bool {
+        self.mirrored
+    }
+
+    /// Convert a counterclockwise on-screen rotation in degrees into model rotation, normalized
+    /// to 0..360. Reflection reverses the model angle so user controls keep their visible direction.
+    pub(crate) fn model_rotation(&self, degrees: u16) -> u16 {
+        let degrees = degrees % 360;
+        if self.mirrored { (360 - degrees) % 360 } else { degrees }
+    }
+
+    /// Show the board from below or above, keeping the same model point at the center of the
+    /// uncovered canvas and the zoom unchanged. Only presentation and picking change.
+    pub(crate) fn set_mirrored(&mut self, mirrored: bool) {
+        if self.mirrored != mirrored {
+            self.cancel_zoom();
+            self.mirrored = mirrored;
+            self.offset.x = 2.0 * self.uncovered_center().x - self.offset.x;
+        }
+    }
+
+    /// -1 when model X is drawn right-to-left, otherwise 1.
+    fn sign(&self) -> f32 {
+        if self.mirrored { -1.0 } else { 1.0 }
     }
 
     /// The snap spacing in nanometres.
@@ -124,7 +180,7 @@ impl Camera {
         let rect = Rect::from_center_size(Pos2::ZERO, Vec2::ZERO);
         for symbol in project.symbols().iter().filter(|symbol| selection.symbols.contains(&symbol.id())) {
             let center = self.screen(symbol.position, rect).to_vec2();
-            let extent = grid_bounds(&symbol.definition, symbol.turns());
+            let extent = grid_bounds(symbol.unit_definition(), symbol.turns(), symbol.is_mirrored());
             let step = self.unit_step();
             bounds = bounds.union(
                 Rect::from_min_max(pos2(extent.min.x * step, extent.min.y * step), pos2(extent.max.x * step, extent.max.y * step)).translate(center),
@@ -132,6 +188,10 @@ impl Camera {
         }
         for point in project.wires().iter().filter(|wire| selection.wires.contains(&wire.id())).flat_map(|wire| project.wire_path(wire)) {
             bounds = bounds.union(Rect::from_pos(self.screen(point, rect)));
+        }
+        for (_, at) in project.no_connect_appearances().filter(|(target, _)| selection.no_connects.contains(target)) {
+            let radius = crate::no_connect::radius(self.unit_step());
+            bounds = bounds.union(Rect::from_center_size(self.screen(at, rect), Vec2::splat(2. * radius)));
         }
         self.reveal_bounds(bounds);
     }
@@ -145,6 +205,7 @@ impl Camera {
         {
             let margin = theme::SCHEMATIC_FIT_MARGIN.min(uncovered.width() / 4.0).min(uncovered.height() / 4.0);
             if !uncovered.shrink(margin).contains_rect(bounds) {
+                self.cancel_zoom();
                 self.offset += uncovered.center() - bounds.center();
                 self.fit_requested = false;
             }
@@ -153,6 +214,7 @@ impl Camera {
 
     /// Fit after the menu closes using the next canvas rectangle, superseding pending centering.
     pub(crate) fn request_fit(&mut self) {
+        self.cancel_zoom();
         self.center_requested = None;
         self.fit_requested = true;
     }
@@ -160,6 +222,7 @@ impl Camera {
     /// Center a Browser pick once the destination workspace has supplied its panel geometry.
     /// This supersedes Fit while retaining zoom, including for a newly created document view.
     pub(crate) fn request_center(&mut self, point: Point) {
+        self.cancel_zoom();
         self.fit_requested = false;
         self.center_requested = Some(point);
     }
@@ -190,9 +253,10 @@ impl Camera {
     /// Pan so a model point sits at the center of the uncovered canvas, keeping the zoom.
     /// Cancels pending fit and centering requests, which would otherwise move the view away again.
     pub(crate) fn center_on(&mut self, point: Point) {
+        self.cancel_zoom();
         self.center_requested = None;
         let scale = self.unit_step() / GRID_NM as f32;
-        self.offset = self.uncovered_center() - vec2(point.x_nm as f32, point.y_nm as f32) * scale;
+        self.offset = self.uncovered_center() - vec2(self.sign() * point.x_nm as f32, point.y_nm as f32) * scale;
         self.fit_requested = false;
     }
 
@@ -208,15 +272,22 @@ impl Camera {
     pub(crate) fn center(&self) -> Point {
         let scale = self.unit_step() / GRID_NM as f32;
         let center = (self.uncovered_center() - self.offset) / scale;
-        Point { x_nm: center.x.round() as i64, y_nm: center.y.round() as i64 }
+        Point { x_nm: (self.sign() * center.x).round() as i64, y_nm: center.y.round() as i64 }
     }
 
-    /// Zoom to `zoom` (clamped to the wheel's limits) about the uncovered canvas center, as a
-    /// wheel zoom with Zoom around center does. Cancels a pending fit, like any navigation.
+    /// Zoom about the uncovered canvas center within the definition and schematic limits.
+    /// Cancels a pending fit, like any navigation.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn set_zoom(&mut self, zoom: f32) {
+        self.set_zoom_with_limit(zoom, MAX_ZOOM);
+    }
+
+    /// Zoom about the uncovered canvas center, clamped to the target workspace's limits.
+    /// Cancels a pending fit, like any navigation.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn set_zoom_with_limit(&mut self, zoom: f32, max_zoom: f32) {
         let center = self.center();
-        self.zoom = zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+        self.zoom = zoom.clamp(MIN_ZOOM, max_zoom);
         self.center_on(center);
     }
 
@@ -229,7 +300,7 @@ impl Camera {
     /// Convert a model point to a point on the canvas.
     pub(crate) fn screen(&self, point: Point, rect: Rect) -> Pos2 {
         let scale = self.unit_step() / GRID_NM as f32;
-        rect.center() + self.offset + vec2(point.x_nm as f32, point.y_nm as f32) * scale
+        rect.center() + self.offset + vec2(self.sign() * point.x_nm as f32, point.y_nm as f32) * scale
     }
 
     /// Snap the pointer to the nearest multiple of the snap spacing in schematic coordinates,
@@ -250,7 +321,7 @@ impl Camera {
         let relative = pointer - rect.center() - self.offset;
         let nm_per_point = GRID_NM as f64 / f64::from(self.unit_step());
         let snap = |points: f32| (f64::from(points) * nm_per_point / spacing as f64).round() as i64 * spacing;
-        Point { x_nm: snap(relative.x), y_nm: snap(relative.y) }
+        Point { x_nm: snap(self.sign() * relative.x), y_nm: snap(relative.y) }
     }
 
     /// Apply navigation only when the canvas owns input, following the person's settings.
@@ -261,12 +332,12 @@ impl Camera {
         if std::mem::take(&mut self.fit_requested) {
             self.fit(project, rect);
         }
-        self.interact(response, rect, enabled, navigation);
+        self.interact(response, rect, enabled, navigation, MAX_ZOOM);
     }
 
     /// Navigate and fit resolved board copper/graphics, independently of schematic geometry.
-    /// Physical SMD packages may magnify up to the ordinary navigation limit. Fit includes the
-    /// authored board boundary even on an otherwise empty board, independently of layer visibility.
+    /// Wheel and pinch can magnify beyond the whole-board Fit range to inspect fine copper.
+    /// Fit includes the authored board boundary independently of layer visibility.
     pub(crate) fn navigate_board(
         &mut self,
         response: &Response,
@@ -275,17 +346,24 @@ impl Camera {
         enabled: bool,
         navigation: Navigation,
     ) {
+        #[cfg(feature = "performance-harness")]
+        {
+            self.performance_rect = Some(rect);
+        }
         if std::mem::take(&mut self.fit_requested) {
-            *self = Self { uncovered: self.uncovered, snap_nm: self.snap_nm, ..Self::default() };
-            let bounds = project.footprints().flat_map(board_extent).chain(project.drawings().into_iter().flat_map(|drawing| drawing.points)).fold(
-                Rect::NOTHING,
-                |bounds, point| {
+            *self = Self { uncovered: self.uncovered, snap_nm: self.snap_nm, mirrored: self.mirrored, ..Self::default() };
+            let copper = project.tracks().iter().flat_map(|track| [track.start, track.end]).chain(project.vias().iter().map(|via| via.at));
+            let bounds = project
+                .footprints()
+                .flat_map(board_extent)
+                .chain(project.drawings().into_iter().flat_map(|drawing| drawing.points))
+                .chain(copper)
+                .fold(Rect::NOTHING, |bounds, point| {
                     bounds.union(Rect::from_pos((self.screen(point, rect) - rect.center()).to_pos2()).expand(theme::SCHEMATIC_FIT_MARGIN))
-                },
-            );
+                });
             self.fit_bounds(bounds, rect, MAX_ZOOM);
         }
-        self.interact(response, rect, enabled, navigation);
+        self.interact(response, rect, enabled, navigation, MAX_BOARD_ZOOM);
     }
 
     /// Fit native library primitives and navigate without a project, sheet or placed board.
@@ -300,13 +378,13 @@ impl Camera {
     ) {
         self.schematic_rect = Some(rect);
         if std::mem::take(&mut self.fit_requested) {
-            *self = Self { uncovered: self.uncovered, snap_nm: self.snap_nm, ..Self::default() };
+            *self = Self { uncovered: self.uncovered, snap_nm: self.snap_nm, mirrored: self.mirrored, ..Self::default() };
             let bounds = points.fold(Rect::NOTHING, |bounds, point| {
                 bounds.union(Rect::from_pos((self.screen(point, rect) - rect.center()).to_pos2()).expand(theme::SCHEMATIC_FIT_MARGIN))
             });
             self.fit_bounds(bounds, rect, MAX_ZOOM);
         }
-        self.interact(response, rect, enabled, navigation);
+        self.interact(response, rect, enabled, navigation, MAX_ZOOM);
     }
 
     /// Reveal selected board placements in their own coordinate space without changing zoom.
@@ -318,32 +396,99 @@ impl Camera {
         self.reveal_bounds(bounds);
     }
 
-    /// Apply input navigation independently of the displayed document and its fit geometry.
-    fn interact(&mut self, response: &Response, rect: Rect, enabled: bool, navigation: Navigation) {
-        if !enabled {
+    /// Stop transient wheel motion at its displayed transform, without changing saved navigation.
+    pub(crate) fn cancel_zoom(&mut self) {
+        self.wheel_zoom = None;
+    }
+
+    /// Apply a scale about a canvas-relative anchor, preserving its model point even in a mirrored view.
+    fn zoom_at(&mut self, zoom: f32, anchor: Vec2, max_zoom: f32) {
+        let before = (anchor - self.offset) / self.zoom;
+        self.zoom = zoom.clamp(MIN_ZOOM, max_zoom);
+        self.offset = anchor - before * self.zoom;
+    }
+
+    /// Accumulate wheel notches toward a bounded target. Reversal or changed settings replace
+    /// outstanding motion so the camera responds immediately in the new direction.
+    fn wheel_target(&mut self, delta: f32, anchor: Vec2, navigation: Navigation, max_zoom: f32) {
+        let base = self
+            .wheel_zoom
+            .as_ref()
+            .filter(|motion| motion.navigation == navigation && (motion.target - self.zoom).signum() == delta.signum())
+            .map_or(self.zoom, |motion| motion.target);
+        let target = (base * delta.clamp(-2.0, 2.0).exp()).clamp(MIN_ZOOM, max_zoom);
+        self.wheel_zoom = (target != self.zoom).then_some(WheelZoom { from: self.zoom, target, elapsed: 0.0, anchor, navigation, max_zoom });
+    }
+
+    /// Advance a finite, eased transition in logarithmic scale. Return whether another frame
+    /// is needed, and land exactly on the target rather than leaving an endless animation tail.
+    fn advance_zoom(&mut self, dt: f32) -> bool {
+        let Some(mut motion) = self.wheel_zoom.take() else { return false };
+        let dt = if dt.is_finite() { dt.clamp(0.0, 0.05) } else { 1.0 / 60.0 };
+        motion.elapsed += dt;
+        let progress = (motion.elapsed / WHEEL_ZOOM_SECONDS).min(1.0);
+        let zoom = if progress == 1.0 {
+            motion.target
+        } else {
+            let eased = 1.0 - (1.0 - progress).powi(3);
+            (motion.from.ln() + (motion.target.ln() - motion.from.ln()) * eased).exp()
+        };
+        self.zoom_at(zoom, motion.anchor, motion.max_zoom);
+        if progress < 1.0 {
+            self.wheel_zoom = Some(motion);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Apply navigation once per native viewport frame. Wheel motion eases while this canvas
+    /// owns input; pinch and pan stay direct. A click, focus loss, blocked input or leaving the
+    /// canvas stops the transition, so motion cannot leak into another pane or an editing click.
+    fn interact(&mut self, response: &Response, rect: Rect, enabled: bool, navigation: Navigation, max_zoom: f32) {
+        let frame = (response.ctx.viewport_id(), response.ctx.cumulative_frame_nr());
+        if self.navigation_frame == Some(frame) {
             return;
         }
+        self.navigation_frame = Some(frame);
+        if !enabled || !response.ctx.input(|input| input.focused) {
+            self.cancel_zoom();
+            return;
+        }
+        if response.ctx.input(|input| input.pointer.any_pressed()) {
+            self.cancel_zoom();
+        }
         if response.dragged_by(PointerButton::Middle) {
+            self.cancel_zoom();
             self.center_requested = None;
             self.offset += response.drag_delta();
         }
         if response.contains_pointer()
             && let Some(pointer) = response.ctx.input(|i| i.pointer.hover_pos())
         {
-            let Wheel { zoom, pan } = response.ctx.input(|input| wheel(&input.events, rect.height(), navigation));
-            if pan != Vec2::ZERO || zoom != 0.0 {
+            let Wheel { zoom, pinch, pan } = response.ctx.input(|input| wheel(&input.events, rect.height(), navigation));
+            if pan != Vec2::ZERO || zoom != 0.0 || pinch != 0.0 {
                 self.center_requested = None;
             }
             self.offset += pan;
-            if zoom != 0.0 {
-                let anchor = match navigation.zoom_around {
-                    ZoomAround::Pointer => pointer,
-                    ZoomAround::Center => rect.center(),
-                };
-                let before = (anchor - rect.center() - self.offset) / self.zoom;
-                self.zoom = (self.zoom * zoom.clamp(-2.0, 2.0).exp()).clamp(MIN_ZOOM, MAX_ZOOM);
-                self.offset = anchor - rect.center() - before * self.zoom;
+            if pan != Vec2::ZERO || self.wheel_zoom.as_ref().is_some_and(|motion| motion.navigation != navigation || motion.max_zoom != max_zoom) {
+                self.cancel_zoom();
             }
+            let anchor = match navigation.zoom_around {
+                ZoomAround::Pointer => pointer - rect.center(),
+                ZoomAround::Center => Vec2::ZERO,
+            };
+            if pinch != 0.0 {
+                self.cancel_zoom();
+                self.zoom_at(self.zoom * (zoom + pinch).clamp(-2.0, 2.0).exp(), anchor, max_zoom);
+            } else if zoom != 0.0 {
+                self.wheel_target(zoom, anchor, navigation, max_zoom);
+            }
+            if self.advance_zoom(response.ctx.input(|input| input.stable_dt)) {
+                response.ctx.request_repaint();
+            }
+        } else {
+            self.cancel_zoom();
         }
         // Keep the view center within reach of the full schematic coordinate range.
         let limit = Vec2::splat((MAX_CENTER_NM + MAX_PIN_OFFSET_NM) as f32 / GRID_NM as f32 * self.unit_step());
@@ -353,11 +498,11 @@ impl Camera {
     /// Center symbol and wire bounds, including free routes and a margin for labels, in the part
     /// of the canvas left uncovered by all visible floating cards.
     fn fit(&mut self, project: &Project, rect: Rect) {
-        *self = Self { uncovered: self.uncovered, snap_nm: self.snap_nm, ..Self::default() };
+        *self = Self { uncovered: self.uncovered, snap_nm: self.snap_nm, mirrored: self.mirrored, ..Self::default() };
         let mut bounds = Rect::NOTHING;
         for symbol in project.symbols() {
             let center = self.screen(symbol.position, rect) - rect.center();
-            let extent = grid_bounds(&symbol.definition, symbol.turns());
+            let extent = grid_bounds(symbol.unit_definition(), symbol.turns(), symbol.is_mirrored());
             let step = self.unit_step();
             let symbol_bounds = Rect::from_min_max(pos2(extent.min.x * step, extent.min.y * step), pos2(extent.max.x * step, extent.max.y * step))
                 .translate(center)
@@ -389,10 +534,11 @@ impl Camera {
     }
 }
 
-/// This frame's wheel and pinch input: a logarithmic zoom delta and a pan in points.
+/// This frame's separate logarithmic wheel/pinch deltas and direct pan in points.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Wheel {
     zoom: f32,
+    pinch: f32,
     pan: Vec2,
 }
 
@@ -415,7 +561,7 @@ fn wheel(events: &[Event], viewport_height: f32, navigation: Navigation) -> Whee
                     out.zoom += (delta.y * scale * 0.004 * navigation.zoom_speed()).clamp(-1.5, 1.5) * direction;
                 }
             }
-            Event::Zoom(factor) if factor.is_finite() && *factor > 0.0 => out.zoom += factor.ln().clamp(-1.5, 1.5),
+            Event::Zoom(factor) if factor.is_finite() && *factor > 0.0 => out.pinch += factor.ln().clamp(-1.5, 1.5),
             _ => {}
         }
     }
@@ -465,6 +611,26 @@ mod tests {
         assert_eq!(camera.zoom, 2.0);
     }
 
+    /// A mirrored camera draws model X right-to-left, maps the pointer back to the same model
+    /// point, keeps the centered point when toggled, and saves its center in model coordinates.
+    #[test]
+    fn mirroring_round_trips_points_and_keeps_the_center() {
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
+        let mut camera = Camera { zoom: 2.0, offset: vec2(-30.0, 14.0), snap_nm: 1, ..Camera::default() };
+        let point = Point { x_nm: 3_810_000, y_nm: -1_270_000 };
+        let center = camera.saved_state().center_nm;
+        let plain = camera.screen(point, rect);
+        camera.set_mirrored(true);
+        let mirrored = camera.screen(point, rect);
+        assert!((mirrored.y - plain.y).abs() < 0.01);
+        assert_ne!(mirrored.x, plain.x);
+        assert_eq!(camera.unsnapped(mirrored, rect), point);
+        let saved = camera.saved_state().center_nm;
+        assert!((saved[0] - center[0]).abs() < 1.0 && (saved[1] - center[1]).abs() < 1.0, "{saved:?} vs {center:?}");
+        camera.set_mirrored(false);
+        assert!((camera.screen(point, rect) - plain).length() < 0.01);
+    }
+
     /// Snapping follows the chosen spacing without changing where model points are drawn.
     #[test]
     fn snapping_follows_the_spacing_and_keeps_the_scale() {
@@ -499,9 +665,83 @@ mod tests {
         assert_eq!((camera.snap_nm(), camera.fork_navigation().snap_nm()), (30 * mil, 30 * mil));
     }
 
+    /// Every sampled frame changes scale smoothly while keeping the anchor fixed. Motion
+    /// finishes at the same scale at different refresh rates, including mirrored PCB views.
+    #[test]
+    fn wheel_motion_interpolates_and_preserves_its_anchor() {
+        for fps in [30., 60., 144.] {
+            for mirrored in [false, true] {
+                for anchor in [Vec2::ZERO, vec2(63., -28.)] {
+                    let mut camera = Camera { zoom: 0.6, offset: vec2(12., 30.), mirrored, ..Camera::default() };
+                    let point = (anchor - camera.offset) / camera.zoom;
+                    let target = camera.zoom * 0.32_f32.exp();
+                    camera.wheel_target(0.32, anchor, Navigation::default(), MAX_ZOOM);
+                    let mut frames = 0;
+                    while camera.wheel_zoom.is_some() {
+                        let before = camera.zoom;
+                        camera.advance_zoom(1. / fps);
+                        assert!(camera.zoom > before && camera.zoom <= target);
+                        assert!(((anchor - camera.offset) / camera.zoom - point).length() < 0.001);
+                        frames += 1;
+                        assert!(frames <= 22, "motion did not settle at {fps} Hz");
+                    }
+                    assert!(frames > 1);
+                    assert_eq!(camera.zoom, target);
+                }
+            }
+        }
+    }
+
+    /// A new notch adds to the pending target, while reversing direction responds from
+    /// the displayed scale instead of continuing the old zoom. Bounds cannot leave a tail.
+    #[test]
+    fn wheel_motion_accumulates_reverses_and_clamps() {
+        let mut camera = Camera::default();
+        camera.wheel_target(0.16, Vec2::ZERO, Navigation::default(), MAX_ZOOM);
+        camera.advance_zoom(1. / 60.);
+        camera.wheel_target(0.16, Vec2::ZERO, Navigation::default(), MAX_ZOOM);
+        assert!((camera.wheel_zoom.as_ref().unwrap().target - 0.32_f32.exp()).abs() < 1e-6);
+        let before = camera.zoom;
+        camera.wheel_target(-0.16, Vec2::ZERO, Navigation::default(), MAX_ZOOM);
+        camera.advance_zoom(1. / 60.);
+        assert!(camera.zoom < before);
+        for (zoom, delta) in [(MAX_ZOOM, 0.16), (MIN_ZOOM, -0.16)] {
+            camera.zoom = zoom;
+            camera.wheel_target(delta, Vec2::ZERO, Navigation::default(), MAX_ZOOM);
+            assert!(camera.wheel_zoom.is_none());
+        }
+    }
+
+    /// Splits and saved arrangements start from the visible transform, with no queued
+    /// wheel movement. Explicit centering and Fit discard that transient authority too.
+    #[test]
+    fn wheel_motion_is_not_saved_or_inherited_by_another_view() {
+        let mut camera = Camera::default();
+        camera.wheel_target(0.32, vec2(50., 30.), Navigation::default(), MAX_ZOOM);
+        camera.advance_zoom(1. / 60.);
+        let restored = Camera::from_state(&camera.saved_state());
+        assert_eq!(restored.zoom, camera.zoom);
+        assert!(restored.wheel_zoom.is_none());
+        let fork = camera.fork_navigation();
+        assert_eq!(fork.zoom, camera.zoom);
+        assert!(camera.wheel_zoom.is_none() && fork.wheel_zoom.is_none());
+        camera.wheel_target(0.32, Vec2::ZERO, Navigation::default(), MAX_ZOOM);
+        camera.request_fit();
+        assert!(camera.wheel_zoom.is_none());
+        camera.wheel_target(0.32, Vec2::ZERO, Navigation::default(), MAX_ZOOM);
+        camera.center_on(Point { x_nm: 0, y_nm: 0 });
+        assert!(camera.wheel_zoom.is_none());
+    }
+
     fn scroll(y: f32, command: bool) -> Event {
         let modifiers = if command { egui::Modifiers::COMMAND } else { egui::Modifiers::NONE };
-        Event::MouseWheel { unit: MouseWheelUnit::Point, delta: vec2(0.0, y), modifiers, phase: egui::TouchPhase::Move }
+        Event::MouseWheel {
+            source: egui::MouseWheelSource::Unknown,
+            unit: MouseWheelUnit::Point,
+            delta: vec2(0.0, y),
+            modifiers,
+            phase: egui::TouchPhase::Move,
+        }
     }
 
     #[test]
@@ -519,7 +759,8 @@ mod tests {
         let fast = Navigation { zoom_speed_percent: 200, ..Navigation::default() };
         assert!((wheel(&[scroll(50.0, false)], 500.0, fast).zoom - 2.0 * base).abs() < 1e-6);
         let pinch = [Event::Zoom(1.5)];
-        assert_eq!(wheel(&pinch, 500.0, reversed).zoom, wheel(&pinch, 500.0, Navigation::default()).zoom);
+        assert_eq!(wheel(&pinch, 500.0, reversed).pinch, 1.5_f32.ln());
+        assert_eq!(wheel(&pinch, 500.0, reversed).pinch, wheel(&pinch, 500.0, Navigation::default()).pinch);
     }
 
     #[test]

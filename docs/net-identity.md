@@ -5,10 +5,12 @@ Design recorded November 8, 2026; related work:
 [#42](https://github.com/tangency-labs/pcbcraft/issues/42) and
 [#122](https://github.com/tangency-labs/pcbcraft/issues/122).
 This policy applies to schematic-only, single-board and multiboard projects.
-It does not claim that persistent net identity is already implemented.
+The [implemented single-board/schematic-only registry](net-registry-storage.md)
+covers sparse IDs, anchors, reconciliation and explicit ambiguity resolution.
+The broader multiboard, system, class and authored-rule contracts below remain
+design work; the [path to the net registry](net-registry-path.md) orders those slices.
 
-The current electrical graph is derived and does not have persistent net IDs.
-The registry design gives reviewed board updates and authored rules stable
+The electrical graph remains derived. The registry gives future reviewed board updates and authored rules stable
 targets without making a second source of electrical connectivity. Wiring,
 ports, labels and explicit system connections still determine the graph.
 
@@ -18,7 +20,7 @@ Each board's `instances.json` owns its logical `net_registry`, including stable
 net IDs, primary and fallback anchors, lineage, explicit net/class bindings and
 unresolved reconciliation records. Its physical `board.json` owns that board's
 accepted net/terminal baseline and pending physical removal information.
-`project.pc` owns the schematic-only registry under
+`project.json` owns the schematic-only registry under
 `schematic_instances.net_registry`, plus a distinct system registry for system
 connections when required. System continuity does not merge the separate board copper-net records.
 

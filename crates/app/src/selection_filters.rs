@@ -15,14 +15,16 @@ pub(super) struct Filters {
     pub wires: bool,
     pub sheets: bool,
     pub labels: bool,
+    pub no_connects: bool,
     pub footprints: bool,
     pub tracks: bool,
+    pub vias: bool,
     pub graphics: bool,
 }
 
 impl Default for Filters {
     fn default() -> Self {
-        Self { symbols: true, wires: true, sheets: true, labels: true, footprints: true, tracks: true, graphics: true }
+        Self { symbols: true, wires: true, sheets: true, labels: true, no_connects: true, footprints: true, tracks: true, vias: true, graphics: true }
     }
 }
 
@@ -45,6 +47,9 @@ impl Filters {
         selection
             .net_labels
             .retain(|id| project.is_some_and(|p| p.net_labels().iter().any(|label| label.object_id() == *id && self.allows_net_label(label.style))));
+        if !self.no_connects {
+            selection.no_connects.clear();
+        }
         if !self.symbols {
             selection.symbols.clear();
         }
@@ -64,6 +69,7 @@ impl Filters {
                 planned("pins", "Pins"),
                 row("wires", "Wires", self.wires),
                 row("labels", "Labels", self.labels),
+                row("no_connects", "No connects", self.no_connects),
                 planned("graphics", "Graphics"),
                 planned("images", "Images"),
                 planned("text", "Text"),
@@ -74,7 +80,7 @@ impl Filters {
                 row("footprints", "Footprints", self.footprints),
                 planned("pads", "Pads"),
                 row("tracks", "Tracks", self.tracks),
-                planned("vias", "Vias"),
+                row("vias", "Vias", self.vias),
                 planned("zones", "Zones"),
                 planned("text", "Text"),
                 row("graphics", "Graphics", self.graphics),
@@ -96,8 +102,10 @@ impl PcbApp {
                 (Workspace::Schematic, "wires") => &mut next.wires,
                 (Workspace::Schematic, "sheets") => &mut next.sheets,
                 (Workspace::Schematic, "labels") => &mut next.labels,
+                (Workspace::Schematic, "no_connects") => &mut next.no_connects,
                 (Workspace::Board, "footprints") => &mut next.footprints,
                 (Workspace::Board, "tracks") => &mut next.tracks,
+                (Workspace::Board, "vias") => &mut next.vias,
                 (Workspace::Board, "graphics") => &mut next.graphics,
                 (_, "view" | "collapsed" | "open") => continue,
                 _ => return Err(format!("Selection filter `{key}` is unavailable in this workspace")),
@@ -121,12 +129,20 @@ impl PcbApp {
             }
             if !next.footprints {
                 view.board.selection.clear();
+                view.board.reference = Default::default();
             }
-            if !next.tracks {
-                view.board.tracks.selected.clear();
+            if !next.tracks || !next.vias {
+                // Drop only the copper kinds that can no longer be picked.
+                let vias: std::collections::BTreeSet<uuid::Uuid> = self
+                    .session
+                    .project()
+                    .and_then(|project| view.board.target.and_then(|target| project.board_view(target)))
+                    .map(|board| board.vias().iter().map(|via| via.id).collect())
+                    .unwrap_or_default();
+                view.board.tracks.selected.retain(|id| if vias.contains(id) { next.vias } else { next.tracks });
             }
             if !next.graphics {
-                view.board.drawing.selected = None;
+                view.board.drawing.select(None);
             }
         }
         if let Some(open) = open {
@@ -152,7 +168,7 @@ impl PcbApp {
         let mut changed = false;
         let (rect, toggle) = self.views.active.panels[crate::workspace_panels::FILTERS].show(
             ui,
-            egui::Id::new(("selection_filters", self.views.host)),
+            egui::Id::unique(("selection_filters", self.views.host)),
             "Selection filters",
             canvas,
             area,

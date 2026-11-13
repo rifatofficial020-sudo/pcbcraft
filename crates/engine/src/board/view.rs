@@ -47,9 +47,10 @@ pub enum CopperLayers {
 }
 
 impl CopperLayers {
-    /// Resolve library copper binding in physical stack order. Component-side lands currently
-    /// use the documented front-side placement compatibility rule; all-copper lands span the stack.
-    pub(crate) fn resolve(setup: Option<&super::setup::BoardSetup>, binding: super::definition::CopperBinding) -> Self {
+    /// Resolve library copper binding in physical stack order. Mounting-side lands use the
+    /// front copper of a top-side placement and the back copper of a bottom-side one;
+    /// all-copper lands span the stack.
+    pub(crate) fn resolve(setup: Option<&super::setup::BoardSetup>, binding: super::definition::CopperBinding, bottom: bool) -> Self {
         use super::{
             definition::CopperBinding,
             setup::{Side, Stratum},
@@ -61,7 +62,8 @@ impl CopperLayers {
             .iter()
             .filter_map(|stratum| {
                 let Stratum::Copper { layer, .. } = stratum else { return None };
-                (binding == CopperBinding::AllCopper || setup.layers().iter().any(|record| record.id == *layer && record.side == Some(Side::Front)))
+                let side = if bottom { Side::Back } else { Side::Front };
+                (binding == CopperBinding::AllCopper || setup.layers().iter().any(|record| record.id == *layer && record.side == Some(side)))
                     .then_some(*layer)
             })
             .collect();
@@ -91,9 +93,13 @@ pub struct PadView {
 #[derive(Clone, Debug)]
 pub struct GraphicView {
     pub purpose: super::definition::GraphicPurpose,
+    /// The board side whose technical layer holds this graphic: the placement's side.
+    pub side: super::setup::Side,
     pub points: Vec<Point>,
     pub stroke_nm: Option<i64>,
     pub closed: bool,
+    /// This path belongs to the generated reference text rather than fixed footprint artwork.
+    pub reference: bool,
 }
 
 /// A placement resolved in one addressed board, including its logical component association.
@@ -103,16 +109,27 @@ pub struct FootprintView<'a> {
     pub id: String,
     pub component: String,
     pub reference: &'a str,
-    pub value: &'a str,
+    /// Presentation value; typed primary quantities use SI prefixes.
+    pub value: std::borrow::Cow<'a, str>,
     pub definition: &'a str,
     pub position: Point,
     /// Counterclockwise whole degrees around the footprint origin, from 0 through 359.
     pub rotation: u16,
     pub pads: Vec<PadView>,
     pub graphics: Vec<GraphicView>,
+    /// Use generated silk rather than an editor-only label. A definition-owned reference
+    /// retains this mode while hidden; definitions without one require explicitly enabled local ink.
     pub physical_reference: bool,
+    /// Additional local displacement from the library reference default, before rotation or side mirroring.
+    pub reference_offset: Point,
+    /// Sparse local print overrides, retained independently of the component's reference.
+    pub reference_text: Option<super::reference::Text>,
+    /// Effective font, words and print dimensions after resolving defaults and local overrides.
+    pub reference_appearance: super::reference::Resolved,
     /// The accepted source was removed from the schematic; physical removal is pending.
     pub pending_removal: bool,
+    /// Placed on the bottom side, mirrored and on the back layers.
+    pub bottom: bool,
 }
 
 impl Project {
@@ -196,12 +213,18 @@ impl<'a> BoardView<'a> {
     /// Accepted terminal membership is indexed once per traversal, rather than
     /// scanning every net for every pad. The index borrows only this snapshot.
     pub fn footprints(self) -> impl Iterator<Item = FootprintView<'a>> {
+        self.footprints_range(0, usize::MAX)
+    }
+
+    /// Resolve a bounded placement range without constructing skipped footprint graphics.
+    /// A resumable checker retains its stable range under one immutable snapshot.
+    pub(super) fn footprints_range(self, start: usize, count: usize) -> impl Iterator<Item = FootprintView<'a>> {
         let accepted = self.project.board.baseline.as_ref().map(|baseline| (baseline, baseline.terminal_net_index()));
-        self.project.board.footprints().iter().filter_map(move |footprint| {
+        self.project.board.footprints().iter().skip(start).take(count).filter_map(move |footprint| {
             let component = self.project.components.get(&footprint.component);
             let historical = self.project.board.baseline.as_ref().and_then(|baseline| baseline.components.get(&footprint.component));
             let reference = component.map(|component| component.reference()).or_else(|| historical.map(|component| component.reference.as_str()))?;
-            let value = component.map(|component| component.value()).or_else(|| historical.map(|component| component.value.as_str()))?;
+            let value = component.map(|component| component.display_value()).or_else(|| historical.map(|part| part.display_value()))?;
             Some(FootprintView {
                 board: self.target,
                 id: format!("footprint-{}", footprint.id),
@@ -232,7 +255,7 @@ impl<'a> BoardView<'a> {
                             number: pad.as_str().to_owned(),
                             center,
                             copper,
-                            copper_layers: definition.map(|pad| CopperLayers::resolve(self.setup(), pad.copper)),
+                            copper_layers: definition.map(|pad| CopperLayers::resolve(self.setup(), pad.copper, footprint.bottom)),
                             shape: definition.map_or(super::definition::PadShape::Rectangle, |p| p.shape),
                             corner_radius_nm: definition.map_or(0, |p| p.corner_radius_nm),
                             drill_nm: definition.and_then(|p| p.drill_nm),
@@ -242,10 +265,34 @@ impl<'a> BoardView<'a> {
                     })
                     .collect(),
                 graphics: graphics(self.project, footprint, reference),
-                physical_reference: self.project.board.definition_for(footprint).is_some_and(|d| d.reference.is_some()),
+                physical_reference: self
+                    .project
+                    .board
+                    .definition_for(footprint)
+                    .is_some_and(|d| d.reference.is_some() || footprint.reference_text.as_ref().is_some_and(|text| text.visible == Some(true))),
+                reference_offset: footprint.reference_offset.unwrap_or(super::DEFAULT_REFERENCE_OFFSET),
+                reference_text: footprint.reference_text.clone(),
+                reference_appearance: super::reference::Resolved::new(
+                    self.project.board.definition_for(footprint),
+                    reference,
+                    self.silkscreen(),
+                    footprint.reference_text.as_ref(),
+                ),
                 pending_removal: !self.project.component_is_board_eligible(footprint.component),
+                bottom: footprint.bottom,
             })
         })
+    }
+
+    /// Project a disposable reference move through the same silk clipping and transform as export.
+    /// The view must belong to this board. Editor-only legacy labels have no physical paths.
+    pub fn reference_preview(self, view: &FootprintView<'_>, offset: Point) -> Vec<GraphicView> {
+        let Some(id) = crate::schematic::wiring::parse_id(&view.id, "footprint-").filter(|_| view.board == self.target) else { return Vec::new() };
+        let placements = self.project.board.footprints();
+        let Ok(index) = placements.binary_search_by_key(&id, |footprint| footprint.id) else { return Vec::new() };
+        let mut placement = placements[index].clone();
+        placement.reference_text = view.reference_text.clone();
+        reference_graphics(self.project, &placement, view.reference, offset)
     }
 
     /// Project schematic component selection into this board's placement IDs. Wires and missing
@@ -296,14 +343,17 @@ fn net_label(project: &Project, terminal: crate::schematic::Terminal) -> Option<
 fn graphics(project: &Project, footprint: &super::Footprint, reference: &str) -> Vec<GraphicView> {
     let Some(definition) = project.board.definition_for(footprint) else { return Vec::new() };
     let style = project.board.silkscreen.unwrap_or_default();
+    let side = if footprint.bottom { super::setup::Side::Back } else { super::setup::Side::Front };
     let mut result: Vec<_> = definition
         .graphics
         .iter()
         .map(|g| GraphicView {
             purpose: g.purpose,
+            side,
             points: rectangle_points(footprint, g.center, g.width_nm, g.height_nm, g.rotation).to_vec(),
             stroke_nm: None,
             closed: true,
+            reference: false,
         })
         .collect();
     for artwork in &definition.artwork {
@@ -318,21 +368,25 @@ fn graphics(project: &Project, footprint: &super::Footprint, reference: &str) ->
                 let style = super::silkscreen::Settings { stroke_width_nm: artwork.graphic.stroke_nm, ..style };
                 result.extend(super::silkscreen::clipped(vec![points], &definition.pads, style).into_iter().map(|path| GraphicView {
                     purpose: artwork.purpose,
+                    side,
                     points: path.into_iter().map(|p| footprint.point(p)).collect(),
                     stroke_nm: Some(artwork.graphic.stroke_nm),
                     closed: false,
+                    reference: false,
                 }));
             } else {
                 result.push(GraphicView {
                     purpose: artwork.purpose,
+                    side,
                     points: points.into_iter().map(|p| footprint.point(p)).collect(),
                     stroke_nm: Some(artwork.graphic.stroke_nm),
                     closed: artwork.graphic.closed(),
+                    reference: false,
                 });
             }
         }
     }
-    let mut paths: Vec<_> = definition
+    let paths: Vec<_> = definition
         .silkscreen
         .iter()
         .map(|path| {
@@ -343,29 +397,37 @@ fn graphics(project: &Project, footprint: &super::Footprint, reference: &str) ->
             points
         })
         .collect();
-    if definition.reference.is_some() {
-        let top_pad = definition.pads.iter().map(|p| p.center.y_nm - p.width_nm.max(p.height_nm) / 2).min().unwrap_or(0);
-        let top_line = paths.iter().flatten().map(|p| p.y_nm - style.stroke_width_nm / 2).min().unwrap_or(top_pad);
-        let lettering = if definition.reference.as_deref() == Some("pcbcraft-technical-1") {
-            super::silkscreen::lettering
-        } else {
-            super::silkscreen::legacy_lettering
-        };
-        let mut text = lettering(reference, 0, style);
-        let bottom = text.iter().flatten().map(|p| p.y_nm).max().unwrap_or(0) + (style.stroke_width_nm + 1) / 2;
-        let offset = top_pad.min(top_line) - style.pad_clearance_nm - bottom;
-        for point in text.iter_mut().flatten() {
-            point.y_nm += offset;
-        }
-        paths.extend(text);
-    }
     result.extend(super::silkscreen::clipped(paths, &definition.pads, style).into_iter().map(|path| GraphicView {
         purpose: super::definition::GraphicPurpose::Silkscreen,
+        side,
         points: path.into_iter().map(|point| footprint.point(point)).collect(),
         stroke_nm: Some(style.stroke_width_nm),
         closed: false,
+        reference: false,
     }));
+    result.extend(reference_graphics(project, footprint, reference, footprint.reference_offset.unwrap_or(super::DEFAULT_REFERENCE_OFFSET)));
     result
+}
+
+/// Place generated lettering at the automatic anchor plus the library and placement offsets. Clip after moving
+/// so the displayed paths and fabrication both use the actual position relative to copper.
+fn reference_graphics(project: &Project, footprint: &super::Footprint, reference: &str, offset: Point) -> Vec<GraphicView> {
+    let Some(definition) = project.board.definition_for(footprint) else { return Vec::new() };
+    let style = project.board.silkscreen.unwrap_or_default();
+    let stroke_nm = super::reference::Resolved::new(Some(definition), reference, style, footprint.reference_text.as_ref()).size.stroke_width_nm;
+    let side = if footprint.bottom { super::setup::Side::Back } else { super::setup::Side::Front };
+    definition
+        .reference_paths_with(reference, style, offset, footprint.reference_text.as_ref())
+        .into_iter()
+        .map(|path| GraphicView {
+            purpose: super::definition::GraphicPurpose::Silkscreen,
+            side,
+            points: path.into_iter().map(|point| footprint.point(point)).collect(),
+            stroke_nm: Some(stroke_nm),
+            closed: false,
+            reference: true,
+        })
+        .collect()
 }
 
 /// Resolve rectangle corners from immutable local geometry, preserving exact odd dimensions

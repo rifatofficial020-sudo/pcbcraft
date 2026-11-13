@@ -47,6 +47,7 @@ If Trunk reports `invalid value '1' for '--no-color'`, the shell has supplied
 | `crates/engine` | Project model, validation, commands, immutable snapshots and undo/redo; no UI |
 | `crates/app` | Desktop/browser composition, canvas tools, preferences and project-file lifecycle |
 | `crates/chrome` | Shared colors, sizes, icons, menus, cards and other presentation primitives |
+| `crates/units` | Shared physical quantity/unit definitions, exact decimal parsing/display, and geometry length conversion/edit formatting |
 | `crates/mcp` | Tool discovery and dispatch over the engine; a restricted live adapter and a separate headless session |
 | `crates/craft-control` | Bounded framing and authenticated local transport |
 | `crates/storage` | Native folder/archive I/O and publication; encoding/decoding is in the engine |
@@ -71,6 +72,20 @@ original fixture set, use a destination that does not already exist:
 ```sh
 cargo run --locked -p pcbcraft-engine --example storage_fixtures -- /tmp/pcbcraft-fixtures-new
 ```
+
+For changes affecting routing/checking, geometry queries, connectivity, live MCP edits or editor
+interaction/rendering performance, use the [performance-testing guide](docs/performance-testing.md)
+before implementation. Its runner-selection table links the CPU, native/browser
+rendered and process-resource commands, saved workloads and comparison tools.
+Collect matched before/after evidence for the affected paths and include the raw
+reports, environment, correctness results and any regressions in the PR; the
+[coverage record](docs/performance-coverage.md) explains existing observations and
+measurement limits.
+
+Routine CI verifies the harness and saved reports with short tests. Full rendered
+baselines, allocation profiles and endurance runs need a separate qualification
+scope and stopping condition under the [bounded verification rule](AGENTS.md#keep-verification-bounded).
+Unrelated or documentation-only changes do not need fresh performance baselines.
 
 ## Choose a bounded change
 
@@ -105,7 +120,27 @@ exposure pauses.
 
 ## Verify and submit
 
-Run the workspace checks before a commit, including for documentation changes:
+Apply the [bounded verification rule](AGENTS.md#keep-verification-bounded):
+choose checks that answer a specific question about the change, and stop when
+the required checks pass and no unresolved correctness or acceptance question
+requires more work.
+
+For documentation-only changes, review wording and formatting, verify local links
+and check any changed commands or examples. Prose and link edits do not require
+Rust builds, Clippy, workspace tests or fresh performance baselines. Changes to
+build configuration, generated sources or executable examples need the checks
+appropriate to their effects, even when they accompany documentation.
+
+During code development, use affected-crate checks and focused regressions for
+the behavior or failure path being changed. Verify the affected native/browser
+behavior when platform interaction changes; a passing check on one target does
+not establish behavior on another.
+
+Before submitting a code PR for review, run the broader workspace checks once
+after the coherent change is complete. These are submission checks, not a
+requirement before every local commit. Reuse results for unchanged code; after
+further edits, repeat affected checks and broaden them when shared behavior or a
+concrete failure warrants it:
 
 ```sh
 cargo fmt --all --check
@@ -116,8 +151,8 @@ cargo check --locked -p pcbcraft-web --target wasm32-unknown-unknown
 
 The test suite includes loopback transport tests, so a sandbox that forbids local
 sockets cannot run the complete suite. Report that limitation rather than
-silently skipping those tests. Match CI's dependency check when cargo-deny is
-available:
+silently skipping those tests. For code or dependency changes, match CI's
+dependency check when cargo-deny is available:
 
 ```sh
 cargo install --locked cargo-deny --version 0.20.2

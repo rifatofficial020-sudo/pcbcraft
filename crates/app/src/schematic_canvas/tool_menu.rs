@@ -1,8 +1,14 @@
 //! Context actions operate on the owning canvas tool through the existing host handlers.
 use super::*;
+use pcbcraft_chrome::{menu::MenuIcon, workspace::ToolIcon};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Action {
+    Copy,
+    Cut,
+    Paste,
+    PasteOptions,
+    Duplicate,
     Symbols,
     Wire,
     Ground,
@@ -45,13 +51,14 @@ pub(super) fn idle(ui: &mut Ui, spacing_nm: i64, unit: pcbcraft_chrome::units::U
         .submenu(ui, |ui| {
             canvas_grid::SCHEMATIC_SPACING_PRESETS_NM.into_iter().find_map(|preset| {
                 let label = canvas_grid::spacing_label(preset, unit);
-                MenuItem::new(&label).checked(preset == spacing_nm).show(ui).then_some(Action::Grid(preset))
+                MenuItem::new(&label).choice(preset == spacing_nm).show(ui).then_some(Action::Grid(preset))
             })
         })
         .and_then(|menu| menu.inner)
 }
 
-/// Menus change the placement preference or tool preview; only a later canvas press commits.
+/// Present active tool actions as aligned menu rows, with Cancel in its own group.
+/// Actions change the placement preference or tool preview; only a later canvas press commits.
 pub(super) fn active(ui: &mut Ui, tool: Option<&Tool>, repeat: bool) -> Option<Action> {
     let keys = egui::Modifiers { ctrl: ui.input(|i| i.modifiers.ctrl), ..egui::Modifiers::NONE };
     if ui.input_mut(|i| i.consume_key(keys, Key::Escape)) {
@@ -59,18 +66,30 @@ pub(super) fn active(ui: &mut Ui, tool: Option<&Tool>, repeat: bool) -> Option<A
         return Some(Action::Cancel);
     }
     if matches!(tool, Some(Tool::Wire { .. })) {
-        if MenuItem::new("Switch bend direction").shortcut("Space").show(ui) {
+        if MenuItem::new("Switch bend direction").tool_icon(ToolIcon::Wire).shortcut("Space").show(ui) {
             return Some(Action::FlipWire);
         }
     } else {
-        if MenuItem::new("Rotate").shortcut("R").show(ui) {
+        if MenuItem::new("Rotate").tool_icon(ToolIcon::Rotate).shortcut("R").show(ui) {
             return Some(Action::Rotate);
         }
-        let mut selected = repeat;
-        if pcbcraft_chrome::catalog::repeat_placement(ui, &mut selected).changed() {
-            ui.close();
-            return Some(Action::Repeat(selected));
+        if MenuItem::new("Repeat placement").toggle(repeat).show(ui) {
+            return Some(Action::Repeat(!repeat));
         }
     }
-    MenuItem::new("Cancel").shortcut("Esc").show(ui).then_some(Action::Cancel)
+    menu::separator(ui);
+    MenuItem::new("Cancel").icon(MenuIcon::Close).shortcut("Esc").show(ui).then_some(Action::Cancel)
+}
+
+/// Clipboard actions follow the existing selection while Paste always reads the system clipboard.
+pub(super) fn clipboard(ui: &mut Ui, selected: bool) -> Option<Action> {
+    [
+        ("Copy", "Ctrl+C", Action::Copy, selected),
+        ("Cut", "Ctrl+X", Action::Cut, selected),
+        ("Paste", "Ctrl+V", Action::Paste, true),
+        ("Paste Options…", "Ctrl+Shift+V", Action::PasteOptions, true),
+        ("Duplicate", "Ctrl+D", Action::Duplicate, selected),
+    ]
+    .into_iter()
+    .find_map(|(label, key, action, enabled)| MenuItem::new(label).shortcut(key).enabled(enabled).show(ui).then_some(action))
 }

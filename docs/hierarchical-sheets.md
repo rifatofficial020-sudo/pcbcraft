@@ -1,6 +1,6 @@
 # Hierarchical sheets
 
-Place a sheet with **S** or **Capture → Sheets → Subsheet**, then click its top-left
+Place a sheet with **S** or **Sheets → Subsheet**, then click its top-left
 corner on the canvas. The form can create a named child or place an existing
 unparented sheet. Creation and placement are one undo step. The Browser displays
 children beneath their parents, while every document keeps its UUID and filename.
@@ -10,7 +10,7 @@ Double-click inside the sheet symbol to enter its child. **Alt+Backspace** retur
 to the parent in the same pane. Browser navigation works in both schematic and
 PCB workspaces, and other panes/windows keep their own document and camera.
 
-Inside the child, use **H** or **Capture → Sheets → Hierarchical label**, click an anchor position
+Inside the child, use **H** or **Sheets → Hierarchical label**, click an anchor position
 and enter a name and direction. The label exposes a matching pin on the parent's
 sheet symbol automatically. Draw a wire to the pointed label anchor or parent
 pin with **W**; an ordinary click also starts a wire at an unconnected anchor.
@@ -45,3 +45,11 @@ directly attached to either. Deleting the child through the Browser also removes
 its placements and associated board footprints; its own children become roots.
 Each operation is atomic and undoable. Save/reopen preserves hierarchy and
 connectivity in folders and packed projects; see the [storage contract](native-project-storage.md#hierarchical-sheet-records).
+
+Copy, Cut and Duplicate are also available for sheet bodies and hovered interface
+labels. A body copy carries its complete child subtree; duplication makes new
+independent documents and components. Cut retains child documents for relocation
+and preserves unselected incident routes on both sides of an interface. See the
+[clipboard guide](clipboard.md#hierarchical-clipboard) for reuse, naming,
+versioned exchange and cancellation. These operations keep the existing
+single-parent model and do not introduce repeated sheet instances.

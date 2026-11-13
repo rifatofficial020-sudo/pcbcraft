@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
 pub(crate) mod fields;
+mod overlaps;
+pub(crate) use overlaps::Cache as OverlapCache;
 mod selection;
 mod tool_menu;
 pub(crate) use tool_menu::Action as ToolAction;
@@ -10,6 +12,14 @@ mod thumbnail;
 pub(crate) use thumbnail::Thumbnail;
 mod wires;
 pub(crate) use selection::BoxDrag;
+
+/// A popup owns a revision-bound list without retaining an old project or re-resolving every row.
+#[derive(Clone)]
+struct SymbolChoices {
+    target: pcbcraft_engine::SheetTarget,
+    revision: u64,
+    entries: Vec<(String, String)>,
+}
 
 #[cfg(test)]
 mod tests;
@@ -30,6 +40,9 @@ use pcbcraft_engine::{
 /// The active canvas interaction, bound to the revision at which it began.
 #[derive(Clone, Debug)]
 pub(crate) enum Tool {
+    NoConnect {
+        revision: u64,
+    },
     Field {
         drag: fields::Drag,
         revision: u64,
@@ -53,6 +66,9 @@ pub(crate) enum Tool {
     },
     PlaceSymbol {
         definition: Arc<SymbolDefinition>,
+        unit: String,
+        component: Option<String>,
+        part: Option<pcbcraft_engine::part_instances::Selection>,
         value: String,
         revision: u64,
         turns: u8,
@@ -69,6 +85,10 @@ pub(crate) enum Tool {
         items: Selection,
         origin: Point,
         revision: u64,
+        /// Keyboard pickup follows hover and finishes on a click; held drags finish on release.
+        pickup: bool,
+        /// Move cuts selection-boundary contacts; Grab retains and stretches them.
+        disconnect: bool,
     },
     Move {
         symbol: SymbolPlacement,
@@ -92,7 +112,8 @@ impl Tool {
     /// Return the revision used to reject stale canvas actions.
     pub(crate) fn revision(&self) -> u64 {
         match self {
-            Self::Field { revision, .. }
+            Self::NoConnect { revision, .. }
+            | Self::Field { revision, .. }
             | Self::NetLabel { revision, .. }
             | Self::SheetGesture { revision, .. }
             | Self::Hierarchy { revision, .. }
@@ -108,6 +129,10 @@ impl Tool {
 
 /// A placement, selection, move, edit or cancellation requested through the canvas.
 pub(crate) enum Click {
+    BeginNoConnect,
+    NoConnect(pcbcraft_engine::no_connect::Attachment, bool),
+    InvalidNoConnect,
+    CancelNoConnect,
     ToolAction(ToolAction, egui::Context),
     GrabField(fields::Drag),
     RotateField(fields::Drag),
@@ -122,13 +147,20 @@ pub(crate) enum Click {
     FinishSheetGesture(Option<crate::hierarchy::Geometry>),
     SelectSheetSymbol(u64),
     HierarchyPlace(Point),
+    HierarchyClipboard(crate::hierarchy::Kind, u64, tool_menu::Action, egui::Context),
     HierarchyAction(crate::hierarchy::Kind, u64, crate::hierarchy::Action),
     Place(Point),
     StartBox(BoxDrag),
     SelectItems(Selection),
     /// Select one leg for direct deletion and reshaping.
     SelectLeg(LegTarget),
-    GrabItems(Selection, Point),
+    /// Translate from this model point with explicit gesture and attachment behavior.
+    MoveItems {
+        items: Selection,
+        origin: Point,
+        pickup: bool,
+        disconnect: bool,
+    },
     FinishItems(Option<Point>),
     /// A drag started on a wire segment, corner or free end; the handler selects its target.
     GrabReshape(wires::ReshapeDrag),
@@ -162,11 +194,24 @@ pub(crate) struct PartDrag {
 /// is drawn unrotated and without labels. A shared minimum preview extent keeps small symbols
 /// from growing disproportionately large across the catalog.
 pub(crate) fn paint_preview(painter: &Painter, definition: &SymbolDefinition, rect: Rect, color: egui::Color32) {
-    let bounds = grid_bounds(definition, 0);
+    paint_preview_transformed(painter, definition, rect, color, 1.0, egui::Vec2::ZERO);
+}
+
+/// The same fitted native symbol can be inspected through a view-only zoom and pan.
+/// Geometry remains clipped by the caller; ordinary thumbnails retain the identity transform.
+pub(crate) fn paint_preview_transformed(
+    painter: &Painter,
+    definition: &SymbolDefinition,
+    rect: Rect,
+    color: egui::Color32,
+    zoom: f32,
+    pan: egui::Vec2,
+) {
+    let bounds = grid_bounds(definition.default_unit(), 0, false);
     let extent = bounds.size().max(theme::SCHEMATIC_PREVIEW_EXTENT);
-    let step = (rect.width() / extent.x).min(rect.height() / extent.y).min(theme::SCHEMATIC_PREVIEW_MAX_STEP);
-    let center = rect.center() - bounds.center().to_vec2() * step;
-    paint_symbol(painter, definition, center, step, 0, Stroke::new(theme::SCHEMATIC_PREVIEW_STROKE, color));
+    let step = (rect.width() / extent.x).min(rect.height() / extent.y).min(theme::SCHEMATIC_PREVIEW_MAX_STEP) * zoom;
+    let center = rect.center() + pan - bounds.center().to_vec2() * step;
+    paint_symbol(painter, definition.default_unit(), center, step, 0, false, Stroke::new(theme::SCHEMATIC_PREVIEW_STROKE, color));
 }
 
 /// What a wire's context menu asks for.
@@ -192,6 +237,7 @@ pub(crate) enum SymbolAction {
     Grab,
     DisconnectMove,
     Rotate,
+    Mirror(pcbcraft_engine::schematic::MirrorAxis),
     EditFields,
     AssignFootprint,
     Delete,
@@ -226,6 +272,10 @@ pub(crate) enum SymbolAction {
 /// a reshape completed by the next click. Other `selected` items use the accent colour. Both mouse buttons can start a box;
 /// direction chooses containment or crossing, and Shift/Ctrl add or toggle hits. Group moves
 /// preview the same bounded transformation used by the engine and commit only on valid release.
+/// M picks up a multi-item selection or an explicitly selected wire and commits on a valid
+/// primary click; Escape, right-click or focus loss cancels that preview.
+/// M cuts contacts to unselected objects; G grabs a group with its external contacts retained,
+/// matching held group dragging. Both preserve contacts within the selected group.
 /// Symbol move previews also include their pending quarter turns; painted wire contacts use
 /// that transformed snapshot, and cancellation discards both position and orientation.
 /// `grid_opacity` is the grid's strength in percent; it changes only how the grid is drawn, never
@@ -234,13 +284,18 @@ pub(crate) enum SymbolAction {
 /// `label` distinguishes simultaneously visible canvases in accessibility output.
 /// `highlighted` marks counterparts selected in another view. It affects paint only; hit
 /// testing, group moves and deletion use `selected`, which takes visual precedence on overlap.
+/// Drawing-bound overlaps have persistent view-only markers and placement warnings; coincident
+/// bodies remain allowed. The symbol context menu clarifies selection without authoring edits.
 /// `filters` restricts item picking, boxes and context menus without disabling explicit drawing tools.
+/// Navigation authority is separate from authoring input, allowing a read-only clipboard ghost
+/// to pan/zoom without enabling picking, tools or model edits.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn show(
     ui: &mut Ui,
     project: &Project,
     revision: u64,
     camera: &mut Camera,
+    overlap_cache: &mut OverlapCache,
     tool: Option<Tool>,
     selected: &Selection,
     selected_leg: Option<&LegTarget>,
@@ -249,6 +304,7 @@ pub(crate) fn show(
     highlighted: &Selection,
     filters: crate::selection_filters::Filters,
     input_enabled: bool,
+    navigation_enabled: bool,
     navigation: Navigation,
     grid_opacity: u8,
     auto_heal: bool,
@@ -261,7 +317,7 @@ pub(crate) fn show(
     let rect = ui.available_rect_before_wrap();
     // Keep the canvas from taking keyboard focus away from editor shortcuts.
     let response = ui.allocate_rect(rect, Sense::CLICK | Sense::DRAG);
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Panel, true, label));
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Pane, true, label));
     let moving = matches!(
         tool,
         Some(
@@ -274,7 +330,7 @@ pub(crate) fn show(
                 | Tool::Reshape { .. }
         )
     );
-    camera.navigate(&response, rect, project, input_enabled && !moving, navigation);
+    camera.navigate(&response, rect, project, navigation_enabled && !moving, navigation);
 
     let field_destination = if let Some(Tool::Field { drag, .. }) = &tool {
         ui.input(|i| i.pointer.hover_pos()).and_then(|p| fields::destination(project, camera, rect, drag, p))
@@ -287,10 +343,13 @@ pub(crate) fn show(
         None
     };
     let group_delta = match &tool {
-        Some(Tool::MoveItems { origin, .. }) => response.interact_pointer_pos().map(|pointer| {
-            let point = camera.snap(pointer, rect);
-            Point { x_nm: point.x_nm - origin.x_nm, y_nm: point.y_nm - origin.y_nm }
-        }),
+        Some(Tool::MoveItems { origin, pickup, .. }) => {
+            let pointer = if *pickup { response.hover_pos().or_else(|| response.interact_pointer_pos()) } else { response.interact_pointer_pos() };
+            pointer.map(|pointer| {
+                let point = camera.snap(pointer, rect);
+                Point { x_nm: point.x_nm - origin.x_nm, y_nm: point.y_nm - origin.y_nm }
+            })
+        }
         _ => None,
     };
     let reshape_target = match &tool {
@@ -310,11 +369,19 @@ pub(crate) fn show(
     };
     let group_preview = match (&tool, group_delta, reshape_target) {
         (Some(Tool::Move { symbol, turns, disconnect, .. }), _, _) => moved.as_ref().and_then(|(_, point)| {
-            project.transformed_symbol(&symbol.id(), *point, Some((symbol.turns() + turns) % 4), *disconnect, revision, auto_heal).ok()
+            project
+                .transformed_symbol(
+                    &symbol.id(),
+                    *point,
+                    Some((symbol.turns() + turns) % 4),
+                    Some(symbol.is_mirrored()),
+                    *disconnect,
+                    revision,
+                    auto_heal,
+                )
+                .ok()
         }),
-        (Some(Tool::MoveItems { items, .. }), Some(delta), _) => {
-            items.moved(project, delta).and_then(|next| next.healed(project, revision, auto_heal)).ok()
-        }
+        (Some(Tool::MoveItems { items, disconnect, .. }), Some(delta), _) => items.transformed(project, delta, *disconnect, revision, auto_heal).ok(),
         (Some(Tool::Reshape { drag, .. }), _, Some(to)) => drag.preview(project, to, revision, auto_heal),
         _ => None,
     };
@@ -364,6 +431,7 @@ pub(crate) fn show(
         .unwrap_or(project);
     let painter = ui.painter_at(rect);
     let tokens = Tokens::get();
+    let overlap_index = overlap_cache.get(project, revision, &painter, camera.unit_step());
     let screen = |point| camera.screen(point, rect);
     let origin = screen(Point { x_nm: 0, y_nm: 0 });
     let unit_step = camera.unit_step();
@@ -392,7 +460,12 @@ pub(crate) fn show(
         wires::paint_selected_leg(&painter, rect, camera, leg, offset);
     }
     let visible = rect.expand((unit_step * 5.0).max(theme::SCHEMATIC_FIT_MARGIN));
-    for symbol in project.symbols() {
+    for symbol in project
+        .symbols()
+        .iter()
+        .filter(|s| !selected.symbols.contains(&s.id()))
+        .chain(project.symbols().iter().filter(|s| selected.symbols.contains(&s.id())))
+    {
         let position = moved.as_ref().filter(|(moving, _)| moving.id() == symbol.id()).map_or(symbol.position, |(_, point)| *point);
         let center = screen(position);
         if visible.contains(center) {
@@ -403,11 +476,21 @@ pub(crate) fn show(
             } else {
                 tokens.text
             };
-            paint_symbol(&painter, &symbol.definition, center, unit_step, symbol.turns(), Stroke::new(theme::SCHEMATIC_SYMBOL_STROKE, color));
+            paint_symbol(
+                &painter,
+                symbol.unit_definition(),
+                center,
+                unit_step,
+                symbol.turns(),
+                symbol.is_mirrored(),
+                Stroke::new(theme::SCHEMATIC_SYMBOL_STROKE, color),
+            );
         }
     }
 
     fields::paint(ui, project, camera, rect, selected, highlighted, tool.as_ref(), input_enabled && filters.symbols, editing);
+    overlap_index.paint(ui, response.id, project, camera, rect);
+    crate::no_connect::paint(ui, &painter, project, camera, rect, selected, highlighted);
     crate::net_labels::paint(ui, rect, camera, project, tool.as_ref(), label_position, selected, editing);
     crate::hierarchy::paint(&painter, rect, camera, project, tool.as_ref(), response.hover_pos().filter(|_| filters.sheets), selected_sheet);
     // Handles go over the symbols, so a corner under a symbol's outline can still be grabbed.
@@ -435,10 +518,16 @@ pub(crate) fn show(
         && let Some(popup) = menu::context(&response, |ui| tool_menu::active(ui, tool.as_ref(), repeat))
     {
         let anchor = egui::Popup::position_of_id(ui.ctx(), egui::Popup::default_response_id(&response));
-        if let (Some(Tool::PlaceSymbol { definition, value, turns, .. }), Some(at)) = (&tool, anchor) {
-            let at = wires::symbol_position(project, definition, *turns, camera, rect, at, draft, revision);
-            if valid_position(at) {
-                paint_template(&painter, definition, value, screen(at), unit_step, *turns, tokens.accent);
+        if let (Some(Tool::PlaceSymbol { definition, unit, value, turns, .. }), Some(at)) = (&tool, anchor)
+            && let Some(drawing) = definition.unit(unit)
+        {
+            let at = wires::symbol_position(project, drawing, *turns, camera, rect, at, draft, revision);
+            if valid_position(at)
+                && let Some(preview) =
+                    SymbolPlacement::preview_unit(definition.clone(), unit, *turns, definition.defaults.clone().unwrap_or_default().field_layout)
+            {
+                paint_unit_template(&painter, &preview, value, screen(at), unit_step, tokens.accent);
+                overlap_index.preview(ui, camera, rect, drawing, *turns, false, at);
             }
         }
         if let Some(Tool::Wire { start, .. }) = tool {
@@ -460,15 +549,16 @@ pub(crate) fn show(
         && let Some(drag) = response.dnd_hover_payload::<PartDrag>()
         && let Some(pointer) = drag_pointer
     {
-        let point = wires::symbol_position(project, &drag.placement.definition, 0, camera, rect, pointer, draft, revision);
+        let point = wires::symbol_position(project, drag.placement.definition.default_unit(), 0, camera, rect, pointer, draft, revision);
         if valid_position(point) {
             paint_template(&painter, &drag.placement.definition, &drag.placement.value, screen(point), unit_step, 0, tokens.accent);
+            overlap_index.preview(ui, camera, rect, drag.placement.definition.default_unit(), 0, false, point);
         }
     }
     if let Some(drag) = response.dnd_release_payload::<PartDrag>()
         && let Some(pointer) = drag_pointer
     {
-        let point = wires::symbol_position(project, &drag.placement.definition, 0, camera, rect, pointer, draft, revision);
+        let point = wires::symbol_position(project, drag.placement.definition.default_unit(), 0, camera, rect, pointer, draft, revision);
         return (input_enabled && valid_position(point)).then(|| Click::Drop(PartDrag::clone(&drag), point));
     }
 
@@ -519,14 +609,33 @@ pub(crate) fn show(
         }
         return None;
     }
-    if matches!(tool, Some(Tool::MoveItems { .. })) {
-        if lost_focus {
+    if let Some(Tool::MoveItems { pickup, .. }) = &tool {
+        if lost_focus || response.secondary_clicked() {
             return Some(Click::FinishItems(None));
         }
-        if ui.input(|i| i.pointer.button_released(egui::PointerButton::Primary)) {
+        if if *pickup {
+            response.clicked_by(egui::PointerButton::Primary)
+        } else {
+            ui.input(|i| i.pointer.button_released(egui::PointerButton::Primary))
+        } {
             return Some(Click::FinishItems(group_delta.filter(|_| input_enabled && response.contains_pointer() && group_preview.is_some())));
         }
         return None;
+    }
+    // Dragging a wire-end mark stretches its attached routes through the existing junction
+    // edit. A pin mark stays with its symbol; drawing tools retain their own input priority.
+    if input_enabled
+        && !lost_focus
+        && tool.is_none()
+        && filters.no_connects
+        && selected.len() <= 1
+        && !ui.input(|i| i.modifiers.shift || i.modifiers.ctrl || i.modifiers.command)
+        && response.drag_started_by(egui::PointerButton::Primary)
+        && let Some(origin) = ui.input(|i| i.pointer.press_origin())
+        && let Some(pcbcraft_engine::no_connect::Attachment::WireEnd(marker)) = crate::no_connect::marker_at(project, camera, rect, origin)
+        && let Some(drag) = wires::marker_drag(project, marker, camera.snap(origin, rect))
+    {
+        return Some(Click::GrabReshape(drag));
     }
     // Endpoint and corner handles use their own hit area before the narrow stroke picker.
     // A ready wire tool allows a deliberate handle drag; a plain click still starts a wire.
@@ -534,6 +643,8 @@ pub(crate) fn show(
         && !lost_focus
         && matches!(tool, None | Some(Tool::Wire { start: None, .. }))
         && selected.len() <= 1
+        && !(filters.no_connects
+            && ui.input(|i| i.pointer.press_origin()).is_some_and(|p| crate::no_connect::marker_at(project, camera, rect, p).is_some()))
         && !whole_wire_drag
         && filters.wires
         && !ui.input(|i| i.modifiers.shift || i.modifiers.ctrl || i.modifiers.command)
@@ -589,24 +700,81 @@ pub(crate) fn show(
                 button: if right { egui::PointerButton::Secondary } else { egui::PointerButton::Primary },
             }));
         }
+        if !hit.no_connects.is_empty() && selected.symbols.is_empty() && selected.wires.is_empty() && selected.net_labels.is_empty() {
+            return Some(Click::SelectItems(selected.combine(&hit, false, false)));
+        }
         if hit.is_subset(selected) && (selected.len() > 1 || whole_wire_drag) {
-            return Some(Click::GrabItems(selected.clone(), camera.snap(origin, rect)));
+            return Some(Click::MoveItems { items: selected.clone(), origin: camera.snap(origin, rect), pickup: false, disconnect: false });
         }
         if let Some(wire) = hit.single_wire()
             && let Some(drag) = wires::reshape_at(project, camera, rect, wire, origin, camera.snap(origin, rect))
         {
             return Some(Click::GrabReshape(drag));
         }
-        return grab_symbol(project, camera, rect, origin, false);
+        return grab_symbol(project, camera, rect, origin, false, selected);
     }
 
     if tool.is_none() && (input_enabled || response.context_menu_opened()) {
         // A right-click names its symbol this frame; afterwards the menu follows the selection.
         let pressed = response.secondary_clicked().then(|| response.interact_pointer_pos()).flatten();
+        let choices_key = response.id.with("symbol_choices");
+        if let Some(pointer) = pressed {
+            let hits = if filters.symbols {
+                symbols_at(project, camera, rect, pointer)
+                    .into_iter()
+                    .map(|(symbol, _)| (symbol.id(), format!("Select {}", symbol.display_reference(&project.reference(symbol)))))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            ui.data_mut(|data| data.insert_temp(choices_key, Arc::new(SymbolChoices { target: project.sheet_target(), revision, entries: hits })));
+        } else if !response.context_menu_opened() {
+            ui.data_mut(|data| data.remove::<Arc<SymbolChoices>>(choices_key));
+        }
+        let captured_choices = ui
+            .data(|data| data.get_temp::<Arc<SymbolChoices>>(choices_key))
+            .filter(|choices| choices.target == project.sheet_target() && choices.revision == revision && filters.symbols);
+        let choices = captured_choices.as_ref().map_or(&[][..], |choices| choices.entries.as_slice());
+        let pin_key = response.id.with("no_connect_pin");
+        if let Some(pointer) = pressed {
+            let pin = crate::no_connect::target_at(project, camera, rect, pointer, selected).filter(|pick| {
+                if project.has_no_connect_attachment(&pick.target) {
+                    return filters.no_connects;
+                }
+                match pick.target {
+                    pcbcraft_engine::no_connect::Attachment::Pin(_) => filters.symbols,
+                    pcbcraft_engine::no_connect::Attachment::WireEnd(_) => filters.wires,
+                }
+            });
+            ui.data_mut(|data| {
+                data.remove::<(pcbcraft_engine::SheetTarget, u64, pcbcraft_engine::no_connect::Attachment, bool)>(pin_key);
+                if let Some(pick) = pin {
+                    let marked = project.has_no_connect_attachment(&pick.target);
+                    data.insert_temp(pin_key, (project.sheet_target(), revision, pick.target, marked));
+                }
+            });
+        }
+        let pin = ui
+            .data(|data| data.get_temp::<(pcbcraft_engine::SheetTarget, u64, pcbcraft_engine::no_connect::Attachment, bool)>(pin_key))
+            .filter(|(sheet, captured_revision, target, marked)| {
+                *sheet == project.sheet_target()
+                    && *captured_revision == revision
+                    && if *marked {
+                        filters.no_connects
+                    } else {
+                        match target {
+                            pcbcraft_engine::no_connect::Attachment::Pin(_) => filters.symbols,
+                            pcbcraft_engine::no_connect::Attachment::WireEnd(_) => filters.wires,
+                        }
+                    }
+            });
         let mut target = match pressed {
             Some(pointer) => filters.symbols.then(|| symbol_at(project, camera, rect, pointer)).flatten().map(|(symbol, _)| symbol.id()),
             None => selected.single_symbol().filter(|_| filters.symbols).map(str::to_owned),
         };
+        if let Some(current) = selected.single_symbol().filter(|current| choices.iter().any(|(id, _)| id == current)) {
+            target = Some(current.to_owned());
+        }
         let mut group = selected.len() > 1
             && (pressed.is_none()
                 || pressed.is_some_and(|p| {
@@ -644,6 +812,44 @@ pub(crate) fn show(
             Some(drag)
         });
         let picked = menu::context(&response, |ui| {
+            if let Some((_, _, target, marked)) = &pin {
+                if (!marked || !group)
+                    && MenuItem::new(if *marked { "Delete" } else { "Mark no connect" }).shortcut(if *marked { "Del" } else { "Q" }).show(ui)
+                {
+                    return Some(Click::NoConnect(target.clone(), !marked));
+                }
+                if *marked && !group {
+                    return None;
+                }
+                menu::separator(ui);
+            }
+            if choices.len() > 1 {
+                if let Some(chosen) = MenuItem::new("Select symbol")
+                    .submenu(ui, |ui| {
+                        let tokens = Tokens::get();
+                        let height = tokens.control_height + tokens.space_2;
+                        egui::ScrollArea::vertical()
+                            .max_height(height * 8.)
+                            .show_rows(ui, height, choices.len(), |ui, range| {
+                                choices[range].iter().find_map(|(id, label)| {
+                                    MenuItem::new(label)
+                                        .choice(selected.single_symbol() == Some(id.as_str()))
+                                        .show(ui)
+                                        .then(|| Click::Select(Some(id.clone())))
+                                })
+                            })
+                            .inner
+                    })
+                    .and_then(|shown| shown.inner)
+                {
+                    return Some(chosen);
+                }
+                menu::separator(ui);
+            }
+            if let Some(action) = tool_menu::clipboard(ui, !selected.is_empty() || selected_sheet.is_some()) {
+                return Some(Click::ToolAction(action, ui.ctx().clone()));
+            }
+            menu::separator(ui);
             if group {
                 return MenuItem::new("Delete selected items").shortcut("Del").show(ui).then_some(Click::DeleteItems);
             }
@@ -657,6 +863,8 @@ pub(crate) fn show(
                 ("Grab (keep connected)", "G", SymbolAction::Grab),
                 ("Disconnect and Move", "M", SymbolAction::DisconnectMove),
                 ("Rotate", "R", SymbolAction::Rotate),
+                ("Mirror Horizontally", "X", SymbolAction::Mirror(pcbcraft_engine::schematic::MirrorAxis::Horizontal)),
+                ("Mirror Vertically", "Y", SymbolAction::Mirror(pcbcraft_engine::schematic::MirrorAxis::Vertical)),
                 ("Edit Fields…", "E", SymbolAction::EditFields),
                 ("Assign Footprint…", "", SymbolAction::AssignFootprint),
                 ("Delete", "Del", SymbolAction::Delete),
@@ -673,6 +881,9 @@ pub(crate) fn show(
             return Some(click);
         }
         if pressed.is_some() && !group {
+            if let Some((_, _, target, true)) = &pin {
+                return Some(Click::SelectItems(Selection::one_no_connect(target.clone())));
+            }
             if let Some(leg) = leg.filter(|_| target.is_none()) {
                 return Some(Click::SelectLeg(leg));
             }
@@ -695,14 +906,40 @@ pub(crate) fn show(
         ));
     }
 
+    if matches!(tool, Some(Tool::NoConnect { .. })) && lost_focus {
+        return Some(Click::CancelNoConnect);
+    }
     if !input_enabled || (response.dragged() && !matches!(tool, Some(Tool::PlaceSymbol { .. }))) {
         return None;
+    }
+
+    if !ui.ctx().egui_wants_keyboard_input()
+        && response.contains_pointer()
+        && tool.is_none()
+        && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Q))
+    {
+        let target =
+            response.hover_pos().and_then(|pointer| crate::no_connect::target_at(project, camera, rect, pointer, selected)).map(|pick| pick.target);
+        return Some(target.map_or(Click::BeginNoConnect, |target| Click::NoConnect(target, true)));
+    }
+    if matches!(tool, Some(Tool::NoConnect { .. })) {
+        if response.secondary_clicked() {
+            return Some(Click::CancelNoConnect);
+        }
+        // Accessible marker labels may own hover without taking canvas editing input.
+        // Keep the tool cursor over those labels while respecting panels on higher layers.
+        let target = ui
+            .input(|input| input.pointer.hover_pos())
+            .filter(|_| ui.rect_contains_pointer(rect))
+            .and_then(|pointer| crate::no_connect::preview(&painter, project, camera, rect, pointer, selected));
+        return response.clicked().then(|| target.map_or(Click::InvalidNoConnect, |target| Click::NoConnect(target, true)));
     }
     if tool.is_none()
         && response.hovered()
         && !ui.ctx().egui_wants_keyboard_input()
         && !ui.input(|input| input.modifiers.shift || input.modifiers.ctrl || input.modifiers.command)
         && let Some(pointer) = response.hover_pos()
+        && !(filters.no_connects && crate::no_connect::marker_at(project, camera, rect, pointer).is_some())
         && (!filters.symbols || fields::at(ui, project, camera, rect, pointer).is_none())
         && let Some(anchor) = wires::node_at(project, camera, rect, pointer, draft, revision)
         && let Some(point) = anchor.position(project)
@@ -719,6 +956,9 @@ pub(crate) fn show(
         && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::G))
         && let Some(pointer) = response.hover_pos()
     {
+        if selected.len() > 1 {
+            return Some(Click::MoveItems { items: selected.clone(), origin: camera.snap(pointer, rect), pickup: true, disconnect: false });
+        }
         if filters.symbols && fields::at(ui, project, camera, rect, pointer).is_some() {
             return None;
         }
@@ -741,7 +981,7 @@ pub(crate) fn show(
             }
         }
         if filters.symbols && fields::at(ui, project, camera, rect, pointer).is_none() {
-            return grab_symbol(project, camera, rect, pointer, true);
+            return grab_symbol(project, camera, rect, pointer, true, selected);
         }
     }
     // Field editing and body properties precede click-to-wire for enabled symbols.
@@ -761,6 +1001,14 @@ pub(crate) fn show(
     }
     if tool.is_none() && response.clicked_by(egui::PointerButton::Primary) {
         let pointer = response.interact_pointer_pos()?;
+        if let Some(target) = filters.no_connects.then(|| crate::no_connect::marker_at(project, camera, rect, pointer)).flatten() {
+            let modifiers = ui.input(|i| i.modifiers);
+            return Some(Click::SelectItems(selected.combine(
+                &Selection::one_no_connect(target),
+                modifiers.shift,
+                modifiers.ctrl || modifiers.command,
+            )));
+        }
         if filters.symbols
             && let Some(field) = fields::at(ui, project, camera, rect, pointer)
         {
@@ -773,6 +1021,9 @@ pub(crate) fn show(
         }
         let hit = selection::at(ui, project, camera, rect, pointer, filters);
         let modifiers = ui.input(|i| i.modifiers);
+        if !hit.no_connects.is_empty() {
+            return Some(Click::SelectItems(selected.combine(&hit, modifiers.shift, modifiers.ctrl || modifiers.command)));
+        }
         if !modifiers.shift
             && !modifiers.ctrl
             && !modifiers.command
@@ -786,6 +1037,7 @@ pub(crate) fn show(
         }
         if !modifiers.shift
             && !modifiers.ctrl
+            && !modifiers.command
             && hit.single_wire().is_some()
             && let Some(leg) = wires::leg_at(project, camera, rect, pointer, revision)
         {
@@ -794,12 +1046,14 @@ pub(crate) fn show(
         return Some(Click::SelectItems(selected.combine(&hit, modifiers.shift, modifiers.ctrl || modifiers.command)));
     }
     match tool? {
-        Tool::PlaceSymbol { definition, value, turns, .. } => {
-            placement_preview(&painter, rect, response, camera, tokens, &definition, &value, turns, project, draft, revision).map(Click::Place)
+        Tool::PlaceSymbol { definition, unit, value, turns, .. } => {
+            placement_preview(ui, rect, response, camera, tokens, &definition, &unit, &value, turns, project, draft, revision, &overlap_index)
+                .map(Click::Place)
         }
         Tool::Wire { start, .. } => wires::pick(&painter, rect, &response, project, camera, start, draft, auto_heal, revision)
             .map(|(anchor, finish)| Click::WirePoint(anchor, finish)),
-        Tool::Field { .. }
+        Tool::NoConnect { .. }
+        | Tool::Field { .. }
         | Tool::NetLabel { .. }
         | Tool::SheetGesture { .. }
         | Tool::Hierarchy { .. }
@@ -841,9 +1095,12 @@ fn wire_menu(ui: &mut Ui, painter: &Painter, rect: Rect, camera: &Camera, leg: w
     picked.map(|action| Click::WireEdit(action, leg))
 }
 
-/// Pick the nearest symbol body under the original press and preserve the grab offset.
-fn grab_symbol(project: &Project, camera: &Camera, rect: Rect, pointer: Pos2, pickup: bool) -> Option<Click> {
-    let (symbol, center) = symbol_at(project, camera, rect, pointer)?;
+/// Preserve the chosen stacked symbol under the press, otherwise pick the nearest body.
+/// The grab offset remains relative to that symbol so selection clarification also works for moves.
+fn grab_symbol(project: &Project, camera: &Camera, rect: Rect, pointer: Pos2, pickup: bool, selected: &Selection) -> Option<Click> {
+    let hits = symbols_at(project, camera, rect, pointer);
+    let (symbol, center) =
+        hits.iter().find(|(symbol, _)| selected.single_symbol() == Some(symbol.id().as_str())).or_else(|| hits.first()).copied()?;
     Some(Click::Grab(symbol.clone(), center - pointer, pickup))
 }
 
@@ -854,16 +1111,34 @@ pub(super) fn symbol_at<'a>(project: &'a Project, camera: &Camera, rect: Rect, p
         .iter()
         .rev()
         .map(|symbol| (symbol, camera.screen(symbol.position, rect)))
-        .filter(|(symbol, center)| {
-            body(&symbol.definition, symbol.turns())
-                .translate(center.to_vec2() / camera.unit_step())
-                .contains((pointer.to_vec2() / camera.unit_step()).to_pos2())
-        })
+        .filter(|(symbol, center)| symbol_contains(symbol, *center, camera.unit_step(), pointer))
         .min_by(|(_, a), (_, b)| a.distance_sq(pointer).total_cmp(&b.distance_sq(pointer)))
 }
 
-/// Turn an offset in grid steps by quarter turns counterclockwise, as the engine turns pins.
-fn turn(x: f32, y: f32, turns: u8) -> (f32, f32) {
+/// Test the same drawn body area for ordinary picking and selection clarification.
+fn symbol_contains(symbol: &SymbolPlacement, center: Pos2, step: f32, pointer: Pos2) -> bool {
+    body(symbol.unit_definition(), symbol.turns(), symbol.is_mirrored())
+        .translate(center.to_vec2() / step)
+        .contains((pointer.to_vec2() / step).to_pos2())
+}
+
+/// Return all bodies under the pointer in nearest-center order, newest first for ties.
+fn symbols_at<'a>(project: &'a Project, camera: &Camera, rect: Rect, pointer: Pos2) -> Vec<(&'a SymbolPlacement, Pos2)> {
+    let mut hits: Vec<_> = project
+        .symbols()
+        .iter()
+        .rev()
+        .map(|symbol| (symbol, camera.screen(symbol.position, rect)))
+        .filter(|(symbol, center)| symbol_contains(symbol, *center, camera.unit_step(), pointer))
+        .collect();
+    hits.sort_by(|(_, a), (_, b)| a.distance_sq(pointer).total_cmp(&b.distance_sq(pointer)));
+    hits
+}
+
+/// Transform an offset in grid steps exactly as the engine does: reflect horizontally first,
+/// then turn counterclockwise.
+fn turn(x: f32, y: f32, turns: u8, mirrored: bool) -> (f32, f32) {
+    let x = if mirrored { -x } else { x };
     match turns % 4 {
         0 => (x, y),
         1 => (y, -x),
@@ -872,10 +1147,11 @@ fn turn(x: f32, y: f32, turns: u8) -> (f32, f32) {
     }
 }
 
-/// A rectangle in grid steps after quarter turns: the turned corners' bounds.
-fn turn_rect(rect: Rect, turns: u8) -> Rect {
-    let (ax, ay) = turn(rect.min.x, rect.min.y, turns);
-    let (bx, by) = turn(rect.max.x, rect.max.y, turns);
+/// A rectangle in grid steps after the same mirror and quarter turns as the drawing.
+fn turn_rect(rect: Rect, turns: u8, mirrored: bool) -> Rect {
+    let rect = if mirrored { Rect::from_min_max(pos2(-rect.max.x, rect.min.y), pos2(-rect.min.x, rect.max.y)) } else { rect };
+    let (ax, ay) = turn(rect.min.x, rect.min.y, turns, false);
+    let (bx, by) = turn(rect.max.x, rect.max.y, turns, false);
     Rect::from_two_pos(pos2(ax, ay), pos2(bx, by))
 }
 
@@ -888,25 +1164,29 @@ fn valid_position(point: Point) -> bool {
 /// Explicit placement owns this press; the following release never places a second symbol.
 #[allow(clippy::too_many_arguments)]
 fn placement_preview(
-    painter: &Painter,
+    ui: &mut Ui,
     rect: Rect,
     response: Response,
     camera: &Camera,
     tokens: Tokens,
     definition: &Arc<SymbolDefinition>,
+    unit: &str,
     value: &str,
     turns: u8,
     project: &Project,
     draft: &Draft,
     revision: u64,
+    overlaps: &overlaps::Index,
 ) -> Option<Point> {
     let screen = |point| camera.screen(point, rect);
     let pointer = response.hover_pos().or_else(|| response.interact_pointer_pos())?;
-    let point = wires::symbol_position(project, definition, turns, camera, rect, pointer, draft, revision);
+    let point = wires::symbol_position(project, definition.unit(unit)?, turns, camera, rect, pointer, draft, revision);
     if !valid_position(point) {
         return None;
     }
-    paint_template(painter, definition, value, screen(point), camera.unit_step(), turns, tokens.accent);
+    let preview = SymbolPlacement::preview_unit(definition.clone(), unit, turns, definition.defaults.clone().unwrap_or_default().field_layout)?;
+    paint_unit_template(&ui.painter_at(rect), &preview, value, screen(point), camera.unit_step(), tokens.accent);
+    overlaps.preview(ui, camera, rect, preview.unit_definition(), turns, false, point);
     let pressed = response.contains_pointer() && response.ctx.input(|input| input.pointer.primary_pressed());
     if pressed && response.ctx.input(|input| input.pointer.primary_down()) {
         response.ctx.data_mut(|data| data.insert_temp(response.id.with("placed_on_press"), true));
@@ -917,11 +1197,24 @@ fn placement_preview(
 
 /// Preview ordinary drawing and instance fields from the same native defaults as placement.
 fn paint_template(painter: &Painter, definition: &Arc<SymbolDefinition>, value: &str, center: Pos2, step: f32, turns: u8, color: egui::Color32) {
-    paint_symbol(painter, definition, center, step, turns, Stroke::new(theme::SCHEMATIC_SYMBOL_STROKE, color));
-    let fallback = pcbcraft_engine::library::Defaults::default();
-    let defaults = definition.defaults.as_ref().unwrap_or(&fallback);
-    let symbol = SymbolPlacement::preview(definition.clone(), turns, defaults.field_layout.clone());
-    fields::paint_labels(painter, &symbol, fields::Content { reference: "", value, metadata: &defaults.metadata }, center, step, color);
+    let defaults = definition.defaults.clone().unwrap_or_default();
+    let symbol = SymbolPlacement::preview(definition.clone(), turns, defaults.field_layout);
+    paint_unit_template(painter, &symbol, value, center, step, color);
+}
+
+/// Preview the selected drawing with the same fields and geometry as its committed placement.
+fn paint_unit_template(painter: &Painter, symbol: &SymbolPlacement, value: &str, center: Pos2, step: f32, color: egui::Color32) {
+    paint_symbol(
+        painter,
+        symbol.unit_definition(),
+        center,
+        step,
+        symbol.turns(),
+        symbol.is_mirrored(),
+        Stroke::new(theme::SCHEMATIC_SYMBOL_STROKE, color),
+    );
+    let defaults = symbol.definition.defaults.clone().unwrap_or_default();
+    fields::paint_labels(painter, symbol, fields::Content { reference: "", value, metadata: &defaults.metadata }, center, step, color);
 }
 
 /// One schematic grid step in nanometers, for converting library drawings to grid steps.
@@ -940,19 +1233,19 @@ fn grid_pos(point: Point) -> Pos2 {
 
 /// The area a symbol's drawing covers around its center, in grid steps, after its turns: its
 /// pins and every stroke. Fit uses it so every part stays in view.
-pub(super) fn grid_bounds(definition: &SymbolDefinition, turns: u8) -> Rect {
-    turn_rect(unturned_bounds(definition), turns)
+pub(super) fn grid_bounds(definition: &pcbcraft_engine::schematic::SymbolUnit, turns: u8, mirrored: bool) -> Rect {
+    turn_rect(unturned_bounds(definition), turns, mirrored)
 }
 
 /// [`grid_bounds`] before rotation.
-fn unturned_bounds(definition: &SymbolDefinition) -> Rect {
+fn unturned_bounds(definition: &pcbcraft_engine::schematic::SymbolUnit) -> Rect {
     let pins = definition.pins().iter().map(|pin| Rect::from_pos(grid_pos(pin.offset)));
     pins.fold(shape_bounds(definition.graphics().iter()), Rect::union)
 }
 
 /// The bounds of a symbol's strokes alone, in grid steps before rotation, or nothing when it
 /// has none.
-fn drawing_bounds(definition: &SymbolDefinition) -> Rect {
+fn drawing_bounds(definition: &pcbcraft_engine::schematic::SymbolUnit) -> Rect {
     shape_bounds(definition.drawing.iter())
 }
 
@@ -972,7 +1265,16 @@ fn shape_bounds<'a>(shapes: impl Iterator<Item = &'a Shape>) -> Rect {
 
 /// Where an upright label sits on its anchor after the symbol turns. Half a turn swaps start
 /// and end so a label inside a body edge stays inside; a quarter turn centers it.
-fn text_anchor(align: TextAlign, turns: u8) -> Align2 {
+fn text_anchor(align: TextAlign, turns: u8, mirrored: bool) -> Align2 {
+    let align = if mirrored {
+        match align {
+            TextAlign::Start => TextAlign::End,
+            TextAlign::End => TextAlign::Start,
+            TextAlign::Middle => TextAlign::Middle,
+        }
+    } else {
+        align
+    };
     match (align, turns % 4) {
         (TextAlign::Middle, _) | (_, 1 | 3) => Align2::CENTER_CENTER,
         (TextAlign::Start, 0) | (TextAlign::End, 2) => Align2::LEFT_CENTER,
@@ -980,24 +1282,38 @@ fn text_anchor(align: TextAlign, turns: u8) -> Align2 {
     }
 }
 
+/// Use the same zoom cutoff and clamped font for native drawing text and its overlap bounds.
+fn drawing_text_font(step: f32) -> Option<FontId> {
+    (step >= theme::SCHEMATIC_MIN_GRID_SPACING)
+        .then(|| FontId::proportional((step * 1.1).clamp(Tokens::get().font_small * 0.8, Tokens::get().font_button)))
+}
+
 /// The grabbable area of a symbol in grid steps around its center, after its turns: a 5 by 4
 /// step box at the center, grown to the drawing's strokes so a large part can be picked by its
 /// body. Pins stay outside it unless a stroke reaches them.
-fn body(definition: &SymbolDefinition, turns: u8) -> Rect {
+fn body(definition: &pcbcraft_engine::schematic::SymbolUnit, turns: u8, mirrored: bool) -> Rect {
     let core = Rect::from_center_size(Pos2::ZERO, vec2(5.0, 4.0));
     let drawing = drawing_bounds(definition);
     let unturned = if drawing.is_positive() { core.union(drawing.shrink2(vec2(1.0, 0.0)).intersect(drawing)) } else { core };
-    turn_rect(unturned, turns)
+    turn_rect(unturned, turns, mirrored)
 }
 
 /// Draw the symbol's library strokes around its center, with one grid step of `step` points,
 /// turned with the symbol.
-/// Component fields are drawn separately so their layout never changes the body or pins.
-fn paint_symbol(painter: &Painter, definition: &SymbolDefinition, center: Pos2, step: f32, turns: u8, stroke: Stroke) {
+/// Part instance fields are drawn separately so their layout never changes the body or pins.
+fn paint_symbol(
+    painter: &Painter,
+    definition: &pcbcraft_engine::schematic::SymbolUnit,
+    center: Pos2,
+    step: f32,
+    turns: u8,
+    mirrored: bool,
+    stroke: Stroke,
+) {
     let color = stroke.color;
     let xy = |point: &Point| {
         let (x, y) = grid(*point);
-        let (x, y) = turn(x, y, turns);
+        let (x, y) = turn(x, y, turns, mirrored);
         pos2(center.x + x * step, center.y + y * step)
     };
     for shape in &definition.graphics() {
@@ -1007,7 +1323,7 @@ fn paint_symbol(painter: &Painter, definition: &SymbolDefinition, center: Pos2, 
                     if step < theme::SCHEMATIC_MIN_GRID_SPACING {
                         continue;
                     }
-                    let text = crate::definition_graphics::symbol_text(graphic, turns);
+                    let text = crate::definition_graphics::symbol_text(graphic, turns, mirrored);
                     crate::definition_graphics::paint(
                         painter,
                         &text,
@@ -1033,9 +1349,8 @@ fn paint_symbol(painter: &Painter, definition: &SymbolDefinition, center: Pos2, 
                 painter.circle_stroke(xy(at), *radius as f32 / GRID * step, stroke);
             }
             Shape::Text(at, text, align) => {
-                if step >= theme::SCHEMATIC_MIN_GRID_SPACING {
-                    let font = FontId::proportional((step * 1.1).clamp(Tokens::get().font_small * 0.8, Tokens::get().font_button));
-                    painter.text(xy(at), text_anchor(*align, turns), text, font, color);
+                if let Some(font) = drawing_text_font(step) {
+                    painter.text(xy(at), text_anchor(*align, turns, mirrored), text, font, color);
                 }
             }
         }

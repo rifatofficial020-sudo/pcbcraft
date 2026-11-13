@@ -4,6 +4,11 @@ PCBCraft offers an in-app Assistant and a live MCP connection on desktop.
 The CLI can also run a separate headless session. Project edits use the
 same engine commands and undo history within each session.
 
+Projects from the previous split layout can be copied into the current format
+with `pcbcraft-cli convert SOURCE DESTINATION` before starting MCP. A `.pc`
+destination creates a ZIP; other destinations create a new working folder. See
+[conversion support and limits](native-project-storage.md#convert-a-previous-split-project).
+
 ## Assistant in the desktop editor
 
 Open **Assistant** from the chat icon next to Preferences or press
@@ -68,7 +73,7 @@ isn't on your PATH, set its command to the full path of the binary in
 `target/debug`. Close the setup dialog before editing. The copied configuration
 grants access to this window until you disable the connection or close the app.
 
-For a quick check, open `crates/app/tests/fixtures/split/two-resistors/project.pc`. Use
+For a quick check, open `crates/app/tests/fixtures/split/two-resistors/project.json`. Use
 `inspect_project` to get R1's symbol ID and the current revision. Call `execute`
 with `schematic.move_symbol` and pass the ID as `symbol`, coordinates as integer
 `x_nm` and `y_nm`, and the inspected revision as `expected_revision`. Move R1 to
@@ -78,6 +83,11 @@ until you save the project. The move command also accepts optional absolute
 `rotation` in degrees (0, 90, 180 or 270), applying movement and orientation in
 one undo step; omitting it preserves the current orientation. `disconnect: true`
 leaves the old wire paths in place while applying the new pose.
+`schematic.mirror_symbol` reflects the addressed symbol about its center across
+the screen's `horizontal` (left-to-right) or `vertical` (top-to-bottom) axis,
+composes with its quarter-turn rotation, keeps attached wires on their terminals,
+and is one undoable revision-checked edit. Applying the same axis twice restores
+the original pose; inspection publishes `mirrored` on each affected symbol.
 
 `schematic.set_symbol_fields` applies reference, value and optional `rotation`,
 `x_nm` and `y_nm` together as one revision-checked undo step, matching the schematic
@@ -111,9 +121,10 @@ command waits while an inline text edit, dialog or file operation is open.
 `inspect_editor` reports `text_editing`, `dialog_open` and `file_operation` so
 clients can identify the state holding command input.
 
-It also lists window commands, marked `"scope": "window"`, which run through the
-same handlers as the editor's own controls and never edit the project, its
-revision or undo history; only `file.save` changes the unsaved state. Call `inspect_editor` for the window,
+It also lists presentation commands, marked `"scope": "window"`, which run through
+the same handlers as the editor's own controls without editing the project, its
+revision or undo history; `file.save` changes the unsaved state. The separate
+`ui.` input commands described below can invoke authored edits. Call `inspect_editor` for the window,
 view and arrangement IDs they take, with each view's workspace, selection, zoom, center and grid:
 
 | Commands | Matching control |
@@ -124,21 +135,42 @@ view and arrangement IDs they take, with each view's workspace, selection, zoom,
 | `app.set_workspace` | Choose Schematic, PCB layout, Symbol Editor or Footprint Editor in an addressed pane, here/beside/in a native window; definition workspaces resume their last document |
 | `view.set_workspace` | Project view placement: schematic or PCB layout, here, beside or in a new window |
 | `app.library_new`, `app.library_fork_selected`, `app.library_edit`, `app.library_focus`, `app.library_view`, `app.library_open`, `app.library_save`, `app.library_close` | Definition creation/forking, revision-checked edits, document focus, per-pane authoring ribbon/panels/navigation and open/save/export/close |
-| `pcb.set_footprint_transform` | Set a footprint center and whole-degree orientation through the same atomic command used by the PCB canvas |
+| `pcb.align_footprints` | Align two or more `footprints` by their physical bounds (`mode` `left`, `right`, `top`, `bottom`, `center_x`, `center_y`) or distribute three or more with equal gaps to nanometer precision (`distribute_x`, `distribute_y`), in one undo step; distribution keeps physical outermost footprints and the span fixed, refusing overlapping selections that cannot retain those anchors. Track ends follow moving pads, as for a transform |
+| `pcb.set_footprint_transform` | Set a footprint center, whole-degree orientation and optional `side` (`front` or `back`) through the same atomic command used by the PCB canvas; inspection reports each footprint's `side`. Track ends follow the pads that move on their layer. Edits that join two nets are refused |
+| `pcb.set_footprint_reference_offset` | Move the reference of a placed footprint. `offset` is a local `{x_nm, y_nm}` displacement from the library default. A zero offset restores that default |
+| `pcb.set_footprint_reference_text` | Set sparse placement-local `appearance` fields for printed text, font, paired size/stroke, local rotation, alignment and visibility, with an optional `offset`. Null appearance resets inheritance. The component's reference and schematic use the separate shared reference edit |
 | `pcb.delete_footprints` | Delete the addressed board placements atomically; retain schematic components and pinned physical assignments for re-placement |
-| `view.set_grid`, `view.select`, `view.select_footprints` | Status-bar grid spacing; click and box selection in a schematic; footprint and Browser selection in a PCB view |
+| `view.set_grid`, `view.select`, `view.select_footprints` | Status-bar grid spacing, remembered separately for schematic and PCB views; click and box selection in a schematic; footprint and Browser selection in a PCB view; optional `element: "reference"` selects one placement's text and Properties |
 | `view.set_selection_filters` | Per-view Selection filters checkboxes, `collapsed` and `open` card state; selection commands refuse disabled object categories |
 | `view.set_panel_position` | `panel`: `layers`, `properties` or `selection_filters`; `position`: `left`, `right` or `floating`, with optional logical `x`/`y` offsets when floating. `inspect_editor` reports each view's `panel_positions`. Properties also supports definition panes. |
 | `arrangement.select`, `arrangement.create`, `arrangement.rename`, `arrangement.delete` | The named arrangement tabs: click, **+** and **Duplicate…**, **Rename…**, **Delete** |
-| `window.set_panel`, `window.set_ribbon_tab`, `window.close` | Browser/Parts/Nets toggles, ribbon tabs (Capture, Analyze, Libraries, Manage and View for schematics; Layout, Libraries and View for PCB), closing a non-last window |
-| `app.set_preferences`, `app.set_home` | **Preferences** (theme, scale, units, grid opacity, PCB grid style, selection following, navigation) and **Home** |
+| `window.set_panel`, `window.set_ribbon_tab`, `window.close` | Browser/Parts/Nets toggles, ribbon tabs (Capture, Sheets, Analyze, Libraries and View for schematics; Layout, Draw, Analyze, Manufacture, Libraries and View for PCB; `manage` remains an alias for `sheets`, and PCB `route` remains an alias for `layout`), closing a non-last window |
+| `app.set_preferences`, `app.set_home` | **Preferences** (theme, scale, units, grid opacity, PCB grid style, selection following, navigation) and **Home**. Explicit grid visibility takes precedence over an accompanying Off style or zero opacity |
 | `file.save` | **File → Save** for a project that already has a location |
 
 Closing the last window and choosing where to save an Untitled project stay in
 the editor, which asks about unsaved changes. Headless sessions refuse window
 commands with a reason.
 
+The native live connection also exposes `ui.handles`, `ui.at` and queued pointer,
+keyboard, text and wheel input through `execute`. See [UI automation](ui-automation.md)
+for named targets, window-local coordinates, completion tickets and cancellation.
+These calls interact with ordinary controls, including dialogs, and may author
+edits or reach file controls. Headless sessions cannot run them.
+
 ## Headless MCP
+
+`nets.promote` and `nets.resolve_ambiguity` use the shared revision-checked
+transactions in headless and live sessions. Both take `expected_revision` and
+an `anchor`, using an existing terminal/label/port endpoint or a complete typed
+anchor from `project.net_registry.nets`. Address `sheet` when multiple sheets
+exist; an optional `board` must match the current owner. Resolution also takes
+the ambiguous source UUID as `net` and assigns it to the selected current
+candidate branch. Promotion of an already persistent network is a no-op.
+Bare pins and unnamed one-pin stubs cannot be promoted. Inspection reports saved
+IDs, anchors, lineage and decisions only when a registry exists, and never
+creates records. See the [storage and command contract](net-registry-storage.md)
+for scope and version details. There are no new editor controls in this slice.
 
 `pcb.add_drawing`, `pcb.set_drawing` and `pcb.delete_drawing` use the same
 transactions as canvas Board Outline editing. Each takes `board` and
@@ -152,23 +184,62 @@ without a manufacturing or clearance claim.
 
 `pcb.add_tracks` and `pcb.delete_tracks` use the same transactions as the PCB
 route tool. Each takes `board` and `expected_revision`. Routing also takes a copper
-`layer` UUID from `project.boards[].layers`, `width_nm` (10,000 to 10,000,000) and
+`layer` UUID from `project.boards[].layers`, optional `width_nm` (10,000 to 10,000,000) and
 2–256 ordered `points`; each neighboring pair becomes one straight segment, all in
 one undo step. Optional `layer_changes`, a list of `{at, layer}` in increasing
 vertex order after the first, places a through via at `points[at]` and continues on
-that copper layer; a change at the last vertex ends the route on a via. Layer changes
-require `via_diameter_nm` and `via_drill_nm`, with the drill smaller than the pad.
-Deleting takes `tracks` and/or `vias`, unique UUIDs from `project.boards[].tracks`
+that copper layer; a change at the last vertex ends the route on a via. Omitted
+width, via diameter and drill use the board routing preferences, including layer
+changes; explicit drills must be smaller than their pads.
+`pcb.check_design` checks the addressed board without editing it; `execute` returns
+`design_check` with the `rules` used, `violations` (each with a `kind`, `message`,
+representative `at` point and `items`), `counts` per kind and the `total`, listing at
+most 1000 findings. Saved board defaults apply unless a request supplies a
+supported hard-limit override; authored minimums can only tighten upward and
+maximums downward. The report includes per-property `sources`. Kinds are `short`,
+`clearance`, `track_width`, `via_diameter`, `via_drill`, `annular_ring`, `unconnected`,
+`no_outline`, `outside_board`, `edge_clearance` and `courtyard_overlap`.
+
+`pcb.export_fabrication` generates the addressed board's fabrication files without
+editing it; `execute` returns `fabrication.files`, each with a `name` and text `contents`:
+Gerber X2 copper per layer, mask and paste top and bottom, top silkscreen and the outline,
+and one Excellon plated drill file. It needs a board setup and a closed Board Outline.
+File names are deterministic and unique after portable-name sanitization,
+including case-insensitive collisions with fixed-purpose output names. One
+`execute` request generates the file contents once; `apply` still validates
+exportability without changing the project or revision.
+
+`pcb.set_copper_locked` requires an explicit `board` UUID, `expected_revision`,
+`locked` boolean and at least one of `tracks`/`vias` (unique UUID arrays). It locks
+or unlocks the whole selection in one undo step, with no geometry or connectivity
+change. `project.boards[].tracks[]` and `.vias[]` always report `locked`, including
+false; the typed board snapshot exposes the same flag. Geometry, size and deletion
+commands refuse the whole edit when they would modify existing locked copper,
+including indirect footprint/segment transforms. No-op operations remain no-ops.
+Copy/paste preserve locks on new identities; Cut of protected copper is refused.
+
+`pcb.add_via` places one standalone through via from `at`, with optional `via_diameter_nm` and
+`via_drill_nm`, in one undo step, refusing a second via at the same position or a pad
+that would join two nets. `pcb.move_tracks` moves `tracks` and/or `vias` by `dx_nm` and
+`dy_nm`, keeping sizes and layers. `pcb.reshape_tracks` sets new `start` and `end` points for each listed `track` at once,
+keeping layers and widths; a collapsed segment is refused. `pcb.set_track_width` gives
+`tracks` one `width_nm`,
+and `pcb.set_via_size` gives `vias` one `via_diameter_nm` and `via_drill_nm`. Each is one
+undo step, checks shorts for the copper it changes, and is not an edit when nothing
+changes. Deleting takes `tracks` and/or `vias`, unique UUIDs from `project.boards[].tracks`
 and `.vias`; at least one item is required, and deleting a via keeps its tracks. A route is refused whole when a point is out of range,
 neighbors repeat, the layer is not copper in the board setup, or its copper would
 join pads on two different nets (the error names both). Only copper the new route
 touches is checked, so a short left by an earlier edit does not block unrelated routes.
 Copper connects where it overlaps on a shared layer, a via joins the copper it overlaps
 on every layer, and the board ratsnest drops airwires between terminals already joined
-by tracks. This is not a clearance or DRC check.
+by tracks. Routing does not check clearance; use `pcb.check_design` for that.
 
 Live `view.set_layer` uses the same Layers handler for `active` and `visible` changes on an addressed view; those
 presentation changes do not alter project revision or undo.
+`view.set_board_flipped` takes `view` and `flipped` and shows that board view from below
+or above through the same handler as **Design → Flip view**, keeping the centered point
+and zoom; `inspect_editor` reports `board.flipped` per view. It changes no project data.
 `view.set_layer_visibility` takes `view` and `mode` (`all` or `active`) through the
 same handler as Show all / Isolate active. Isolation reveals the active layer,
 hides the others and cancels unfinished drawing in that view.
@@ -190,7 +261,7 @@ unavailable copper sides before changing anything.
 To start the MCP server from the repository root, run
 `cargo run --locked -p pcbcraft-cli -- mcp`. To connect an MCP client, point it
 at `pcbcraft-cli mcp`. Pass
-`--project path/to/project.pc` (or a folder or `.pc.zip`) after `mcp` to start with a saved snapshot. The
+`--project path/to/project.json` (or a folder or `.pc`) after `mcp` to start with a saved snapshot. The
 headless session is separate from the app window. Send `inspect: false` with
 `execute` to return just the resulting revision. Use `inspect_project` to read
 the project, or `cross_probe` to look up a linked terminal or pad.
@@ -231,3 +302,64 @@ stay fixed, and the entire group is one undo step. Duplicate/unknown, already
 placed, excluded or pending assignments refuse the whole command. The native
 Update PCB cursor handoff commits through this same command. Inspect and describe
 the command before supplying IDs or coordinates; spacing is not a DRC result.
+
+## Native part definitions and quantities
+
+`library.search` accepts `kind: "part"` or `"category"` alongside symbols and
+footprints. `library.resolve_part` takes an exact `library`, `definition` and
+`definition_revision`, validates category values and every package map, and
+returns native dependency documents. It never fetches or substitutes definitions.
+`library.parse_quantity` takes a declared `quantity` and input `value`; for
+example, resistance `100 mΩ` produces
+`{"type":"quantity","value":"0.1","unit":"Ohm"}`. Both operations are read-only
+and work without an open project. [The native contracts](part-schema.md)
+distinguish part definitions from placed part instances. `schematic.place_part`
+pins the full native dependency set; `part.set_selection` edits package, MPN and
+typed requirements through the same revision-checked command path as the GUI.
+
+`schematic.place_symbol` accepts an optional `unit` for a new part, while
+`schematic.place_unit` adds an unplaced unit to an existing `component-…` part
+using its project-pinned definition. Supply `component`, `unit`, `x_nm`, `y_nm`,
+`expected_revision` and `sheet` when the project contains multiple sheets.
+Schematic inspection reports `available_units` and `display_reference`; the
+base `reference` stays shared by the part. The library authoring transaction
+accepts `select_unit` and `add_unit` actions. See the
+[multi-unit contract](symbol-schema.md#multiple-schematic-units).
+
+## Saved board defaults
+
+`pcb.set_rules` requires an explicit `board`, `expected_revision` and complete
+`rules` values, or `rules: null` to restore built-in defaults. Board inspection
+reports authored records and effective values with stable rule IDs and per-field
+provenance. DRC resolves saved limits; request overrides can tighten authored
+minimums/maximums but cannot weaken them or persist a change. It also reports via
+diameter and drill bounds. Omitted dimensions on track/via creation use the same
+preferred sizes as the GUI. See [board-rules.md](board-rules.md) for the full
+property, precedence, compatibility and undo contract.
+
+## Intentional no-connect targets
+
+`schematic.set_no_connect` uses `target: {"part":"component-N","terminal":"1"}`
+for a logical pin, or `target: {"junction":"junction-N"}` for a physical open
+wire end, plus `marked` and `expected_revision`. Both forms use the same edits
+as Q and the Capture tool. `schematic.check_no_connects` returns a read-only,
+revision-qualified report even with `inspect:false`; its `markers`/`findings`
+arrays describe pins and `wire_markers`/`wire_findings` describe wire ends.
+Totals and truncation cover both. These markers record intent without changing
+the real netlist or physical DRC. See the [contract](no-connect-markers.md).
+
+Schematic selections may include an optional `no_connects` array of the same
+pin/wire target objects. `view.select` exposes marker selection and
+`view.set_selection_filters` accepts `no_connects`. Passing these targets to
+`schematic.delete_items` removes only the selected markers, or combines them
+with ordinary owner deletion in one undoable transaction. Target validation is
+sheet-scoped and revision-checked. Copy/group-move selections must include each selected marker's owner; standalone
+marker geometry is not persisted. A direct wire-end X drag uses the existing
+`schematic.move_junction` command and preserves marker identity.
+
+A placed no-connect mark blocks new wire attachments at that point. Shared
+wire drawing, pin connection and endpoint attachment commands reject the edit
+atomically with “Remove the no-connect marker before connecting a wire.” This
+also covers coordinate and wire/at aliases. Remove the mark through the same
+commands or Delete before connecting; saved conflicts from older projects are
+preserved and remain reportable.

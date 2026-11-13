@@ -43,8 +43,9 @@ pub const WIRE_CURSOR_GAP: f32 = 3.0;
 pub const WIRE_CURSOR_TARGET_RADIUS: f32 = 7.0;
 /// Radius of the dot marking the snapped free point under the wiring crosshair, in logical points.
 pub const WIRE_CURSOR_SNAP_RADIUS: f32 = 2.0;
-/// Radius of the filled dot where three or more wires meet at a free point.
-pub const SCHEMATIC_JUNCTION_RADIUS: f32 = 2.5;
+/// Radius in logical points of a connected branch dot, kept visible at every canvas zoom.
+/// Its eight-point diameter distinguishes a connection from a plain wire crossing.
+pub const SCHEMATIC_JUNCTION_RADIUS: f32 = 4.0;
 /// Half the side of the open square on an unconnected wire end.
 pub const SCHEMATIC_DANGLING_HALF_SIZE: f32 = 2.5;
 /// Radius of the ring marking where Slice will split a wire.
@@ -72,6 +73,8 @@ pub struct Tokens {
     pub canvas_ink: Color32,
     pub canvas_grid: Color32,
     pub schematic_wire: Color32,
+    /// Intentional no-connect geometry is distinct from electrical wire ink.
+    pub schematic_no_connect: Color32,
     /// Counterpart highlight from another editor, distinct from this view's edit selection.
     pub schematic_highlight: Color32,
     /// PCB canvas stays near-black with either chrome theme, following the FigCraft layout.
@@ -83,6 +86,7 @@ pub struct Tokens {
     pub stack_copper_highlight: Color32,
     pub stack_dielectric: Color32,
     pub stack_dielectric_weave: Color32,
+    /// Visible grid marks against the near-black board canvas, shared by dots and lines.
     pub board_grid: Color32,
     pub board_highlight: Color32,
     /// Copper colors for front, back, plated through-hole and internal board lands.
@@ -211,6 +215,7 @@ impl Tokens {
             canvas_ink: Color32::from_rgb(110, 116, 128),
             canvas_grid: Color32::from_rgb(135, 148, 166),
             schematic_wire: Color32::from_rgb(20, 112, 75),
+            schematic_no_connect: Color32::from_rgb(30, 90, 190),
             schematic_highlight: Color32::from_rgb(145, 88, 12),
             board_canvas: Color32::from_rgb(0, 16, 32),
             board_ink: Color32::from_rgb(213, 221, 221),
@@ -219,7 +224,7 @@ impl Tokens {
             stack_copper_highlight: Color32::from_rgb(231, 170, 110),
             stack_dielectric: Color32::from_rgb(177, 202, 192),
             stack_dielectric_weave: Color32::from_rgb(143, 176, 163),
-            board_grid: Color32::from_rgb(29, 39, 43),
+            board_grid: Color32::from_rgb(96, 112, 128),
             board_highlight: Color32::from_rgb(245, 195, 91),
             board_front: Color32::from_rgb(255, 48, 48),
             board_back: Color32::from_rgb(64, 96, 255),
@@ -323,6 +328,7 @@ impl Tokens {
         t.canvas_ink = Color32::from_rgb(148, 155, 168);
         t.canvas_grid = Color32::from_rgb(85, 93, 108);
         t.schematic_wire = Color32::from_rgb(111, 210, 160);
+        t.schematic_no_connect = Color32::from_rgb(110, 175, 255);
         t.schematic_highlight = Color32::from_rgb(240, 192, 106);
         t.catalog_symbol = Color32::from_rgb(143, 176, 205);
         t.stack_dielectric = Color32::from_rgb(57, 90, 80);
@@ -428,6 +434,7 @@ fn visuals(t: Tokens, dark: bool) -> egui::Visuals {
 /// changes, not every frame: it asks for a repaint.
 pub fn apply(ctx: &egui::Context, dark: bool) {
     DARK.set(dark);
+    solidcraft_theme::set_dark(dark);
     let t = Tokens::get();
     ctx.set_theme(if dark { egui::Theme::Dark } else { egui::Theme::Light });
     ctx.set_visuals(visuals(t, dark));
@@ -466,6 +473,7 @@ mod tests {
             assert!(contrast(t.ribbon_tab_text, t.accent_soft) >= 4.5);
             assert!(contrast(t.text_dim, t.panel) >= 4.5);
             assert!(contrast(t.canvas_ink, t.canvas) >= 3.0);
+            assert!(contrast(t.board_grid, t.board_canvas) >= 3.0);
             assert!(contrast(t.schematic_highlight, t.canvas) >= 4.5);
             assert!(contrast(t.error, t.panel) >= 4.5);
         }

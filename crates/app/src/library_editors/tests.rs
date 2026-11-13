@@ -22,6 +22,61 @@ fn library_documents_are_independent_and_revision_checked() {
 
 use egui_kittest::{Harness, kittest::Queryable};
 
+/// Definition panes extend their own canvas palette through the exposed ribbon margins.
+#[test]
+fn definition_ribbon_backdrop_matches_the_document_canvas() {
+    for kind in [Kind::Footprint, Kind::Symbol] {
+        let mut app = PcbApp::default();
+        app.new_library_item(kind);
+        let mut h = Harness::builder().with_size(egui::vec2(1200., 800.)).build_ui_state(|ui, app: &mut PcbApp| app.frame(ui), app);
+        h.run();
+        let pane = h.state().views.hosts[&h.state().views.host].rects[0].1;
+        let t = pcbcraft_chrome::Tokens::get();
+        let fill = if kind == Kind::Footprint { t.board_canvas } else { t.canvas };
+        assert!(
+            h.output().shapes.iter().any(|shape| match &shape.shape {
+                egui::Shape::Vec(shapes) => shapes.iter().any(|shape| matches!(shape, egui::Shape::Rect(rect)
+                if rect.fill == fill && rect.rect.bottom() <= pane.top()
+                    && (rect.rect.left() - pane.left()).abs() < 0.5
+                    && (rect.rect.right() - pane.right()).abs() < 0.5)),
+                _ => false,
+            }),
+            "{kind:?} must carry its canvas palette through the ribbon"
+        );
+    }
+}
+
+/// Definition properties author the default reference, and both editable and exported files
+/// retain it without changing the active project or the library primitives.
+#[test]
+fn footprint_definition_properties_save_a_default_reference_offset() {
+    let mut app = PcbApp::default();
+    app.new_library_item(Kind::Footprint);
+    let mut h = Harness::builder().with_size(egui::vec2(1200.0, 800.0)).build_ui_state(|ui, app: &mut PcbApp| app.frame(ui), app);
+    h.run();
+    let id = h.state().library_editors.active.unwrap();
+    let before = h.state().library_editors.documents[&id].session.snapshot();
+    crate::tests::click(&mut h, "Generate silkscreen reference");
+    let field = "Reference X offset (mm)";
+    h.get_by_label(field).click();
+    h.run();
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.get_by_label(field).type_text("2.5");
+    h.run();
+    crate::tests::click(&mut h, "Apply");
+    let after = h.state().library_editors.documents[&id].session.snapshot();
+    let offset = pcbcraft_engine::schematic::Point { x_nm: 2_500_000, y_nm: 0 };
+    assert_eq!(after.reference_offset, Some(offset));
+    assert_eq!(after.objects, before.objects);
+    assert!(h.state().session.project().is_none());
+    let definition = after.footprint().unwrap();
+    assert_eq!(definition.reference_offset, Some(offset));
+    assert!(!definition.reference_paths("REF", Default::default(), pcbcraft_engine::board::DEFAULT_REFERENCE_OFFSET).is_empty());
+    assert_eq!(Item::decode(&after.encode().unwrap()).unwrap().reference_offset, Some(offset));
+    crate::tests::click(&mut h, "Undo Library Edit");
+    assert_eq!(h.state().library_editors.documents[&id].session.snapshot().reference_offset, None);
+}
+
 /// Project and definition Browsers share row geometry and disclosure controls. Folding a
 /// definition retains its selected primitive and both document histories at normal/compact widths.
 #[test]
@@ -378,7 +433,7 @@ fn library_workspaces_share_the_picker_with_schematic_and_pcb() {
         h.run();
         let before = h.state().session.snapshot().unwrap();
         let revision = h.state().session.revision();
-        for project in ["Schematic", "PCB layout"] {
+        for project in ["Schematic", "PCB Layout"] {
             choose_workspace(&mut h, project);
             assert!(h.state().library_editors.active.is_none());
             crate::tests::click(&mut h, "File");
@@ -877,4 +932,35 @@ fn library_group_selection_and_stale_array_do_not_overwrite_edits() {
     assert_eq!(h.state().library_editors.documents[&id].session.revision(), 1);
     assert_eq!(h.state().library_editors.documents[&id].session.snapshot().objects.len(), 2);
     crate::tests::click(&mut h, "Cancel");
+}
+
+/// Unit selection keeps the inactive drawings, while adding a draft never duplicates electrical pins.
+#[test]
+fn multiunit_symbol_editor_selects_and_adds_units_through_shared_actions() {
+    for width in [1200.0, 420.0] {
+        let definition =
+            pcbcraft_engine::library::parse_symbol(include_str!("../../../../examples/native-parts/symbols/dual-amplifier.json")).unwrap();
+        let mut item = Item::from_symbol(&definition).unwrap();
+        item.license = "MIT OR Apache-2.0".into();
+        let mut app = PcbApp::default();
+        let id = app.library_editors.open(item, false).unwrap();
+        app.run_window_command(&Context::default(), "app.library_focus", &json!({"document":id})).unwrap();
+        let mut h = Harness::builder().with_size(egui::vec2(width, 900.0)).build_ui_state(|ui, app: &mut PcbApp| app.frame(ui), app);
+        h.run();
+        let before = h.state().library_editors.documents[&id].session.snapshot();
+        h.get_by_role_and_label(egui::Role::ComboBox, "Unit").click();
+        h.run();
+        crate::tests::click(&mut h, "b");
+        let selected = h.state().library_editors.documents[&id].session.snapshot();
+        assert_eq!(selected.unit, "b");
+        assert_eq!(selected.other_units["a"], before.objects);
+        assert_eq!(selected.symbol().unwrap().units().len(), 2);
+        crate::tests::click(&mut h, "Add unit");
+        let added = h.state().library_editors.documents[&id].session.snapshot();
+        assert_eq!(added.unit, "unit-1");
+        assert!(added.objects.is_empty());
+        assert_eq!(added.other_units.len(), 2);
+        assert!(added.native().is_err());
+        assert!(h.state().session.project().is_none());
+    }
 }

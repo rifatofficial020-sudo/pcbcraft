@@ -55,12 +55,12 @@ fn change_value(h: &mut Harness<'_, PcbApp>) {
 fn open(h: &mut Harness<'_, PcbApp>) {
     h.remove_cursor();
     h.run();
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Update PCB from schematic").click();
-    h.run();
+    click(h, "Update PCB from schematic");
     assert!(matches!(h.state().dialog, Dialog::BoardUpdate(_)), "dialog {:?}; message {:?}", h.state().dialog, h.state().message);
 }
 
-/// Opening and Close never author data. Explicit board creation is a separate undoable action.
+/// Opening, Enter and dismissal never create a board. Explicit creation uses the primary
+/// action as a separate undoable edit, with title close and Escape discarding the draft.
 #[test]
 fn no_board_review_cancel_and_explicit_creation_have_distinct_history() {
     let mut h = harness();
@@ -69,10 +69,19 @@ fn no_board_review_cancel_and_explicit_creation_have_distinct_history() {
     let before = h.state().session.snapshot().unwrap();
     let revision = h.state().session.revision();
     open(&mut h);
+    h.key_press(Key::Enter);
+    h.run();
+    assert!(matches!(h.state().dialog, Dialog::BoardUpdate(_)));
     assert!(Arc::ptr_eq(&before, &h.state().session.snapshot().unwrap()));
-    click(&mut h, "Close");
+    click(&mut h, "Close Update PCB from Schematic");
     assert_eq!(h.state().session.revision(), revision);
     assert!(h.state().session.project().unwrap().board_target().is_none());
+
+    open(&mut h);
+    h.key_press(Key::Escape);
+    h.run();
+    assert!(matches!(h.state().dialog, Dialog::None));
+    assert!(Arc::ptr_eq(&before, &h.state().session.snapshot().unwrap()));
 
     open(&mut h);
     click(&mut h, "Create board");
@@ -360,6 +369,35 @@ fn legacy_assignment_handoff_preserves_initialization_phase() {
     h.get_by_label("1 footprint ready to place");
 }
 
+/// Initialization has a bounded, scrollable body even when many assignments are missing.
+/// The last action remains reachable while the header and footer stay fixed.
+#[test]
+fn legacy_initialization_scrolls_to_last_missing_assignment() {
+    let mut h = fixture(true);
+    place_first(&mut h, 0, 0);
+    for index in 0..20 {
+        edit(&mut h, pcbcraft_engine::PLACE_RESISTOR, json!({"x_nm":index*10_000_000,"y_nm":10_000_000}));
+    }
+    open(&mut h);
+    h.set_size(egui::vec2(620., 650.));
+    h.run();
+    let header = h.get_by_label("Close Update PCB from Schematic").rect();
+    let footer = h.get_by_label("Use current state").rect();
+    h.get_by_label("Assign footprint to R21").scroll_to_me();
+    h.run();
+    let last = h.get_by_label("Assign footprint to R21").rect();
+    assert!(last.top() > header.bottom() && last.bottom() < footer.top());
+    assert_eq!(
+        h.get_by_label("Use current state").rect(),
+        footer,
+        "before header: {header:?}; after header: {:?}",
+        h.get_by_label("Close Update PCB from Schematic").rect()
+    );
+    h.get_by_label("Assign footprint to R21").click();
+    h.run();
+    h.get_by_label("starter / Resistor 0402 (1005 metric) · r4");
+}
+
 /// Reviewed removal remains visible, but retained excluded package intent is never a placement handoff.
 #[test]
 fn excluded_accepted_unplaced_part_is_reviewed_then_removed_from_handoff() {
@@ -390,42 +428,53 @@ fn add_assigned_resistor(h: &mut Harness<'_, PcbApp>) {
     );
 }
 
-/// Group rotation/placement uses the predicted physical geometry, makes one history edit and
-/// preserves accepted assignments when cancelled before the canvas click.
+/// Group rotation follows the screen in either view, keeps orientation visible and uses the
+/// predicted physical geometry in one history edit. Cancellation preserves accepted assignments.
 #[test]
 fn group_cursor_rotation_commit_undo_and_cancel_share_one_placement_transaction() {
-    let mut h = fixture(true);
-    add_assigned_resistor(&mut h);
-    open(&mut h);
-    click(&mut h, "Update PCB");
-    let accepted = h.state().session.snapshot().unwrap();
-    assert_eq!(h.state().views.active.board.placement.as_ref().unwrap().components.len(), 2);
-    let canvas = h.get_by_label("PCB canvas").rect();
-    let pointer = canvas.center();
-    h.hover_at(pointer);
-    h.run();
-    h.key_press(Key::R);
-    h.run();
-    let group = h.state().views.active.board.placement.as_ref().unwrap();
-    assert_eq!(group.rotation, 90);
-    assert!(Arc::ptr_eq(&accepted, &h.state().session.snapshot().unwrap()));
-    let params = json!({"components":group.components,"x_nm":group.position.x_nm,"y_nm":group.position.y_nm,"rotation":group.rotation,"expected_revision":group.source.revision});
-    let predicted = h.state().session.preview_footprint_placement(&params).unwrap();
-    click_canvas_at(&mut h, pointer);
-    let poses = |project: &pcbcraft_engine::Project| {
-        project.boards().next().unwrap().footprints().map(|f| (f.component, f.position, f.rotation)).collect::<Vec<_>>()
-    };
-    assert_eq!(poses(&predicted), poses(h.state().session.project().unwrap()));
-    assert_eq!(poses(&predicted).len(), 2);
-    edit(&mut h, "edit.undo", json!({}));
-    super::assert_same_content(&accepted, &h.state().session.snapshot().unwrap());
-    open(&mut h);
-    click(&mut h, "Place footprints");
-    let before_cancel = h.state().session.snapshot().unwrap();
-    h.get_by_label("PCB canvas").click_secondary();
-    h.run();
-    assert!(h.state().views.active.board.placement.is_none());
-    assert!(Arc::ptr_eq(&before_cancel, &h.state().session.snapshot().unwrap()));
+    for flipped in [false, true] {
+        let mut h = fixture(true);
+        add_assigned_resistor(&mut h);
+        open(&mut h);
+        click(&mut h, "Update PCB");
+        h.state_mut().views.active.camera.set_mirrored(flipped);
+        h.run();
+        let accepted = h.state().session.snapshot().unwrap();
+        assert_eq!(h.state().views.active.board.placement.as_ref().unwrap().components.len(), 2);
+        let canvas = h.get_by_label("PCB canvas").rect();
+        let pointer = canvas.center();
+        h.hover_at(pointer);
+        h.run();
+        h.key_press(Key::R);
+        h.run();
+        assert_eq!(h.state().views.active.board.placement.as_ref().unwrap().rotation, if flipped { 270 } else { 90 });
+        h.key_press_modifiers(egui::Modifiers::SHIFT, Key::R);
+        h.run();
+        assert_eq!(h.state().views.active.board.placement.as_ref().unwrap().rotation, 0);
+        h.key_press(Key::R);
+        h.run();
+        let group = h.state().views.active.board.placement.as_ref().unwrap();
+        assert_eq!(group.rotation, if flipped { 270 } else { 90 });
+        assert_eq!(h.query_by_label("Bottom view").is_some(), flipped);
+        assert!(Arc::ptr_eq(&accepted, &h.state().session.snapshot().unwrap()));
+        let params = json!({"components":group.components,"x_nm":group.position.x_nm,"y_nm":group.position.y_nm,"rotation":group.rotation,"expected_revision":group.source.revision});
+        let predicted = h.state().session.preview_footprint_placement(&params).unwrap();
+        click_canvas_at(&mut h, pointer);
+        let poses = |project: &pcbcraft_engine::Project| {
+            project.boards().next().unwrap().footprints().map(|f| (f.component, f.position, f.rotation)).collect::<Vec<_>>()
+        };
+        assert_eq!(poses(&predicted), poses(h.state().session.project().unwrap()));
+        assert_eq!(poses(&predicted).len(), 2);
+        edit(&mut h, "edit.undo", json!({}));
+        super::assert_same_content(&accepted, &h.state().session.snapshot().unwrap());
+        open(&mut h);
+        click(&mut h, "Place footprints");
+        let before_cancel = h.state().session.snapshot().unwrap();
+        h.get_by_label("PCB canvas").click_secondary();
+        h.run();
+        assert!(h.state().views.active.board.placement.is_none());
+        assert!(Arc::ptr_eq(&before_cancel, &h.state().session.snapshot().unwrap()));
+    }
 }
 
 /// A long missing-package report at compact widths keeps its reason and primary action inside
@@ -587,4 +636,80 @@ fn placement_option_can_leave_an_updated_report_without_starting_a_cursor_group(
     click(&mut h, "Place footprints");
     assert!(matches!(h.state().dialog, Dialog::None));
     assert!(h.state().views.active.board.placement.is_some());
+}
+
+/// Native package selection keeps its parent review on cancellation and refreshes it after Apply.
+#[test]
+fn native_package_blocker_returns_to_board_update_review() {
+    let mut h = harness();
+    h.set_size(egui::vec2(1400., 900.));
+    h.state_mut().run("project.new", &json!({"create_board":true}));
+    h.run();
+    let documents: pcbcraft_engine::library::sources::Documents = [
+        ("library.json", include_str!("../../../../examples/native-parts/library.json")),
+        ("symbols/resistor.json", include_str!("../../../../examples/native-parts/symbols/resistor.json")),
+        ("footprints/resistor.json", include_str!("../../../../examples/native-parts/footprints/resistor-0603.json")),
+        ("categories/resistor.json", include_str!("../../../../examples/native-parts/categories/resistor.json")),
+        ("parts/resistor.json", include_str!("../../../../examples/native-parts/parts/resistor.json")),
+    ]
+    .into_iter()
+    .map(|(path, text)| (path.into(), text.into()))
+    .collect();
+    h.state_mut().session.execute("library.load_source", &json!({"source":"native","documents":documents})).unwrap();
+    let reference = pcbcraft_engine::library::parts::Reference { library: "parts-demo".into(), id: "resistor".into(), revision: 1 };
+    let resolved = h.state().session.libraries().resolve_part(&reference).unwrap();
+    let digest = pcbcraft_engine::library::sources::part_digest(resolved);
+    edit(
+        &mut h,
+        pcbcraft_engine::part_instances::PLACE_PART,
+        json!({"library":"parts-demo","definition":"resistor","definition_revision":1,
+        "definition_digest":digest,"package":null,"x_nm":0,"y_nm":0}),
+    );
+    let before = encode_documents(h.state().session.snapshot().unwrap()).unwrap();
+    open(&mut h);
+    click(&mut h, "Assign footprint to R1");
+    assert!(matches!(h.state().dialog, Dialog::NativePart(_)));
+    click(&mut h, "Cancel");
+    assert!(matches!(h.state().dialog, Dialog::BoardUpdate(_)));
+    assert_eq!(encode_documents(h.state().session.snapshot().unwrap()).unwrap(), before);
+    click(&mut h, "Assign footprint to R1");
+    h.get_by_role_and_label(egui::Role::ComboBox, "Package").click();
+    h.run();
+    click(&mut h, "0603");
+    click(&mut h, "Apply");
+    assert!(matches!(h.state().dialog, Dialog::BoardUpdate(_)));
+    assert!(!h.get_by_label("Update PCB").accesskit_node().is_disabled());
+    click(&mut h, "Update PCB");
+    click(&mut h, "PCB canvas");
+    assert_eq!(h.state().session.project().unwrap().boards().next().unwrap().footprints().count(), 1);
+}
+
+/// A mapping review identifies pads moved to or from NC in both old and proposed summaries.
+#[test]
+fn mapping_review_shows_current_and_previous_unconnected_pads() {
+    let mut h = fixture(false);
+    h.state_mut()
+        .session
+        .execute("library.load_source", &json!({"source":"multipad","documents":super::footprint_assignment::four_pad_source()}))
+        .unwrap();
+    let component = h.state().session.project().unwrap().components().next().unwrap().id();
+    for (mapped, unconnected) in [("3", "4"), ("4", "3")] {
+        edit(
+            &mut h,
+            ASSIGN_FOOTPRINT,
+            json!({"component":component,"library":"parts-demo","definition":"resistor-0603","definition_revision":1,
+            "mapping":{"1":["1",mapped],"2":"2"},"unconnected_pads":[unconnected]}),
+        );
+        if unconnected == "4" {
+            place_first(&mut h, 0, 0);
+            edit(&mut h, pcbcraft_engine::board::update::INITIALIZE_BASELINE, json!({}));
+        }
+    }
+    let before = encode_documents(h.state().session.snapshot().unwrap()).unwrap();
+    open(&mut h);
+    h.get_by_label("R1 pin mapping: Pin 1 → pad 1, 4, Pin 2 → pad 2, unconnected pads 3.");
+    h.get_by_label(
+        "Previous footprint for R1: parts-demo / resistor-0603 · r1. Previous mapping: Pin 1 → pad 1, 3, Pin 2 → pad 2, unconnected pads 4.",
+    );
+    assert_eq!(encode_documents(h.state().session.snapshot().unwrap()).unwrap(), before);
 }

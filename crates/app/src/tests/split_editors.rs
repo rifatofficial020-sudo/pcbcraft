@@ -1,4 +1,4 @@
-use pcbcraft_engine::{persistence::encode, schematic::Point};
+use pcbcraft_engine::{persistence::encode_documents, schematic::Point};
 
 use super::*;
 
@@ -60,7 +60,7 @@ fn linked_highlights_are_visible_without_becoming_edit_selections() {
         let mut h = split_harness();
         let target = 1 - source;
         let snapshot = h.state().session.snapshot().unwrap();
-        let bytes = encode(snapshot.clone()).unwrap();
+        let bytes = encode_documents(snapshot.clone()).unwrap();
         let revision = h.state().session.revision();
         let origin = Point { x_nm: 0, y_nm: 0 };
         let centers = [view(&h, 0).camera.screen(origin, canvas(&h, 0)), view(&h, 1).camera.screen(origin, canvas(&h, 1))];
@@ -79,7 +79,7 @@ fn linked_highlights_are_visible_without_becoming_edit_selections() {
         h.run();
         assert_eq!(h.state().session.revision(), revision);
         assert!(Arc::ptr_eq(&snapshot, &h.state().session.snapshot().unwrap()));
-        assert_eq!(encode(h.state().session.snapshot().unwrap()).unwrap(), bytes);
+        assert_eq!(encode_documents(h.state().session.snapshot().unwrap()).unwrap(), bytes);
         // Selecting the counterpart deliberately becomes the new source, with no feedback loop.
         click_point(&mut h, target, origin);
         assert!(h.state().views.highlight_for(ViewId(target), &h.state().session).is_empty());
@@ -141,7 +141,7 @@ fn browser_highlights_prune_deleted_targets_and_reset_on_reopen() {
 fn split_views_keep_navigation_and_selection_but_share_undo() {
     let mut h = split_harness();
     let snapshot = h.state().session.snapshot().unwrap();
-    let bytes = encode(snapshot.clone()).unwrap();
+    let bytes = encode_documents(snapshot.clone()).unwrap();
     let before = h.state().session.inspect();
     let dirty = h.state().files.dirty(&h.state().session);
     assert!(canvas(&h, 0).right() < canvas(&h, 1).left());
@@ -152,6 +152,7 @@ fn split_views_keep_navigation_and_selection_but_share_undo() {
     h.hover_at(canvas(&h, 1).center());
     h.run();
     h.event(egui::Event::MouseWheel {
+        source: egui::MouseWheelSource::Unknown,
         unit: egui::MouseWheelUnit::Line,
         delta: egui::vec2(0.0, 2.0),
         phase: egui::TouchPhase::Move,
@@ -166,7 +167,7 @@ fn split_views_keep_navigation_and_selection_but_share_undo() {
     h.run();
     assert_eq!(h.state().session.inspect(), before);
     assert!(Arc::ptr_eq(&snapshot, &h.state().session.snapshot().unwrap()));
-    assert_eq!(encode(h.state().session.snapshot().unwrap()).unwrap(), bytes);
+    assert_eq!(encode_documents(h.state().session.snapshot().unwrap()).unwrap(), bytes);
     assert_eq!(h.state().files.dirty(&h.state().session), dirty);
     focus_tab(&mut h, 1);
     h.key_press(Key::Delete);
@@ -775,21 +776,77 @@ fn context_menu_modal_blocks_same_frame_follow() {
 /// Read the actual painted grid dots in one pane, including their colour, so passing the
 /// preference only to the focused canvas cannot satisfy the split-view regression.
 fn grid_dots(h: &Harness<'_, PcbApp>, id: u64) -> Vec<(egui::Pos2, egui::Color32)> {
-    let rect = canvas(h, id);
-    h.output()
-        .shapes
-        .iter()
-        .filter_map(|shape| match &shape.shape {
+    painted_grid_dots(h, canvas(h, id))
+}
+
+/// Inspect canvas and deferred ribbon grid shapes through their shared dot geometry.
+pub(super) fn painted_grid_dots(h: &Harness<'_, PcbApp>, rect: egui::Rect) -> Vec<(egui::Pos2, egui::Color32)> {
+    let mut pending: Vec<_> = h.output().shapes.iter().map(|shape| &shape.shape).collect();
+    let mut dots = Vec::new();
+    while let Some(shape) = pending.pop() {
+        match shape {
+            egui::Shape::Vec(shapes) => pending.extend(shapes),
             egui::Shape::Circle(circle)
                 if circle.radius == pcbcraft_chrome::theme::SCHEMATIC_GRID_DOT_RADIUS
                     && circle.stroke == egui::Stroke::NONE
                     && rect.contains(circle.center) =>
             {
-                Some((circle.center, circle.fill))
+                dots.push((circle.center, circle.fill));
             }
-            _ => None,
-        })
-        .collect()
+            _ => {}
+        }
+    }
+    dots
+}
+
+/// Ribbon margins use the top panes' own current grid origins, including after panning and
+/// zooming. Side-by-side and stacked layouts respect opacity without authoring project changes.
+#[test]
+fn ribbon_grids_follow_top_panes_and_grid_visibility() {
+    for size in [egui::vec2(1400.0, 900.0), egui::vec2(700.0, 850.0)] {
+        let mut h = split_harness();
+        h.set_size(size);
+        h.run();
+        let snapshot = h.state().session.snapshot().unwrap();
+        focus_tab(&mut h, 0);
+        let at = canvas(&h, 0).center();
+        h.hover_at(at);
+        h.run();
+        let origin = Point { x_nm: 0, y_nm: 0 };
+        let before = view(&h, 0).camera.screen(origin, canvas(&h, 0));
+        h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Middle, pressed: true, modifiers: Modifiers::NONE });
+        h.run();
+        let to = at + egui::vec2(23.0, 17.0);
+        h.event(egui::Event::PointerMoved(to));
+        h.run();
+        h.event(egui::Event::PointerButton { pos: to, button: egui::PointerButton::Middle, pressed: false, modifiers: Modifiers::NONE });
+        h.run();
+        assert_ne!(view(&h, 0).camera.screen(origin, canvas(&h, 0)), before);
+        h.event(egui::Event::Zoom(1.3));
+        h.run();
+        let top = canvas(&h, 0).top().min(canvas(&h, 1).top());
+        for id in [0, 1] {
+            let rect = canvas(&h, id);
+            if (rect.top() - top).abs() > 0.5 {
+                continue;
+            }
+            let band = egui::Rect::from_min_max(egui::pos2(rect.left(), 0.0), egui::pos2(rect.right(), top));
+            let dots = painted_grid_dots(&h, band);
+            assert!(!dots.is_empty());
+            let camera = &view(&h, id).camera;
+            let origin = camera.screen(origin, rect);
+            let step = camera.snap_step() * pcbcraft_chrome::grid::shown_every(camera.snap_step()).unwrap() as f32;
+            for (point, _) in dots {
+                let grid = (point - origin) / step;
+                assert!((grid.x - grid.x.round()).abs() < 0.001 && (grid.y - grid.y.round()).abs() < 0.001);
+            }
+        }
+        h.state_mut().preferences.grid_opacity_percent = 0;
+        h.run();
+        let band = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(size.x, top));
+        assert!(painted_grid_dots(&h, band).is_empty());
+        assert!(Arc::ptr_eq(&snapshot, &h.state().session.snapshot().unwrap()));
+    }
 }
 
 /// Opacity reaches both rendering paths at independent zooms, across focus changes, themes and
@@ -814,7 +871,7 @@ fn grid_opacity_reaches_both_views_without_changing_editor_state() {
             let cameras = [0, 1].map(|id| (view(&h, id).camera.zoom(), view(&h, id).camera.screen(origin, canvas(&h, id))));
             assert_ne!(cameras[0].0, cameras[1].0);
             let snapshot = h.state().session.snapshot().unwrap();
-            let bytes = encode(snapshot.clone()).unwrap();
+            let bytes = encode_documents(snapshot.clone()).unwrap();
             let revision = h.state().session.revision();
             let dirty = h.state().files.dirty(&h.state().session);
             for opacity in [100, 35, 0, 100] {
@@ -840,7 +897,7 @@ fn grid_opacity_reaches_both_views_without_changing_editor_state() {
                 assert_eq!(h.state().session.revision(), revision);
                 assert_eq!(h.state().files.dirty(&h.state().session), dirty);
                 assert!(Arc::ptr_eq(&snapshot, &h.state().session.snapshot().unwrap()));
-                assert_eq!(encode(h.state().session.snapshot().unwrap()).unwrap(), bytes);
+                assert_eq!(encode_documents(h.state().session.snapshot().unwrap()).unwrap(), bytes);
             }
         }
     }

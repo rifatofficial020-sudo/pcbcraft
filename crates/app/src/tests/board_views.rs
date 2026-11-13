@@ -5,7 +5,7 @@ use pcbcraft_engine::{persistence::encode_documents, schematic::Point};
 
 /// Create a resolved starter placement through the same engine commands as MCP. Panels are
 /// closed so point clicks exercise the canvas instead of an overlaid card.
-fn board_harness<'a>() -> Harness<'a, PcbApp> {
+pub(super) fn board_harness<'a>() -> Harness<'a, PcbApp> {
     let mut h = harness();
     h.set_size(egui::vec2(1400.0, 900.0));
     resistor_with_board_at_origin(&mut h);
@@ -32,7 +32,7 @@ fn switching_workspaces_restores_navigation_and_rejects_stale_schematic_input() 
     let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400., 400.));
     let initial = h.state().views.active.camera.screen(origin, rect);
     click(&mut h, "Choose workspace");
-    click(&mut h, "PCB layout");
+    click(&mut h, "PCB Layout");
     assert_eq!(h.state().views.active.workspace, Workspace::Board);
     assert_eq!(
         h.state().views.board_highlight_for(h.state().views.active.id(), &h.state().session),
@@ -52,10 +52,161 @@ fn switching_workspaces_restores_navigation_and_rejects_stale_schematic_input() 
     assert!(!h.state().views.active.accepts(old, &h.state().session));
     h.state_mut().view_click(old, Click::Edit(SymbolAction::Delete, "symbol-2".into()));
     click(&mut h, "Choose workspace");
-    click(&mut h, "PCB layout");
+    click(&mut h, "PCB Layout");
     assert_eq!(h.state().views.active.camera.screen(origin, rect), board_camera);
     assert_eq!(encode_documents(h.state().session.snapshot().unwrap()).unwrap(), bytes);
     assert_eq!(h.state().session.inspect(), before);
+}
+
+/// Close PCB zoom holds the point under the mouse, survives arrangement restoration in either
+/// workspace, and works through the addressed window command. Fit returns to a board overview.
+#[test]
+fn pcb_zoom_reaches_copper_detail_and_round_trips_in_arrangements() {
+    let mut h = board_harness();
+    let before = h.state().session.snapshot().unwrap();
+    click(&mut h, "Choose workspace");
+    click(&mut h, "PCB Layout");
+    let rect = h.get_by_label("PCB canvas").rect();
+    let pointer = rect.center() + egui::vec2(31.0, -27.0);
+    let anchor = h.state().views.active.camera.unsnapped(pointer, rect);
+    h.hover_at(pointer);
+    h.run();
+    for _ in 0..8 {
+        h.event(egui::Event::MouseWheel {
+            source: egui::MouseWheelSource::Unknown,
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, 8.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: Modifiers::NONE,
+        });
+        h.run();
+    }
+    assert_eq!(h.state().views.active.camera.zoom(), 64.0);
+    assert!(h.state().views.active.camera.screen(anchor, rect).distance(pointer) < 0.01);
+
+    let restore = |view: &crate::editor_view::EditorView, session: &pcbcraft_engine::Session| {
+        let saved = view.saved_state(session).unwrap();
+        let decoded: crate::editor_view::ViewState = serde_json::from_value(serde_json::to_value(&saved).unwrap()).unwrap();
+        assert!(decoded.valid());
+        crate::editor_view::EditorView::from_state(ViewId(900), &decoded, session)
+    };
+    let restored = restore(&h.state().views.active, &h.state().session);
+    assert_eq!(restored.camera.zoom(), 64.0);
+    assert!(restored.camera.screen(anchor, rect).distance(pointer) < 0.01);
+
+    let ctx = h.ctx.clone();
+    let view = h.state().views.active.id().0;
+    let zoom = json!({"view":view,"zoom_percent":3200});
+    h.state_mut().run_window_command(&ctx, "view.zoom", &zoom).unwrap();
+    assert_eq!(h.state().views.active.camera.zoom(), 32.0);
+    let mut parked = restore(&h.state().views.active, &h.state().session);
+    parked.switch(Workspace::Schematic, &h.state().session);
+    let mut restored = restore(&parked, &h.state().session);
+    restored.switch(Workspace::Board, &h.state().session);
+    assert_eq!(restored.camera.zoom(), 32.0);
+
+    click(&mut h, "Choose workspace");
+    click(&mut h, "Schematic");
+    let view = h.state().views.active.id().0;
+    assert!(h.state_mut().run_window_command(&ctx, "view.zoom", &json!({"view":view,"zoom_percent":3200})).is_err());
+
+    click(&mut h, "Choose workspace");
+    click(&mut h, "PCB Layout");
+    h.query_all_by_label("Fit board").next().unwrap().click();
+    h.run();
+    assert!(h.state().views.active.camera.zoom() <= 8.0);
+    assert!(Arc::ptr_eq(&before, &h.state().session.snapshot().unwrap()));
+}
+
+/// Canvas grabs move only the rendered reference and commit once, with cancellation and undo.
+#[test]
+fn pcb_reference_can_move_with_m_or_primary_drag() {
+    for rotation in [0, 180] {
+        fn read<'a>(h: &'a Harness<'_, PcbApp>) -> pcbcraft_engine::board::view::FootprintView<'a> {
+            h.state().session.project().unwrap().boards().next().unwrap().footprints().next().unwrap()
+        }
+        let mut h = harness();
+        h.set_size(egui::vec2(1400.0, 900.0));
+        resistor_with_board_at_origin(&mut h);
+        h.state_mut().browser.open = false;
+        let revision = h.state().session.revision();
+        h.state_mut().run(
+            pcbcraft_engine::PLACE_FOOTPRINT,
+            &json!({"symbol":"symbol-2","definition":"resistor-0402","pin_1_pad":2,"x_nm":0,"y_nm":0,"expected_revision":revision}),
+        );
+        h.run();
+        click(&mut h, "Choose workspace");
+        click(&mut h, "PCB Layout");
+        let revision = h.state().session.revision();
+        let id = read(&h).id.clone();
+        h.state_mut().run(
+            pcbcraft_engine::SET_FOOTPRINT_TRANSFORM,
+            &json!({"footprint":id,"x_nm":0,"y_nm":0,"rotation":rotation,"expected_revision":revision}),
+        );
+        h.run();
+        let snapshot = h.state().session.snapshot().unwrap();
+        let footprint = read(&h);
+        let origin = footprint.position;
+        let pads = footprint.pads.clone();
+        let point = footprint.graphics.iter().find(|g| g.reference).unwrap().points[0];
+        let from = board_point(&h, point);
+        let to = from + egui::vec2(70.0, -55.0);
+        h.hover_at(from);
+        h.run();
+        h.key_press(Key::M);
+        h.run();
+        assert!(h.state().views.active.board.reference_drag.is_some());
+        h.hover_at(to);
+        h.run();
+        assert!(Arc::ptr_eq(&snapshot, &h.state().session.snapshot().unwrap()));
+        h.key_press(Key::Escape);
+        h.run();
+        assert!(h.state().views.active.board.reference_drag.is_none());
+        assert!(Arc::ptr_eq(&snapshot, &h.state().session.snapshot().unwrap()));
+
+        h.hover_at(from);
+        h.run();
+        h.event(egui::Event::PointerButton { pos: from, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
+        h.step();
+        assert!(h.state().views.active.board.reference_drag.is_some(), "mouse-down must capture the reference before the drag threshold");
+        h.event(egui::Event::PointerButton { pos: from, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
+        h.run();
+        assert!(h.state().views.active.board.reference_drag.is_none());
+        assert!(Arc::ptr_eq(&snapshot, &h.state().session.snapshot().unwrap()), "a plain click makes no edit");
+
+        for (dragging, quick) in [(false, false), (true, false), (true, true)] {
+            let revision = h.state().session.revision();
+            h.hover_at(from);
+            h.run();
+            if dragging {
+                h.event(egui::Event::PointerButton { pos: from, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
+                h.step();
+                assert!(h.state().views.active.board.reference_drag.is_some());
+                if !quick {
+                    h.event(egui::Event::PointerMoved(from + egui::vec2(1.0, 0.0)));
+                    h.run();
+                    h.event(egui::Event::PointerMoved(from + egui::vec2(10.0, 0.0)));
+                    h.run();
+                }
+                h.event(egui::Event::PointerMoved(to));
+                h.event(egui::Event::PointerButton { pos: to, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
+                h.run();
+            } else {
+                h.key_press(Key::M);
+                h.run();
+                click_canvas_at(&mut h, to);
+            }
+            let moved = read(&h);
+            assert_eq!(h.state().session.revision(), revision + 1);
+            assert_eq!(moved.position, origin);
+            assert_eq!(moved.pads, pads);
+            let moved_point = moved.graphics.iter().find(|g| g.reference).unwrap().points[0];
+            assert!(board_point(&h, moved_point).distance(to) < 0.01);
+            h.key_press_modifiers(Modifiers::COMMAND, Key::Z);
+            h.run();
+            assert_eq!(read(&h).reference_offset, pcbcraft_engine::board::DEFAULT_REFERENCE_OFFSET);
+        }
+    }
 }
 
 /// Opening the board beside a schematic retains both targets. Selection paints actual counterpart
@@ -64,7 +215,7 @@ fn switching_workspaces_restores_navigation_and_rejects_stale_schematic_input() 
 fn mixed_panes_highlight_both_ways_without_granting_schematic_edit_authority() {
     let mut h = board_harness();
     click(&mut h, "Choose workspace");
-    click(&mut h, "Open PCB layout beside current view");
+    click(&mut h, "Open PCB Layout beside current view");
     h.get_by_label("Schematic canvas 1");
     h.get_by_label("PCB canvas 3");
     assert_eq!(h.state().views.view(ViewId(0)).unwrap().workspace, Workspace::Schematic);
@@ -73,7 +224,7 @@ fn mixed_panes_highlight_both_ways_without_granting_schematic_edit_authority() {
     click_canvas_at(&mut h, at);
     assert!(h.state().views.board_highlight_for(ViewId(2), &h.state().session).contains("footprint-3"));
     let board_rect = h.get_by_label("PCB canvas 3").rect();
-    assert!(h.output().shapes.iter().any(|shape| matches!(&shape.shape,egui::Shape::Text(text) if text.galley.job.text=="R1" && board_rect.contains(text.pos) && text.fallback_color==Tokens::get().board_highlight)));
+    assert!(h.output().shapes.iter().any(|shape| matches!(&shape.shape,egui::Shape::Text(text) if text.galley.job.text=="R1" && board_rect.contains(text.pos) && text.fallback_color==pcbcraft_chrome::board::copper_emphasis(Tokens::get().board_ink, Some(true)))));
     h.key_press(Key::Escape);
     h.run();
     click_canvas_at(&mut h, board_rect.center());
@@ -105,7 +256,7 @@ fn mixed_follow_uses_destination_geometry_and_keeps_zoom() {
     for policy in [SelectionFollow::Off, SelectionFollow::Both, SelectionFollow::SecondaryFollowsPrimary, SelectionFollow::PrimaryFollowsSecondary] {
         let mut h = board_harness();
         click(&mut h, "Choose workspace");
-        click(&mut h, "Open PCB layout beside current view");
+        click(&mut h, "Open PCB Layout beside current view");
         h.state_mut().preferences.selection_follow = policy;
         h.state_mut().views.view_mut(ViewId(2)).unwrap().camera.center_on(Point { x_nm: 1_000_000_000, y_nm: 0 });
         h.run();
@@ -143,7 +294,7 @@ fn board_browser_properties_and_layers_share_stable_addresses() {
     );
     h.run();
     click(&mut h, "Choose workspace");
-    click(&mut h, "PCB layout");
+    click(&mut h, "PCB Layout");
     let before = h.state().session.inspect();
     h.state_mut().browser.open = true;
     h.run();
@@ -181,7 +332,7 @@ fn board_browser_properties_and_layers_share_stable_addresses() {
     assert_eq!(h.get_by_label("Show layer Signal top").accesskit_node().toggled(), Some(egui::accesskit::Toggled::False));
     let original_id = h.state().views.active.id();
     click(&mut h, "Choose workspace");
-    click(&mut h, "Open PCB layout beside current view");
+    click(&mut h, "Open PCB Layout beside current view");
     let duplicate_id = h.state().views.hosts[&h.state().views.main].layout.visible_views()[1];
     let original = h.state().views.view(original_id).unwrap();
     let duplicate = h.state().views.view(duplicate_id).unwrap();
@@ -209,7 +360,7 @@ fn board_canvas_and_ribbon_remain_distinct_from_schematic() {
         h.run();
         let before = h.state().session.inspect();
         click(&mut h, "Choose workspace");
-        click(&mut h, "PCB layout");
+        click(&mut h, "PCB Layout");
         h.get_by_label("Layout");
         assert!(h.query_by_label("Capture").is_none());
         let rect = h.get_by_label("PCB canvas").rect();
@@ -247,6 +398,12 @@ fn workspace_keyboard_navigation_reaches_board_and_placement_actions() {
     h.run();
     h.key_press(Key::Space);
     h.run();
+    assert_eq!(h.state().workspace_key(), "library");
+    click(&mut h, "Choose workspace");
+    h.key_press(Key::ArrowDown);
+    h.run();
+    h.key_press(Key::Enter);
+    h.run();
     assert_eq!(h.state().library_editors.active_kind(), Some(pcbcraft_engine::authoring::Kind::Symbol));
     click(&mut h, "Choose workspace");
     h.key_press(Key::ArrowDown);
@@ -262,15 +419,15 @@ fn workspace_keyboard_navigation_reaches_board_and_placement_actions() {
     assert!(h.state().library_editors.active.is_none());
     assert_eq!(h.state().views.active.workspace, Workspace::Schematic);
     click(&mut h, "Choose workspace");
-    let card = h.get_by_label("PCB layout").rect();
-    for label in ["Open PCB layout beside current view", "Open PCB layout in new window"] {
+    let card = h.get_by_label("PCB Layout").rect();
+    for label in ["Open PCB Layout beside current view", "Open PCB Layout in new window"] {
         let icon = h.get_by_label(label).rect();
         assert!(icon.top() >= card.top() && icon.bottom() <= card.bottom());
         assert!(icon.left() >= card.right());
     }
     assert!(h.query_by_label("Open beside").is_none());
     assert!(h.query_by_label("New window").is_none());
-    h.get_by_label("Open PCB layout beside current view").focus();
+    h.get_by_label("Open PCB Layout beside current view").focus();
     h.run();
     h.key_press(Key::Enter);
     h.run();
@@ -292,7 +449,7 @@ fn mixed_pane_close_buttons_preserve_the_surviving_view() {
                 h.state_mut().browser.open = true;
                 h.set_size(size);
                 click(&mut h, "Choose workspace");
-                click(&mut h, "Open PCB layout beside current view");
+                click(&mut h, "Open PCB Layout beside current view");
                 let path = h.state().views.view(focused).unwrap().sheet_path(&h.state().session).unwrap();
                 click(&mut h, &path);
                 assert_eq!(h.state().views.active.id(), focused);
@@ -317,13 +474,14 @@ fn mixed_pane_close_buttons_preserve_the_surviving_view() {
 }
 
 /// PCB grid preferences change only board drawing, survive serialization, and preserve snapping
-/// and project state. Cancel restores the previous style and page defaults restore Off.
+/// and project state. Off retains the previous style, Cancel restores visibility as well,
+/// and page defaults restore the legacy Off style.
 #[test]
 fn pcb_grid_preferences_are_shared_display_settings() {
     use pcbcraft_chrome::grid::Style;
     let mut h = board_harness();
     click(&mut h, "Choose workspace");
-    click(&mut h, "Open PCB layout beside current view");
+    click(&mut h, "Open PCB Layout beside current view");
     let board_rect = h.get_by_label("PCB canvas 3").rect();
     click_canvas_at(&mut h, board_rect.center());
     let id = h.state().views.active.id();
@@ -349,8 +507,10 @@ fn pcb_grid_preferences_are_shared_display_settings() {
         h.get_by_label("PCB grid");
         click(&mut h, label);
         click(&mut h, "OK");
-        assert_eq!(h.state().preferences.board_grid_style, style);
-        assert_eq!(crate::preferences::Preferences::parse(&h.state().preferences.to_text()).board_grid_style, style);
+        let remembered = if style == Style::Off { Style::Lines } else { style };
+        assert_eq!(h.state().preferences.board_grid_style, remembered);
+        assert_eq!(h.state().preferences.grid_visible(true), style != Style::Off);
+        assert_eq!(crate::preferences::Preferences::parse(&h.state().preferences.to_text()), h.state().preferences);
         let (dots, lines) = marks(&h, Tokens::get().board_grid);
         match style {
             Style::Dots => {
@@ -377,7 +537,8 @@ fn pcb_grid_preferences_are_shared_display_settings() {
     click(&mut h, "Preferences");
     click(&mut h, "Dots");
     click(&mut h, "Cancel");
-    assert_eq!(h.state().preferences.board_grid_style, Style::Off);
+    assert_eq!(h.state().preferences.board_grid_style, Style::Lines);
+    assert!(!h.state().preferences.grid_visible(true));
     click(&mut h, "Preferences");
     click(&mut h, "Lines");
     click(&mut h, "Restore page defaults");
@@ -385,11 +546,48 @@ fn pcb_grid_preferences_are_shared_display_settings() {
     click(&mut h, "OK");
 }
 
+/// Choosing a visible PCB style in Preferences restores a ribbon-hidden grid, including
+/// legacy zero opacity. Cancel restores the hidden state and OK preserves the chosen style.
+#[test]
+fn pcb_grid_preferences_restore_hidden_grid() {
+    use pcbcraft_chrome::grid::Style;
+    for opacity in [0, 100] {
+        let mut h = board_harness();
+        choose(&mut h, "Choose workspace", "PCB Layout");
+        h.state_mut().preferences.board_grid_style = Style::Dots;
+        h.state_mut().preferences.board_grid_visible = false;
+        h.state_mut().preferences.grid_opacity_percent = opacity;
+        h.run();
+        let hidden = h.state().preferences;
+        let before = h.state().session.snapshot().unwrap();
+        let canvas = h.get_by_label("PCB canvas").rect();
+        assert!(super::split_editors::painted_grid_dots(&h, canvas).is_empty());
+        click(&mut h, "Preferences");
+        click(&mut h, "Dots");
+        assert!(h.state().preferences.grid_visible(true));
+        click(&mut h, "Cancel");
+        assert_eq!(h.state().preferences, hidden);
+        assert!(super::split_editors::painted_grid_dots(&h, canvas).is_empty());
+        click(&mut h, "Preferences");
+        click(&mut h, "Dots");
+        click(&mut h, "OK");
+        assert!(h.state().preferences.grid_visible(true));
+        assert!(!super::split_editors::painted_grid_dots(&h, canvas).is_empty());
+        click(&mut h, "View");
+        click(&mut h, "Show grid");
+        assert!(!h.state().preferences.grid_visible(true));
+        click(&mut h, "Show grid");
+        assert!(h.state().preferences.grid_visible(true));
+        assert!(!super::split_editors::painted_grid_dots(&h, canvas).is_empty());
+        assert!(std::sync::Arc::ptr_eq(&before, &h.state().session.snapshot().unwrap()));
+    }
+}
+
 /// Open a board with its origin unobstructed, retaining the real layers/properties panels.
 fn editable_board() -> Harness<'static, PcbApp> {
     let mut h = board_harness();
     click(&mut h, "Choose workspace");
-    click(&mut h, "PCB layout");
+    click(&mut h, "PCB Layout");
     h.state_mut().views.active.camera.center_on(Point { x_nm: 0, y_nm: 0 });
     h.run();
     h
@@ -403,6 +601,63 @@ fn board_point(h: &Harness<'_, PcbApp>, point: Point) -> egui::Pos2 {
 /// Inspect the authored placement independently of its temporary canvas preview.
 fn placement(h: &Harness<'_, PcbApp>) -> Value {
     h.state().session.inspect()["project"]["board"]["footprints"][0].clone()
+}
+
+/// Keyboard and ribbon rotation keep their screen direction on either board side and in either view.
+/// Move previews
+/// use the same direction, remain unauthored until commit, and cancel without changing the board.
+#[test]
+fn footprint_rotation_follows_the_screen_in_both_board_views() {
+    for bottom in [false, true] {
+        for flipped in [false, true] {
+            let mut h = editable_board();
+            h.state_mut().views.active.camera.set_mirrored(flipped);
+            h.run();
+            if bottom {
+                let origin = board_point(&h, Point { x_nm: 0, y_nm: 0 });
+                h.hover_at(origin);
+                h.key_press(Key::F);
+                h.run();
+                assert_eq!(placement(&h)["side"], "back");
+            }
+            let before = encode_documents(h.state().session.snapshot().unwrap()).unwrap();
+            let origin = board_point(&h, Point { x_nm: 0, y_nm: 0 });
+            click_canvas_at(&mut h, origin);
+            let pad_direction = |h: &Harness<'_, PcbApp>| {
+                let project = h.state().session.project().unwrap();
+                let board = project.board_view(h.state().views.active.board.target.unwrap()).unwrap();
+                let footprint = board.footprints().next().unwrap();
+                board_point(h, footprint.pads[0].center) - board_point(h, footprint.position)
+            };
+            let initial = pad_direction(&h);
+            h.key_press(Key::R);
+            h.run();
+            let rotated = pad_direction(&h);
+            assert!(initial.x * rotated.y - initial.y * rotated.x < 0., "R is counterclockwise on screen, flipped={flipped}");
+            assert_eq!(placement(&h)["rotation"], if flipped { 270 } else { 90 });
+            h.key_press_modifiers(Modifiers::SHIFT, Key::R);
+            h.run();
+            assert_eq!(placement(&h)["rotation"], 0, "Shift+R reverses R");
+            assert!((pad_direction(&h) - initial).length() < 0.01);
+            click(&mut h, "Rotate selected footprint or text counterclockwise");
+            assert_eq!(placement(&h)["rotation"], if flipped { 270 } else { 90 });
+            let before_move = encode_documents(h.state().session.snapshot().unwrap()).unwrap();
+            h.hover_at(origin);
+            h.key_press(Key::M);
+            h.run();
+            h.key_press_modifiers(Modifiers::SHIFT, Key::R);
+            h.run();
+            assert_eq!(h.state().views.active.board.draft.as_ref().unwrap().rotation, 0);
+            assert_eq!(encode_documents(h.state().session.snapshot().unwrap()).unwrap(), before_move);
+            h.key_press(Key::Escape);
+            h.run();
+            assert!(h.state().views.active.board.draft.is_none());
+            assert_eq!(encode_documents(h.state().session.snapshot().unwrap()).unwrap(), before_move);
+            h.key_press_modifiers(Modifiers::COMMAND, Key::Z);
+            h.run();
+            assert_eq!(encode_documents(h.state().session.snapshot().unwrap()).unwrap(), before);
+        }
+    }
 }
 
 /// Dragging and rotation stay local until release; both changes commit together and undo once.
@@ -435,6 +690,38 @@ fn footprint_drag_rotation_and_undo_share_one_command() {
     h.key_press_modifiers(Modifiers::COMMAND, Key::Y);
     h.run();
     assert_eq!(placement(&h), changed);
+}
+
+/// Footprint drags snap to the board's 25 mil spacing at several zoom levels without changing
+/// the placement model or needing a different grid rule per scale.
+#[test]
+fn footprint_drag_snaps_to_board_grid_at_several_zoom_levels() {
+    let mut h = board_harness();
+    click(&mut h, "Choose workspace");
+    click(&mut h, "PCB Layout");
+    let id = h.state().views.active.id();
+    h.state_mut().set_view_grid(id, 25 * pcbcraft_chrome::grid::NM_PER_MIL);
+    for zoom in [0.5, 1.0, 2.0] {
+        h.state_mut().views.active.camera.set_zoom_with_limit(zoom, crate::canvas_camera::MAX_BOARD_ZOOM);
+        h.run();
+        let before = placement(&h);
+        let start = Point { x_nm: before["x_nm"].as_i64().unwrap(), y_nm: before["y_nm"].as_i64().unwrap() };
+        let destination = board_point(&h, Point { x_nm: start.x_nm + 2_000_000, y_nm: start.y_nm + 1_000_000 });
+        let from = board_point(&h, start);
+        h.hover_at(from);
+        h.run();
+        h.drag_at(from);
+        h.run();
+        h.hover_at(destination);
+        h.run();
+        h.drop_at(destination);
+        h.run();
+        let moved = placement(&h);
+        assert_ne!(moved, before, "zoom {zoom} moved the footprint");
+        for axis in ["x_nm", "y_nm"] {
+            assert_eq!(moved[axis].as_i64().unwrap() % (25 * pcbcraft_chrome::grid::NM_PER_MIL), 0, "zoom {zoom} {axis}");
+        }
+    }
 }
 
 /// Screen positions of a painted text label in the most recent frame only.
@@ -520,7 +807,7 @@ fn footprint_hotkeys_and_ribbon_preserve_exact_quarter_turns() {
     assert_eq!(changed["y_nm"], 1_270_000);
     assert_eq!(changed["rotation"], 90);
     for _ in 0..3 {
-        click(&mut h, "Rotate footprint counterclockwise");
+        click(&mut h, "Rotate selected footprint or text counterclockwise");
     }
     assert_eq!(placement(&h)["rotation"], 0);
     let center = board_point(&h, Point { x_nm: -2_540_000, y_nm: 1_270_000 });
@@ -532,7 +819,7 @@ fn footprint_hotkeys_and_ribbon_preserve_exact_quarter_turns() {
     h.key_press(Key::R);
     h.run();
     assert_eq!(placement(&h)["rotation"], 0);
-    click(&mut h, "Move footprint");
+    click(&mut h, "Move selected footprint, text or copper");
     assert!(h.state().views.active.board.draft.is_some());
     h.key_press(Key::Escape);
     h.run();
@@ -609,7 +896,7 @@ fn footprint_moves_cancel_on_escape_panel_release_and_stale_revision() {
         assert!(h.state().views.active.board.draft.is_none(), "{mode:?}");
         let mut after = encode_documents(h.state().session.snapshot().unwrap()).unwrap();
         if mode == Cancel::Revision {
-            after.insert("project.pc".into(), bytes["project.pc"].clone());
+            after.insert("project.json".into(), bytes["project.json"].clone());
         }
         assert_eq!(after, bytes, "{mode:?}");
     }
@@ -652,7 +939,7 @@ fn live_footprint_transform_shares_editor_history_and_invalidates_drafts() {
 fn footprint_tools_in_split_views_share_history_without_sharing_input() {
     let mut h = board_harness();
     click(&mut h, "Choose workspace");
-    click(&mut h, "Open PCB layout beside current view");
+    click(&mut h, "Open PCB Layout beside current view");
     let board_id = ViewId(2);
     h.state_mut().views.view_mut(board_id).unwrap().camera.center_on(Point { x_nm: 0, y_nm: 0 });
     h.run();
@@ -697,17 +984,17 @@ fn opening_another_project_from_pcb_layout_binds_its_board() {
         let mut h = board_harness();
         if split {
             click(&mut h, "Choose workspace");
-            click(&mut h, "Open PCB layout beside current view");
+            click(&mut h, "Open PCB Layout beside current view");
             let at = h.get_by_label("PCB canvas 3").rect().center();
             click_canvas_at(&mut h, at);
         } else {
             click(&mut h, "Choose workspace");
-            click(&mut h, "PCB layout");
+            click(&mut h, "PCB Layout");
         }
         let before = h.state().views.active.input(&h.state().session).unwrap();
         // The folder case opens a private copy; see `dual_led_copy`.
         let (_copy, path) = if archive {
-            (None, std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/dual-led.pc.zip"))
+            (None, std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/dual-led.pc"))
         } else {
             let (copy, path) = dual_led_copy();
             (Some(copy), path)
@@ -732,7 +1019,7 @@ fn opening_another_project_from_pcb_layout_binds_its_board() {
         click(&mut h, "Schematic");
         assert_eq!(h.state().views.active.workspace, Workspace::Schematic);
         click(&mut h, "Choose workspace");
-        click(&mut h, "PCB layout");
+        click(&mut h, "PCB Layout");
         assert!(!h.state().views.active.unavailable());
         assert_eq!(h.state().views.active.board.target, Some(target));
     }
@@ -744,7 +1031,7 @@ fn opening_another_project_from_pcb_layout_binds_its_board() {
 fn failed_project_open_preserves_current_pcb_binding() {
     let mut h = board_harness();
     click(&mut h, "Choose workspace");
-    click(&mut h, "PCB layout");
+    click(&mut h, "PCB Layout");
     let before = h.state().session.snapshot().unwrap();
     let target = h.state().views.active.board.target;
     let revision = h.state().session.revision();
@@ -773,7 +1060,7 @@ fn smd_pads_render_physical_geometry_and_respect_layer_visibility() {
     );
     h.run();
     click(&mut h, "Choose workspace");
-    click(&mut h, "PCB layout");
+    click(&mut h, "PCB Layout");
     h.state_mut().views.active.camera.request_fit();
     h.run();
     let target = h.state().views.active.board.target.unwrap();
@@ -802,7 +1089,7 @@ fn smd_pads_render_physical_geometry_and_respect_layer_visibility() {
     assert_eq!(footprint.rotation, 90);
     for pad in footprint.pads {
         let expected = pad.copper.unwrap().map(|point| h.state().views.active.camera.screen(point, rect));
-        assert!(h.output().shapes.iter().any(|shape| matches!(&shape.shape,egui::Shape::Path(path) if path.fill==Tokens::get().accent && {
+        assert!(h.output().shapes.iter().any(|shape| matches!(&shape.shape,egui::Shape::Path(path) if path.fill==pcbcraft_chrome::board::copper_emphasis(Tokens::get().board_front, Some(true)) && {
             let bounds = path.points.iter().fold(egui::Rect::NOTHING, |rect, p| rect.union(egui::Rect::from_pos(*p)));
             let expected = expected.into_iter().fold(egui::Rect::NOTHING, |rect, p| rect.union(egui::Rect::from_pos(p)));
             bounds.min.distance(expected.min) < 0.01 && bounds.max.distance(expected.max) < 0.01
@@ -822,7 +1109,7 @@ fn physical_demo_labels_drills_and_detail_visibility() {
     h.state_mut().files.open_path_for_test(&path, revision);
     h.run();
     click(&mut h, "Choose workspace");
-    click(&mut h, "PCB layout");
+    click(&mut h, "PCB Layout");
     let mut camera = serde_json::to_value(h.state().views.active.camera.saved_state()).unwrap();
     camera["zoom"] = json!(6.);
     h.state_mut().views.active.camera = crate::canvas_camera::Camera::from_state(&serde_json::from_value(camera).unwrap());
@@ -1020,7 +1307,7 @@ fn footprint_deletion_uses_selected_placements_and_shared_undo() {
         click(&mut h, "Cancel");
         let revision = h.state().session.revision();
         if ribbon {
-            click(&mut h, "Placement menu");
+            click(&mut h, "Modify menu");
             click(&mut h, "Delete");
         } else {
             h.key_press(Key::Delete);
@@ -1073,7 +1360,9 @@ fn footprint_delete_menu_accepts_pointer_clicks() {
         assert_eq!(h.state().views.active.board.selection.len(), 1);
         let revision = h.state().session.revision();
         assert!(h.query_by_label("Delete selected footprints").is_none());
-        let menu = h.get_by_label("Placement menu").rect();
+        h.get_by_label("Modify menu").scroll_to_me();
+        h.run();
+        let menu = h.get_by_label("Modify menu").rect();
         click_canvas_at(&mut h, menu.center());
         let action = h.get_by_label("Delete").rect();
         click_canvas_at(&mut h, action.center());
@@ -1106,7 +1395,7 @@ fn click_then_delete_removes_footprint_without_using_the_ribbon() {
             h.state_mut().run(pcbcraft_engine::PLACE_FOOTPRINT, &params);
             h.run();
             click(&mut h, "Choose workspace");
-            click(&mut h, "PCB layout");
+            click(&mut h, "PCB Layout");
             h.state_mut().browser.open = false;
             h.run();
             let before = encode_documents(h.state().session.snapshot().unwrap()).unwrap();

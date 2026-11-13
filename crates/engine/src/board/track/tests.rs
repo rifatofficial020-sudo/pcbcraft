@@ -5,10 +5,35 @@ use crate::{
 };
 use serde_json::json;
 
+/// Curved pads exclude their bounding corners and include copper within the track end's radius.
+#[test]
+fn pad_contours_test_contact_with_round_track_ends() {
+    for (shape, half_x, half_y, corner_radius_nm) in
+        [(PadShape::Circle, 300_000, 300_000, 0), (PadShape::Oval, 500_000, 300_000, 0), (PadShape::RoundedRectangle, 500_000, 300_000, 150_000)]
+    {
+        let corners = [(-half_x, -half_y), (half_x, -half_y), (half_x, half_y), (-half_x, half_y)].map(|(x_nm, y_nm)| Point { x_nm, y_nm });
+        let land = Land {
+            key: ("footprint-1".into(), "1".into()),
+            corners,
+            layers: Vec::new(),
+            net: None,
+            center: Point { x_nm: 0, y_nm: 0 },
+            shape,
+            corner_radius_nm,
+        };
+        let contour = land.contour();
+        let corner = corners[2];
+        assert!(!contour.overlaps_segment(corner, corner, 5_000.), "{shape:?}");
+        let near_edge = Point { x_nm: 0, y_nm: half_y + 20_000 };
+        assert!(!contour.overlaps_segment(near_edge, near_edge, 19_000.), "{shape:?}");
+        assert!(contour.overlaps_segment(near_edge, near_edge, 20_000.), "{shape:?}");
+    }
+}
+
 /// Three placed 0402 resistors whose first terminals share the accepted net ACCEPTED and whose
 /// last two share a second net, on a two-layer board with an accepted baseline. Built through
 /// the shared production commands.
-fn routed_fixture() -> Session {
+pub(crate) fn routed_fixture() -> Session {
     let mut session = super::super::ratsnest::tests::fixture();
     let symbols: Vec<_> = session.project().unwrap().symbols.iter().map(|symbol| symbol.id()).collect();
     session
@@ -24,13 +49,13 @@ fn routed_fixture() -> Session {
     session
 }
 
-fn view(session: &Session) -> BoardView<'_> {
+pub(crate) fn view(session: &Session) -> BoardView<'_> {
     let project = session.project().unwrap();
     project.board_view(project.board_target().unwrap()).unwrap()
 }
 
 /// The front and back copper layer IDs, chosen by side rather than catalog position.
-fn copper_layers(session: &Session) -> Vec<Uuid> {
+pub(crate) fn copper_layers(session: &Session) -> Vec<Uuid> {
     use super::super::setup::Side;
     let layers = view(session).setup().unwrap().layers().to_vec();
     let side = |side| layers.iter().find(|layer| layer.purpose == LayerPurpose::Copper && layer.side == Some(side)).unwrap().id;
@@ -43,7 +68,7 @@ fn detour(from: Point, to: Point) -> Vec<Point> {
     vec![from, Point { x_nm: from.x_nm, y_nm: y }, Point { x_nm: to.x_nm, y_nm: y }, to]
 }
 
-fn route(session: &mut Session, layer: Uuid, points: &[Point]) -> Result<u64, CommandError> {
+pub(crate) fn route(session: &mut Session, layer: Uuid, points: &[Point]) -> Result<u64, CommandError> {
     session.apply(ADD_TRACKS, &json!({"layer":layer,"width_nm":DEFAULT_WIDTH_NM,"points":points,"expected_revision":session.revision()}))
 }
 
@@ -79,7 +104,7 @@ fn routing_a_connection_clears_its_airwire_saves_and_undoes() {
     assert_eq!((on_net(&ratsnest.lines), on_net(&routed.lines)), (2, 1), "only the routed net loses an airwire");
 
     let saved = encode_documents(s.snapshot().unwrap()).unwrap();
-    let board = String::from_utf8(saved["board.json"].clone()).unwrap();
+    let board = String::from_utf8(saved[&crate::persistence::test_board_path(&saved)].clone()).unwrap();
     assert!(board.contains("\"format\": \"pcbcraft-board/12\""), "{board}");
     assert_eq!(board.matches("\"width_nm\":250000").count(), 3, "one line per segment");
     let reopened = decode_documents(&saved).unwrap();
@@ -167,20 +192,20 @@ fn board_format_12_and_tracks_require_each_other() {
     let front = copper_layers(&s)[0];
     route(&mut s, front, &[Point { x_nm: 0, y_nm: 20_000_000 }, Point { x_nm: 5_000_000, y_nm: 20_000_000 }]).unwrap();
     let saved = encode_documents(s.snapshot().unwrap()).unwrap();
-    let text = String::from_utf8(saved["board.json"].clone()).unwrap();
+    let text = String::from_utf8(saved[&crate::persistence::test_board_path(&saved)].clone()).unwrap();
     let mut downgraded = saved.clone();
-    downgraded.insert("board.json".into(), text.replace("pcbcraft-board/12", "pcbcraft-board/10").into_bytes());
+    downgraded.insert(crate::persistence::test_board_path(&downgraded), text.replace("pcbcraft-board/12", "pcbcraft-board/10").into_bytes());
     assert!(decode_documents(&downgraded).is_err(), "older formats cannot carry tracks");
     let start = text.find("  \"tracks\": [").unwrap();
     let end = start + text[start..].find("  ],\n").unwrap() + "  ],\n".len();
     let mut untracked = saved.clone();
-    untracked.insert("board.json".into(), format!("{}{}", &text[..start], &text[end..]).into_bytes());
+    untracked.insert(crate::persistence::test_board_path(&untracked), format!("{}{}", &text[..start], &text[end..]).into_bytes());
     assert!(decode_documents(&untracked).is_err(), "format 12 requires tracks");
     let mut bad_layer = saved;
     let front = front.to_string();
     let edge = view(&s).layers().into_iter().find(|layer| layer.purpose == LayerPurpose::Outline).unwrap().id.to_string();
     let track_line = text[start..end].lines().nth(1).unwrap();
-    bad_layer.insert("board.json".into(), text.replace(track_line, &track_line.replace(&front, &edge)).into_bytes());
+    bad_layer.insert(crate::persistence::test_board_path(&bad_layer), text.replace(track_line, &track_line.replace(&front, &edge)).into_bytes());
     assert!(decode_documents(&bad_layer).is_err(), "tracks must be on copper");
 }
 
@@ -198,7 +223,7 @@ fn connectivity_geometry_is_exact_at_boundaries() {
 }
 
 /// Add a route with layer changes and the default via size.
-fn route_with_vias(session: &mut Session, layer: Uuid, points: &[Point], changes: &[(usize, Uuid)]) -> Result<u64, CommandError> {
+pub(crate) fn route_with_vias(session: &mut Session, layer: Uuid, points: &[Point], changes: &[(usize, Uuid)]) -> Result<u64, CommandError> {
     let changes: Vec<_> = changes.iter().map(|(at, layer)| json!({"at":at,"layer":layer})).collect();
     session.apply(
         ADD_TRACKS,
@@ -238,7 +263,7 @@ fn vias_carry_a_route_between_layers_in_one_edit() {
     assert_eq!(on_net(&view(&s).ratsnest().unwrap().lines), 1, "the via route joins both pads");
 
     let saved = encode_documents(s.snapshot().unwrap()).unwrap();
-    let text = String::from_utf8(saved["board.json"].clone()).unwrap();
+    let text = String::from_utf8(saved[&crate::persistence::test_board_path(&saved)].clone()).unwrap();
     assert!(text.contains("\"format\": \"pcbcraft-board/13\"") && text.contains("  \"vias\": [\n"), "{text}");
     assert_eq!(text.matches("\"drill_nm\":300000").count(), 2, "one line per via");
     assert_eq!(encode_documents(decode_documents(&saved).unwrap()).unwrap(), saved);
@@ -289,7 +314,6 @@ fn invalid_layer_changes_and_deletes_change_nothing() {
     }
     let base =
         json!({"layer":front,"width_nm":DEFAULT_WIDTH_NM,"points":points,"layer_changes":[{"at":1,"layer":back}],"expected_revision":revision});
-    assert!(s.apply(ADD_TRACKS, &base).is_err(), "via sizes are required with layer changes");
     let mut wide_drill = base.clone();
     wide_drill["via_diameter_nm"] = json!(400_000);
     wide_drill["via_drill_nm"] = json!(400_000);
@@ -311,8 +335,8 @@ fn a_route_can_end_on_a_via() {
     assert_eq!(view(&s).vias().iter().map(|via| via.at).collect::<Vec<_>>(), vec![end]);
 }
 
-/// A short made by another edit, here moving a footprint onto a track of another net, refuses
-/// only routes that touch that island. Unrelated routes still succeed.
+/// A short already on the board, here a footprint sitting on a track of another net as an older
+/// board could hold, refuses only routes that touch that island. Unrelated routes still succeed.
 #[test]
 fn an_existing_short_blocks_only_routes_into_it() {
     let mut s = routed_fixture();
@@ -324,15 +348,21 @@ fn an_existing_short_blocks_only_routes_into_it() {
     let target = view(&s).footprints().filter(|f| f.id != id).flat_map(|f| f.pads).find(|p| p.net.is_some() && p.net != moved_net).unwrap().center;
     let stub_end = Point { x_nm: target.x_nm, y_nm: target.y_nm + 3_000_000 };
     route(&mut s, front, &[target, stub_end]).unwrap();
-    // Move the first footprint so its first pad lands on the stub's free end.
+    // Put the first footprint's first pad on the stub's free end. Moves now refuse that short,
+    // so the board is edited directly, as an older board could already hold it.
     let offset = (moved.x_nm - position.x_nm, moved.y_nm - position.y_nm);
-    s.apply(
+    let refused = s.apply(
         crate::SET_FOOTPRINT_TRANSFORM,
         &json!({"footprint":id,"x_nm":stub_end.x_nm - offset.0,"y_nm":stub_end.y_nm - offset.1,
             "rotation":rotation,"expected_revision":s.revision()}),
-    )
-    .unwrap();
-    assert!(short(s.project().unwrap(), &view(&s).tracks().iter().map(|t| t.id).collect()).is_some(), "the move created a short");
+    );
+    assert!(refused.unwrap_err().to_string().contains("would connect nets"), "the move itself is refused");
+    let mut next = s.project().unwrap().clone();
+    let number = crate::schematic::wiring::parse_id(&id, "footprint-").unwrap();
+    let footprint = std::sync::Arc::make_mut(&mut next.board).footprints.iter_mut().find(|f| f.id == number).unwrap();
+    (footprint.x_nm, footprint.y_nm) = (stub_end.x_nm - offset.0, stub_end.y_nm - offset.1);
+    s.change(next).unwrap();
+    assert!(short(s.project().unwrap(), &view(&s).tracks().iter().map(|t| t.id).collect()).is_some(), "the legacy placement creates a short");
     route(&mut s, front, &[Point { x_nm: 0, y_nm: 30_000_000 }, Point { x_nm: 5_000_000, y_nm: 30_000_000 }])
         .expect("an unrelated route is not blamed for an existing short");
     let error = route(&mut s, front, &[stub_end, Point { x_nm: stub_end.x_nm + 2_000_000, y_nm: stub_end.y_nm }]).unwrap_err().to_string();
@@ -344,11 +374,11 @@ fn an_existing_short_blocks_only_routes_into_it() {
 fn an_empty_tracks_field_is_rejected_before_format_12() {
     let s = routed_fixture();
     let saved = encode_documents(s.snapshot().unwrap()).unwrap();
-    let text = String::from_utf8(saved["board.json"].clone()).unwrap();
+    let text = String::from_utf8(saved[&crate::persistence::test_board_path(&saved)].clone()).unwrap();
     assert!(text.contains("\"format\": \"pcbcraft-board/10\""), "{text}");
     let list = if text.contains("  \"assignments\": [\n") { "  \"assignments\": [\n" } else { "  \"footprints\": [\n" };
     let mut with_empty = saved.clone();
-    with_empty.insert("board.json".into(), text.replacen(list, &format!("  \"tracks\": [],\n{list}"), 1).into_bytes());
+    with_empty.insert(crate::persistence::test_board_path(&with_empty), text.replacen(list, &format!("  \"tracks\": [],\n{list}"), 1).into_bytes());
     assert!(decode_documents(&with_empty).is_err());
     assert!(decode_documents(&saved).is_ok());
 }
@@ -379,17 +409,20 @@ fn a_track_crossing_a_pad_off_center_touches_it() {
     let square =
         [Point { x_nm: 0, y_nm: 0 }, Point { x_nm: 600_000, y_nm: 0 }, Point { x_nm: 600_000, y_nm: 600_000 }, Point { x_nm: 0, y_nm: 600_000 }];
     let crossing = Track {
+        locked: false,
         id: Uuid::from_u128(1),
         layer: front,
         width_nm: 100_000,
         start: Point { x_nm: -1_000_000, y_nm: 500_000 },
         end: Point { x_nm: 2_000_000, y_nm: 500_000 },
     };
-    assert!(touches_land(&crossing, &square), "crossing near an edge");
+    let pad = PadContour { core: square, radius: 0. };
+    let touches = |track: &Track| pad.overlaps_segment(track.start, track.end, track.width_nm as f64 / 2.);
+    assert!(touches(&crossing), "crossing near an edge");
     let grazing = Track { start: Point { x_nm: -1_000_000, y_nm: 640_000 }, end: Point { x_nm: 2_000_000, y_nm: 640_000 }, ..crossing.clone() };
-    assert!(touches_land(&grazing, &square), "copper within half the width of an edge");
+    assert!(touches(&grazing), "copper within half the width of an edge");
     let clear = Track { start: Point { x_nm: -1_000_000, y_nm: 700_000 }, end: Point { x_nm: 2_000_000, y_nm: 700_000 }, ..crossing };
-    assert!(!touches_land(&clear, &square), "copper clear of the land");
+    assert!(!touches(&clear), "copper clear of the land");
 }
 
 /// A via whose center sits just off a land still overlaps it when an edge is within its radius,
@@ -397,10 +430,11 @@ fn a_track_crossing_a_pad_off_center_touches_it() {
 #[test]
 fn a_via_overlapping_a_land_edge_touches_it() {
     let p = |x, y| Point { x_nm: x, y_nm: y };
-    let land = [p(0, 0), p(600_000, 0), p(600_000, 600_000), p(0, 600_000)];
-    assert!(via_touches_land(p(300_000, 300_000), 300_000., &land), "centered");
-    assert!(via_touches_land(p(800_000, 300_000), 300_000., &land), "center 0.2 mm off the edge, radius 0.3 mm");
-    assert!(!via_touches_land(p(1_000_000, 300_000), 300_000., &land), "clear of the land");
+    let pad = PadContour { core: [p(0, 0), p(600_000, 0), p(600_000, 600_000), p(0, 600_000)], radius: 0. };
+    let touches = |at| pad.overlaps_segment(at, at, 300_000.);
+    assert!(touches(p(300_000, 300_000)), "centered");
+    assert!(touches(p(800_000, 300_000)), "center 0.2 mm off the edge, radius 0.3 mm");
+    assert!(!touches(p(1_000_000, 300_000)), "clear of the land");
 }
 
 /// A track that crosses a pad with both ends outside its land joins that pad's copper island, and
@@ -442,28 +476,231 @@ fn vias_use_board_format_13_and_format_12_stays_tracks_only() {
     let y = 20_000_000;
     route(&mut s, front, &[Point { x_nm: 0, y_nm: y }, Point { x_nm: 2_000_000, y_nm: y }]).unwrap();
     let tracks_only = encode_documents(s.snapshot().unwrap()).unwrap();
-    let text = String::from_utf8(tracks_only["board.json"].clone()).unwrap();
+    let text = String::from_utf8(tracks_only[&crate::persistence::test_board_path(&tracks_only)].clone()).unwrap();
     assert!(text.contains("\"format\": \"pcbcraft-board/12\"") && !text.contains("\"vias\""), "{text}");
 
     route_with_vias(&mut s, front, &[Point { x_nm: 4_000_000, y_nm: y }, Point { x_nm: 6_000_000, y_nm: y }], &[(1, back)]).unwrap();
     let saved = encode_documents(s.snapshot().unwrap()).unwrap();
-    let text = String::from_utf8(saved["board.json"].clone()).unwrap();
+    let text = String::from_utf8(saved[&crate::persistence::test_board_path(&saved)].clone()).unwrap();
     assert!(text.contains("\"format\": \"pcbcraft-board/13\""), "{text}");
     assert_eq!(encode_documents(decode_documents(&saved).unwrap()).unwrap(), saved);
     let mut as_12 = saved.clone();
-    as_12.insert("board.json".into(), text.replace("pcbcraft-board/13", "pcbcraft-board/12").into_bytes());
+    as_12.insert(crate::persistence::test_board_path(&as_12), text.replace("pcbcraft-board/13", "pcbcraft-board/12").into_bytes());
     assert!(decode_documents(&as_12).is_err(), "format 12 rejects vias");
 
     // Format 13 may carry vias alone, and requires at least one.
     let tracks: Vec<_> = view(&s).tracks().iter().map(|track| track.id).collect();
     s.apply(DELETE_TRACKS, &json!({"tracks":tracks,"expected_revision":s.revision()})).unwrap();
     let vias_only = encode_documents(s.snapshot().unwrap()).unwrap();
-    let text = String::from_utf8(vias_only["board.json"].clone()).unwrap();
+    let text = String::from_utf8(vias_only[&crate::persistence::test_board_path(&vias_only)].clone()).unwrap();
     assert!(text.contains("\"format\": \"pcbcraft-board/13\"") && !text.contains("\"tracks\""), "{text}");
     assert_eq!(encode_documents(decode_documents(&vias_only).unwrap()).unwrap(), vias_only);
     let start = text.find("  \"vias\": [").unwrap();
     let end = start + text[start..].find("  ],\n").unwrap() + "  ],\n".len();
     let mut no_vias = vias_only.clone();
-    no_vias.insert("board.json".into(), format!("{}{}", &text[..start], &text[end..]).into_bytes());
+    no_vias.insert(crate::persistence::test_board_path(&no_vias), format!("{}{}", &text[..start], &text[end..]).into_bytes());
     assert!(decode_documents(&no_vias).is_err(), "format 13 requires vias");
+}
+
+fn place_via(session: &mut Session, at: Point) -> Result<u64, CommandError> {
+    session.apply(
+        ADD_VIA,
+        &json!({"at":at,"via_diameter_nm":DEFAULT_VIA_DIAMETER_NM,"via_drill_nm":DEFAULT_VIA_DRILL_NM,"expected_revision":session.revision()}),
+    )
+}
+
+/// A standalone via is one undoable edit that saves as format 13. A second via on the same spot,
+/// a via whose pad would join two nets' pads, an invalid size or a stale revision is refused.
+#[test]
+fn standalone_vias_place_undo_and_refuse_shorts() {
+    let mut s = routed_fixture();
+    let before = encode_documents(s.snapshot().unwrap()).unwrap();
+    let at = Point { x_nm: 0, y_nm: 20_000_000 };
+    let revision = s.revision();
+    place_via(&mut s, at).unwrap();
+    assert_eq!(s.revision(), revision + 1);
+    assert_eq!(view(&s).vias().iter().map(|via| via.at).collect::<Vec<_>>(), vec![at]);
+    assert!(
+        String::from_utf8(encode_documents(s.snapshot().unwrap()).unwrap()[&s.project().unwrap().board_document_path().unwrap()].clone())
+            .unwrap()
+            .contains("pcbcraft-board/13")
+    );
+    let revision = s.revision();
+    assert!(place_via(&mut s, at).is_err(), "one via per position");
+    // A 0.6 mm pad between two 0402 lands 1.05 mm apart (0.45 mm gap) touches both.
+    let (a, b) = {
+        let f = view(&s).footprints().find(|f| f.pads.iter().all(|p| p.net.is_some()) && f.pads[0].net != f.pads[1].net).unwrap();
+        (f.pads[0].center, f.pads[1].center)
+    };
+    let between = Point { x_nm: (a.x_nm + b.x_nm) / 2, y_nm: a.y_nm };
+    assert!(place_via(&mut s, between).unwrap_err().to_string().contains("would connect nets"));
+    assert!(
+        s.apply(
+            ADD_VIA,
+            &json!({"at":Point { x_nm: 9_000_000, y_nm: 20_000_000 },"via_diameter_nm":300_000,"via_drill_nm":300_000,"expected_revision":revision})
+        )
+        .is_err(),
+        "the drill must be smaller than the pad"
+    );
+    assert!(s.apply(ADD_VIA, &json!({"at":at,"via_diameter_nm":600_000,"via_drill_nm":300_000,"expected_revision":revision - 1})).is_err());
+    assert_eq!(s.revision(), revision);
+    s.apply("edit.undo", &json!({})).unwrap();
+    assert_eq!(encode_documents(s.snapshot().unwrap()).unwrap(), before);
+}
+
+/// Moving tracks and vias shifts exactly the named items in one edit, keeping sizes and layers.
+/// A move that lands copper on another net's pad is refused whole, a zero move changes nothing,
+/// and empty or unknown targets are refused.
+#[test]
+fn moving_tracks_and_vias_is_one_checked_edit() {
+    let mut s = routed_fixture();
+    let [front, back] = copper_layers(&s)[..] else { panic!("two copper layers") };
+    let y = 20_000_000;
+    route_with_vias(
+        &mut s,
+        front,
+        &[Point { x_nm: 0, y_nm: y }, Point { x_nm: 2_000_000, y_nm: y }, Point { x_nm: 4_000_000, y_nm: y }],
+        &[(1, back)],
+    )
+    .unwrap();
+    let before: Vec<_> = view(&s).tracks().to_vec();
+    let via = view(&s).vias()[0].clone();
+    let moved = before[0].id;
+    let revision = s.revision();
+    s.apply(MOVE_TRACKS, &json!({"tracks":[moved],"vias":[via.id],"dx_nm":1_000_000,"dy_nm":-500_000,"expected_revision":revision})).unwrap();
+    assert_eq!(s.revision(), revision + 1);
+    let after = view(&s).tracks().iter().find(|t| t.id == moved).unwrap().clone();
+    let original = before.iter().find(|t| t.id == moved).unwrap();
+    assert_eq!(after.start, Point { x_nm: original.start.x_nm + 1_000_000, y_nm: original.start.y_nm - 500_000 });
+    assert_eq!((after.layer, after.width_nm), (original.layer, original.width_nm));
+    assert_eq!(view(&s).vias()[0].at, Point { x_nm: via.at.x_nm + 1_000_000, y_nm: via.at.y_nm - 500_000 });
+    let other = before.iter().find(|t| t.id != moved).unwrap();
+    assert_eq!(view(&s).tracks().iter().find(|t| t.id == other.id).unwrap(), other, "unnamed copper stays put");
+
+    let revision = s.revision();
+    s.apply(MOVE_TRACKS, &json!({"tracks":[moved],"dx_nm":0,"dy_nm":0,"expected_revision":revision})).unwrap();
+    assert_eq!(s.revision(), revision, "a zero move is not an edit");
+    assert!(s.apply(MOVE_TRACKS, &json!({"dx_nm":1,"dy_nm":0,"expected_revision":revision})).is_err());
+    assert!(s.apply(MOVE_TRACKS, &json!({"tracks":[Uuid::from_u128(4)],"dx_nm":1,"dy_nm":0,"expected_revision":revision})).is_err());
+
+    // Drop a short stub onto a pad of each of two nets: refused, board unchanged.
+    let (a, b) = {
+        let f = view(&s).footprints().find(|f| f.pads.iter().all(|p| p.net.is_some()) && f.pads[0].net != f.pads[1].net).unwrap();
+        (f.pads[0].center, f.pads[1].center)
+    };
+    route(&mut s, front, &[Point { x_nm: 0, y_nm: 30_000_000 }, Point { x_nm: b.x_nm - a.x_nm, y_nm: 30_000_000 }]).unwrap();
+    let stub = view(&s).tracks().iter().find(|t| t.start.y_nm == 30_000_000).unwrap().id;
+    let bytes = encode_documents(s.snapshot().unwrap()).unwrap();
+    let error = s
+        .apply(MOVE_TRACKS, &json!({"tracks":[stub],"dx_nm":a.x_nm,"dy_nm":a.y_nm - 30_000_000,"expected_revision":s.revision()}))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("would connect nets"), "{error}");
+    assert_eq!(encode_documents(s.snapshot().unwrap()).unwrap(), bytes);
+}
+
+/// Width and via size edits change only the named items; widening copper into another net is
+/// refused, and an unchanged size is not an edit.
+#[test]
+fn track_width_and_via_size_edits_are_checked() {
+    let mut s = routed_fixture();
+    let [front, back] = copper_layers(&s)[..] else { panic!("two copper layers") };
+    let y = 20_000_000;
+    route_with_vias(
+        &mut s,
+        front,
+        &[Point { x_nm: 0, y_nm: y }, Point { x_nm: 2_000_000, y_nm: y }, Point { x_nm: 4_000_000, y_nm: y }],
+        &[(1, back)],
+    )
+    .unwrap();
+    let tracks: Vec<_> = view(&s).tracks().iter().map(|t| t.id).collect();
+    let via = view(&s).vias()[0].id;
+    s.apply(SET_TRACK_WIDTH, &json!({"tracks":[tracks[0]],"width_nm":400_000,"expected_revision":s.revision()})).unwrap();
+    assert_eq!(view(&s).tracks().iter().find(|t| t.id == tracks[0]).unwrap().width_nm, 400_000);
+    assert_eq!(view(&s).tracks().iter().find(|t| t.id == tracks[1]).unwrap().width_nm, DEFAULT_WIDTH_NM);
+    let revision = s.revision();
+    s.apply(SET_TRACK_WIDTH, &json!({"tracks":[tracks[0]],"width_nm":400_000,"expected_revision":revision})).unwrap();
+    assert_eq!(s.revision(), revision, "an unchanged width is not an edit");
+    s.apply(SET_VIA_SIZE, &json!({"vias":[via],"via_diameter_nm":800_000,"via_drill_nm":400_000,"expected_revision":revision})).unwrap();
+    assert_eq!((view(&s).vias()[0].diameter_nm, view(&s).vias()[0].drill_nm), (800_000, 400_000));
+    let revision = s.revision();
+    assert!(s.apply(SET_VIA_SIZE, &json!({"vias":[via],"via_diameter_nm":400_000,"via_drill_nm":400_000,"expected_revision":revision})).is_err());
+    assert!(s.apply(SET_TRACK_WIDTH, &json!({"tracks":[],"width_nm":400_000,"expected_revision":revision})).is_err());
+
+    // A thin track through the 0.45 mm gap between two nets' 0402 lands clears both; at 0.6 mm
+    // wide its copper reaches both lands, so the widening is refused whole.
+    let (a, b) = {
+        let f = view(&s).footprints().find(|f| f.pads.iter().all(|p| p.net.is_some()) && f.pads[0].net != f.pads[1].net).unwrap();
+        (f.pads[0].center, f.pads[1].center)
+    };
+    let x = (a.x_nm + b.x_nm) / 2;
+    s.apply(
+        ADD_TRACKS,
+        &json!({"layer":front,"width_nm":100_000,"points":[{"x_nm":x,"y_nm":a.y_nm - 2_000_000},{"x_nm":x,"y_nm":a.y_nm + 2_000_000}],"expected_revision":s.revision()}),
+    )
+    .unwrap();
+    let thin = view(&s).tracks().iter().find(|t| t.start.x_nm == x && t.end.x_nm == x).unwrap().id;
+    let bytes = encode_documents(s.snapshot().unwrap()).unwrap();
+    let error = s.apply(SET_TRACK_WIDTH, &json!({"tracks":[thin],"width_nm":600_000,"expected_revision":s.revision()})).unwrap_err().to_string();
+    assert!(error.contains("would connect nets"), "{error}");
+    assert_eq!(encode_documents(s.snapshot().unwrap()).unwrap(), bytes);
+}
+
+/// Routed copper takes the net of the pads it reaches; floating copper has none.
+#[test]
+fn copper_nets_follow_the_pads_they_reach() {
+    let mut s = routed_fixture();
+    let line = view(&s).ratsnest().unwrap().lines[0].clone();
+    let front = copper_layers(&s)[0];
+    let (a, b) = (line.from.position, line.to.position);
+    let y = a.y_nm.max(b.y_nm) + 2_000_000;
+    route(&mut s, front, &[a, Point { x_nm: a.x_nm, y_nm: y }, Point { x_nm: b.x_nm, y_nm: y }, b]).unwrap();
+    route(&mut s, front, &[Point { x_nm: 0, y_nm: 30_000_000 }, Point { x_nm: 2_000_000, y_nm: 30_000_000 }]).unwrap();
+    let net = view(&s).footprints().flat_map(|f| f.pads).find(|p| p.center == a).unwrap().net.unwrap();
+    let nets = view(&s).copper_nets();
+    let routed: Vec<_> = view(&s).tracks().iter().filter(|t| t.start.y_nm != 30_000_000).map(|t| t.id).collect();
+    assert_eq!(routed.len(), 3);
+    assert!(routed.iter().all(|id| nets.get(id) == Some(&net)), "{nets:?}");
+    let floating = view(&s).tracks().iter().find(|t| t.start.y_nm == 30_000_000).unwrap().id;
+    assert!(!nets.contains_key(&floating));
+}
+
+/// Reshaping sets new ends for several segments in one edit, keeping layer and width; collapsed,
+/// repeated or unknown segments, and reshapes that short two nets, change nothing.
+#[test]
+fn reshaping_moves_segment_ends_in_one_checked_edit() {
+    let mut s = routed_fixture();
+    let front = copper_layers(&s)[0];
+    let y = 20_000_000;
+    let p = |x| Point { x_nm: x, y_nm: y };
+    route(&mut s, front, &[p(0), p(2_000_000), p(4_000_000), p(6_000_000)]).unwrap();
+    let find = |s: &Session, start: Point| view(s).tracks().iter().find(|t| t.start == start).unwrap().clone();
+    let (first, middle, last) = (find(&s, p(0)), find(&s, p(2_000_000)), find(&s, p(4_000_000)));
+    let lifted = |x| Point { x_nm: x, y_nm: y - 1_000_000 };
+    let revision = s.revision();
+    let reshape = json!([
+        {"track":first.id,"start":first.start,"end":lifted(2_000_000)},
+        {"track":middle.id,"start":lifted(2_000_000),"end":lifted(4_000_000)},
+        {"track":last.id,"start":lifted(4_000_000),"end":last.end},
+    ]);
+    s.apply(RESHAPE_TRACKS, &json!({"tracks":reshape,"expected_revision":revision})).unwrap();
+    assert_eq!(s.revision(), revision + 1);
+    let after = view(&s).tracks().iter().find(|t| t.id == middle.id).unwrap().clone();
+    assert_eq!((after.start, after.end, after.layer, after.width_nm), (lifted(2_000_000), lifted(4_000_000), middle.layer, middle.width_nm));
+    let revision = s.revision();
+    for tracks in [
+        json!([{"track":middle.id,"start":lifted(2_000_000),"end":lifted(2_000_000)}]),
+        json!([{"track":middle.id,"start":p(0),"end":p(1)},{"track":middle.id,"start":p(0),"end":p(2)}]),
+        json!([{"track":Uuid::from_u128(5),"start":p(0),"end":p(1)}]),
+    ] {
+        assert!(s.apply(RESHAPE_TRACKS, &json!({"tracks":tracks,"expected_revision":revision})).is_err(), "{tracks}");
+    }
+    let (a, b) = {
+        let f = view(&s).footprints().find(|f| f.pads.iter().all(|p| p.net.is_some()) && f.pads[0].net != f.pads[1].net).unwrap();
+        (f.pads[0].center, f.pads[1].center)
+    };
+    let error =
+        s.apply(RESHAPE_TRACKS, &json!({"tracks":[{"track":middle.id,"start":a,"end":b}],"expected_revision":revision})).unwrap_err().to_string();
+    assert!(error.contains("would connect nets"), "{error}");
+    assert_eq!(s.revision(), revision);
 }

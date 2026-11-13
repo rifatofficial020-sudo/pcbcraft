@@ -9,12 +9,13 @@ fn optional_board_is_created_explicitly_and_undo_restores_schematic_only_state()
     let mut h = harness();
     new_project(&mut h);
     let before = encode_documents(h.state().session.snapshot().unwrap()).unwrap();
+    assert!(h.state().session.project().unwrap().board_document_path().is_none());
     assert!(!before.contains_key("board.json"));
     assert!(h.state().session.project().unwrap().board_target().is_none());
     let revision = h.state().session.revision();
 
     click(&mut h, "Choose workspace");
-    click(&mut h, "PCB layout");
+    click(&mut h, "PCB Layout");
     h.get_by_label("Create board");
     assert_eq!(h.state().session.revision(), revision);
     assert_eq!(encode_documents(h.state().session.snapshot().unwrap()).unwrap(), before);
@@ -27,7 +28,11 @@ fn optional_board_is_created_explicitly_and_undo_restores_schematic_only_state()
     assert_eq!(h.state().session.revision(), revision + 1);
     assert_eq!(h.state().views.active.target(), Some(DocumentTarget::Board(board)));
     h.get_by_label("PCB canvas");
-    assert!(encode_documents(h.state().session.snapshot().unwrap()).unwrap().contains_key("board.json"));
+    assert!(
+        encode_documents(h.state().session.snapshot().unwrap())
+            .unwrap()
+            .contains_key(&h.state().session.project().unwrap().board_document_path().unwrap())
+    );
 
     h.state_mut().run("edit.undo", &Value::Null);
     h.run();
@@ -91,7 +96,7 @@ fn footprint_chooser_does_not_create_a_board_for_schematic_only_parts() {
     let saved = pcbcraft_engine::persistence::encode_packed(h.state().session.snapshot().unwrap()).unwrap();
     h.state_mut().session.open_snapshot(pcbcraft_engine::persistence::decode_packed(&saved).unwrap().project);
     h.run();
-    assert!(!encode_documents(h.state().session.snapshot().unwrap()).unwrap().contains_key("board.json"));
+    assert!(h.state().session.project().unwrap().board_document_path().is_none());
     h.state_mut().begin_footprint_assignment(Some(component));
     h.run();
     let revision = h.state().session.revision();
@@ -150,7 +155,7 @@ fn pending_create_board_click_cannot_follow_project_replacement_or_reopen() {
         let mut h = harness();
         new_project(&mut h);
         click(&mut h, "Choose workspace");
-        click(&mut h, "PCB layout");
+        click(&mut h, "PCB Layout");
         let point = h.get_by_label("Create board").rect().center();
         h.event(egui::Event::PointerMoved(point));
         h.event(egui::Event::PointerButton { pos: point, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
@@ -176,7 +181,7 @@ fn repeated_create_board_clicks_only_create_one_board() {
     let mut h = harness();
     new_project(&mut h);
     click(&mut h, "Choose workspace");
-    click(&mut h, "PCB layout");
+    click(&mut h, "PCB Layout");
     let point = h.get_by_label("Create board").rect().center();
     click(&mut h, "Create board");
     let created = h.state().session.snapshot().unwrap();

@@ -87,13 +87,22 @@ pub struct Preferences {
     /// How strongly visible canvas grids show, in percent; 0 hides them. Shared across views
     /// and windows, this changes drawing only, never snapping, cameras or project history.
     pub grid_opacity_percent: u8,
+    /// Schematic grid visibility is independent of PCB grid visibility and snapping.
+    pub schematic_grid_visible: bool,
+    /// PCB grid visibility preserves the selected dot or line style when hidden.
+    pub board_grid_visible: bool,
     /// Display style for every PCB view. Off is the default, including for older saved settings.
     /// Schematic views retain their dot grid; snap spacing stays independent in each view.
     pub board_grid_style: grid::Style,
-    /// The schematic snap spacing last chosen in any view, in nanometres. Both views start from
-    /// it when the app starts; after that each view keeps its own spacing through focus changes,
-    /// splitting and reopening files. It is never saved in the project.
+    /// The schematic snap spacing last chosen in any schematic view, in nanometres. Every
+    /// schematic view starts from it when the app starts; after that each view keeps its own
+    /// spacing through focus changes, splitting and reopening files. It is never saved in the
+    /// project and is independent of [`Self::board_grid_nm`].
     pub schematic_grid_nm: i64,
+    /// The PCB snap spacing last chosen in any board view, in nanometres. Board views start from
+    /// it when the app starts and keep their own spacing afterward, independently of the
+    /// schematic preference. It is presentation only and never saved in the project.
+    pub board_grid_nm: i64,
     /// Clean up touched wire routes after editing. Explicit Heal is available in either mode.
     /// This is a user preference, never part of a project or its undo history.
     pub auto_heal_wires: bool,
@@ -111,8 +120,11 @@ impl Default for Preferences {
             scale_percent: 100,
             navigation: Navigation::default(),
             grid_opacity_percent: grid::OPACITY_DEFAULT,
+            schematic_grid_visible: true,
+            board_grid_visible: true,
             board_grid_style: grid::Style::Off,
             schematic_grid_nm: grid::SCHEMATIC_SPACING_DEFAULT_NM,
+            board_grid_nm: grid::BOARD_SPACING_DEFAULT_NM,
             auto_heal_wires: true,
             selection_follow: SelectionFollow::default(),
             units: Unit::default(),
@@ -121,6 +133,35 @@ impl Default for Preferences {
 }
 
 impl Preferences {
+    /// Effective drawing opacity for a workspace, preserving the chosen opacity while hidden.
+    pub(crate) fn grid_opacity(self, board: bool) -> u8 {
+        let visible = if board { self.board_grid_visible } else { self.schematic_grid_visible };
+        if visible { self.grid_opacity_percent } else { 0 }
+    }
+
+    /// Whether the workspace currently draws a grid, including legacy opacity-zero and PCB-Off settings.
+    pub(crate) fn grid_visible(self, board: bool) -> bool {
+        self.grid_opacity(board) > 0 && (!board || self.board_grid_style != grid::Style::Off)
+    }
+
+    /// Show or hide one workspace without altering snapping. Showing a legacy opacity-zero grid
+    /// restores default opacity while keeping the other workspace hidden; PCB Off starts as dots.
+    pub(crate) fn set_grid_visible(&mut self, board: bool, visible: bool) {
+        if visible && self.grid_opacity_percent == 0 {
+            self.schematic_grid_visible = false;
+            self.board_grid_visible = false;
+            self.grid_opacity_percent = grid::OPACITY_DEFAULT;
+        }
+        if board {
+            self.board_grid_visible = visible;
+            if visible && self.board_grid_style == grid::Style::Off {
+                self.board_grid_style = grid::Style::Dots;
+            }
+        } else {
+            self.schematic_grid_visible = visible;
+        }
+    }
+
     /// Read saved settings. Anything unreadable falls back to the defaults rather than stopping the
     /// app from starting, a scale or zoom speed off its range or step goes back to 100%, and a
     /// grid opacity above 100% or a grid spacing outside its range goes back to the default.
@@ -141,6 +182,9 @@ impl Preferences {
         }
         if !grid::SPACING_RANGE_NM.contains(&preferences.schematic_grid_nm) {
             preferences.schematic_grid_nm = grid::SCHEMATIC_SPACING_DEFAULT_NM;
+        }
+        if !grid::SPACING_RANGE_NM.contains(&preferences.board_grid_nm) {
+            preferences.board_grid_nm = grid::BOARD_SPACING_DEFAULT_NM;
         }
         preferences
     }
@@ -169,6 +213,8 @@ pub(crate) struct PreferencesWindow {
     state: WindowState,
     /// What Cancel restores: the settings when the window opened, or at the last Apply.
     kept: Preferences,
+    /// The slider's displayed value while a pointer gesture still owns it.
+    pending_scale: Option<u16>,
 }
 
 /// What the window asks the app to do after a frame.
@@ -194,6 +240,7 @@ const AI: usize = 5;
 pub(crate) struct PageData<'a> {
     pub preferences: &'a mut Preferences,
     pub shortcuts: &'a [(&'static str, &'static str, String)],
+    pending_scale: &'a mut Option<u16>,
     /// The Assistant draws the AI page and may ask to add an agent from it.
     #[cfg(not(target_arch = "wasm32"))]
     pub assistant: &'a mut crate::assistant::Assistant,
@@ -204,23 +251,23 @@ pub(crate) struct PageData<'a> {
 impl PreferencesWindow {
     /// Open on Appearance, remembering the current settings for Cancel.
     pub(crate) fn new(preferences: Preferences) -> Self {
-        Self { state: WindowState::default(), kept: preferences }
+        Self { state: WindowState::default(), kept: preferences, pending_scale: None }
     }
 
     /// Open on Views from the View ribbon, with the same Apply and Cancel behavior.
     pub(crate) fn at_views(preferences: Preferences) -> Self {
-        Self { state: WindowState { page: VIEWS, query: String::new() }, kept: preferences }
+        Self { state: WindowState { page: VIEWS, query: String::new() }, ..Self::new(preferences) }
     }
 
     /// Open on the Shortcuts page, for Help › Keyboard Shortcuts.
     pub(crate) fn at_shortcuts(preferences: Preferences) -> Self {
-        Self { state: WindowState { page: SHORTCUTS, query: String::new() }, kept: preferences }
+        Self { state: WindowState { page: SHORTCUTS, query: String::new() }, ..Self::new(preferences) }
     }
 
     /// Open on the AI page, for the Assistant's own Settings button.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn at_ai(preferences: Preferences) -> Self {
-        Self { state: WindowState { page: AI, query: String::new() }, kept: preferences }
+        Self { state: WindowState { page: AI, query: String::new() }, ..Self::new(preferences) }
     }
 
     /// Draw the window. OK keeps the changes; Cancel, Esc and × restore the kept settings;
@@ -251,12 +298,17 @@ impl PreferencesWindow {
         let mut data = PageData {
             preferences,
             shortcuts,
+            pending_scale: &mut self.pending_scale,
             #[cfg(not(target_arch = "wasm32"))]
             assistant,
             #[cfg(not(target_arch = "wasm32"))]
             request: None,
         };
         let action = settings::paged_window(ctx, "preferences_window", "Preferences", &mut self.state, &pages, &mut data, footer);
+        // Discard an interrupted drag even when search or a page switch hid the slider.
+        if action != settings::Action::None || !ctx.input(|input| input.focused && input.pointer.primary_down()) {
+            *data.pending_scale = None;
+        }
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(crate::assistant::SettingsRequest::Add(form)) = data.request.take()
             && action == settings::Action::None
@@ -290,6 +342,8 @@ fn restore_page_defaults(preferences: &mut Preferences, page: usize) {
             preferences.theme = defaults.theme;
             preferences.scale_percent = defaults.scale_percent;
             preferences.grid_opacity_percent = defaults.grid_opacity_percent;
+            preferences.schematic_grid_visible = defaults.schematic_grid_visible;
+            preferences.board_grid_visible = defaults.board_grid_visible;
             preferences.board_grid_style = defaults.board_grid_style;
             preferences.units = defaults.units;
         }
@@ -305,10 +359,7 @@ fn restore_page_defaults(preferences: &mut Preferences, page: usize) {
 fn schematic(ui: &mut Ui, data: &mut PageData<'_>) {
     settings::section(ui, "Wiring", |ui| {
         settings::row_with_keywords(ui, "Auto-heal wires", &["smart routing", "cleanup", "detours", "loops", "overlaps"], |ui| {
-            let response = ui.checkbox(&mut data.preferences.auto_heal_wires, "Enabled");
-            response.widget_info(|| {
-                egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), data.preferences.auto_heal_wires, "Auto-heal wires")
-            });
+            settings::checkbox(ui, "Enabled", "Auto-heal wires", &mut data.preferences.auto_heal_wires);
         });
         settings::hint(
             ui,
@@ -318,8 +369,9 @@ fn schematic(ui: &mut Ui, data: &mut PageData<'_>) {
 }
 
 /// Theme, interface scale, PCB grid display, shared grid opacity and display units.
+/// The PCB style reflects effective visibility; choosing dots or lines restores a hidden grid.
 fn appearance(ui: &mut Ui, data: &mut PageData<'_>) {
-    settings::heading(ui, "Appearance", "How PCBCraft looks. Changes show at once; Cancel puts them back.");
+    settings::heading(ui, "Appearance", "How PCBCraft looks. Cancel restores your previous settings.");
     let preferences = &mut *data.preferences;
     settings::section(ui, "Theme", |ui| {
         settings::row(ui, "Theme", |ui| {
@@ -333,24 +385,26 @@ fn appearance(ui: &mut Ui, data: &mut PageData<'_>) {
     });
     settings::section(ui, "Scale", |ui| {
         settings::row(ui, "Interface scale", |ui| {
-            let slider = egui::Slider::new(&mut preferences.scale_percent, SCALE_RANGE).step_by(5.0).suffix("%");
-            ui.add(slider);
+            interface_scale(ui, &mut preferences.scale_percent, data.pending_scale);
         });
         settings::row(ui, "Scale presets", |ui| {
             for preset in SCALE_PRESETS {
                 if ui.selectable_label(preferences.scale_percent == preset, format!("{preset}%")).clicked() {
                     preferences.scale_percent = preset;
+                    *data.pending_scale = None;
                 }
             }
         });
     });
     settings::section(ui, "Canvas", |ui| {
         settings::row_with_keywords(ui, "PCB grid", &["board", "layout", "grid", "dots", "lines", "hide"], |ui| {
-            settings::segmented(
-                ui,
-                &mut preferences.board_grid_style,
-                &[(grid::Style::Off, "Off"), (grid::Style::Dots, "Dots"), (grid::Style::Lines, "Lines")],
-            );
+            let mut style = if preferences.grid_visible(true) { preferences.board_grid_style } else { grid::Style::Off };
+            if settings::segmented(ui, &mut style, &[(grid::Style::Off, "Off"), (grid::Style::Dots, "Dots"), (grid::Style::Lines, "Lines")]) {
+                if style != grid::Style::Off {
+                    preferences.board_grid_style = style;
+                }
+                preferences.set_grid_visible(true, style != grid::Style::Off);
+            }
         });
         settings::row_with_keywords(ui, "Grid opacity", &["transparency", "fade", "dots"], |ui| {
             grid::opacity_control(ui, &mut preferences.grid_opacity_percent);
@@ -361,6 +415,22 @@ fn appearance(ui: &mut Ui, data: &mut PageData<'_>) {
         });
         settings::hint(ui, "Coordinates and the grid show in this unit, and numbers typed without one use it. Stored geometry never changes.");
     });
+}
+
+/// Preview the percentage in the slider during a pointer drag and apply it on release.
+/// Keyboard steps apply immediately, while the number field applies a typed value on confirmation.
+fn interface_scale(ui: &mut Ui, scale: &mut u16, pending: &mut Option<u16>) {
+    let mut value = pending.take().unwrap_or(*scale);
+    let slider = egui::Slider::new(&mut value, SCALE_RANGE).step_by(5.0).suffix("%").update_while_editing(false);
+    let response = ui.add(slider).accessible_name("Interface scale");
+    if !ui.input(|input| input.focused) {
+        return;
+    }
+    if response.is_pointer_button_down_on() {
+        *pending = Some(value);
+    } else if response.drag_stopped_by(egui::PointerButton::Primary) || response.changed() {
+        *scale = value;
+    }
 }
 
 /// How the scroll wheel and pointer move around the schematic.
@@ -378,7 +448,7 @@ fn navigation(ui: &mut Ui, data: &mut PageData<'_>) {
             settings::segmented(ui, &mut navigation.reverse_zoom, &[(false, "Normal"), (true, "Reversed")]);
         });
         settings::row(ui, "Zoom speed", |ui| {
-            ui.add(egui::Slider::new(&mut navigation.zoom_speed_percent, ZOOM_SPEED_RANGE).step_by(10.0).suffix("%"));
+            ui.add(egui::Slider::new(&mut navigation.zoom_speed_percent, ZOOM_SPEED_RANGE).step_by(10.0).suffix("%")).accessible_name("Zoom speed");
         });
     });
     settings::section(ui, "Zoom", |ui| {
@@ -454,6 +524,23 @@ fn shortcuts_page(ui: &mut Ui, data: &mut PageData<'_>) {
 mod tests {
     use super::*;
 
+    /// Older settings keep their grid defaults. Enabling one legacy opacity-zero grid leaves
+    /// the other hidden and supplies a visible PCB style without changing the snap interval.
+    #[test]
+    fn grid_visibility_restores_legacy_hidden_settings_per_workspace() {
+        let mut preferences = Preferences::parse("{\"grid_opacity_percent\":0}");
+        assert!(!preferences.grid_visible(false) && !preferences.grid_visible(true));
+        let spacing = preferences.schematic_grid_nm;
+        preferences.set_grid_visible(true, true);
+        assert!(preferences.grid_visible(true));
+        assert!(!preferences.grid_visible(false));
+        assert_eq!(preferences.board_grid_style, grid::Style::Dots);
+        preferences.set_grid_visible(false, true);
+        assert!(preferences.grid_visible(false));
+        assert_eq!(preferences.schematic_grid_nm, spacing);
+        assert_eq!(Preferences::parse(&preferences.to_text()), preferences);
+    }
+
     #[test]
     fn saved_settings_come_back() {
         let preferences = Preferences {
@@ -461,8 +548,11 @@ mod tests {
             scale_percent: 110,
             navigation: Navigation { scroll: ScrollAction::Pan, reverse_zoom: true, zoom_speed_percent: 150, zoom_around: ZoomAround::Center },
             grid_opacity_percent: 35,
+            schematic_grid_visible: false,
+            board_grid_visible: true,
             board_grid_style: grid::Style::Dots,
             schematic_grid_nm: 25 * grid::NM_PER_MIL,
+            board_grid_nm: 10 * grid::NM_PER_MIL,
             auto_heal_wires: false,
             selection_follow: SelectionFollow::SecondaryFollowsPrimary,
             units: Unit::Mm,
@@ -496,16 +586,23 @@ mod tests {
         assert_eq!(Preferences::parse("{\"grid_opacity_percent\":101}").grid_opacity_percent, grid::OPACITY_DEFAULT);
         assert_eq!(Preferences::parse("{\"grid_opacity_percent\":-1}"), Preferences::default());
         assert_eq!(older.schematic_grid_nm, grid::SCHEMATIC_SPACING_DEFAULT_NM);
+        assert_eq!(older.board_grid_nm, grid::BOARD_SPACING_DEFAULT_NM);
         assert_eq!(Preferences::parse("{\"schematic_grid_nm\":635000}").schematic_grid_nm, 635_000);
+        assert_eq!(Preferences::parse("{\"board_grid_nm\":254000}").board_grid_nm, 254_000);
         // An out-of-range spacing resets only itself; a value of the wrong type is unreadable,
         // so everything falls back.
         for bad in ["0", "-1270000", "999999999999"] {
             let parsed = Preferences::parse(&format!("{{\"schematic_grid_nm\":{bad},\"grid_opacity_percent\":40}}"));
             assert_eq!(parsed.schematic_grid_nm, grid::SCHEMATIC_SPACING_DEFAULT_NM, "{bad}");
             assert_eq!(parsed.grid_opacity_percent, 40, "{bad}");
+            let parsed = Preferences::parse(&format!("{{\"board_grid_nm\":{bad},\"grid_opacity_percent\":40}}"));
+            assert_eq!(parsed.board_grid_nm, grid::BOARD_SPACING_DEFAULT_NM, "{bad}");
+            assert_eq!(parsed.grid_opacity_percent, 40, "{bad}");
         }
         for bad in ["1.5", "\"50 mil\""] {
             let parsed = Preferences::parse(&format!("{{\"schematic_grid_nm\":{bad},\"grid_opacity_percent\":40}}"));
+            assert_eq!(parsed, Preferences::default(), "{bad}");
+            let parsed = Preferences::parse(&format!("{{\"board_grid_nm\":{bad},\"grid_opacity_percent\":40}}"));
             assert_eq!(parsed, Preferences::default(), "{bad}");
         }
     }
@@ -526,8 +623,11 @@ mod tests {
             scale_percent: 150,
             navigation: Navigation { reverse_zoom: true, ..Navigation::default() },
             grid_opacity_percent: 20,
+            schematic_grid_visible: false,
+            board_grid_visible: false,
             board_grid_style: grid::Style::Lines,
             schematic_grid_nm: 10 * grid::NM_PER_MIL,
+            board_grid_nm: 25 * grid::NM_PER_MIL,
             auto_heal_wires: false,
             selection_follow: SelectionFollow::Both,
             units: Unit::Mm,
@@ -542,8 +642,19 @@ mod tests {
         assert_eq!(preferences.selection_follow, SelectionFollow::Off);
         assert_eq!((preferences.theme, preferences.grid_opacity_percent), (ThemeChoice::Light, 20));
         restore_page_defaults(&mut preferences, APPEARANCE);
-        assert_eq!(preferences, Preferences { schematic_grid_nm: 10 * grid::NM_PER_MIL, auto_heal_wires: false, ..Preferences::default() });
+        assert_eq!(
+            preferences,
+            Preferences {
+                schematic_grid_nm: 10 * grid::NM_PER_MIL,
+                board_grid_nm: 25 * grid::NM_PER_MIL,
+                auto_heal_wires: false,
+                ..Preferences::default()
+            }
+        );
         restore_page_defaults(&mut preferences, SCHEMATIC);
-        assert_eq!(preferences, Preferences { schematic_grid_nm: 10 * grid::NM_PER_MIL, ..Preferences::default() });
+        assert_eq!(
+            preferences,
+            Preferences { schematic_grid_nm: 10 * grid::NM_PER_MIL, board_grid_nm: 25 * grid::NM_PER_MIL, ..Preferences::default() }
+        );
     }
 }

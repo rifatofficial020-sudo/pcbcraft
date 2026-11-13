@@ -24,7 +24,7 @@ impl PcbApp {
     /// the Parts Catalog focuses search, like Capture › Symbol; an open chooser is left alone.
     /// Selection filters require a project view; definition-view requests fail without changing state.
     pub(super) fn set_panel(&mut self, ctx: &Context, panel: Panel, open: bool) -> Result<(), String> {
-        if panel == Panel::Filters && self.views.active.definition.is_some() {
+        if panel == Panel::Filters && self.views.active.auxiliary() {
             return Err("Selection filters require a project view".into());
         }
         match panel {
@@ -59,7 +59,7 @@ impl PcbApp {
             Panel::Parts => self.parts.open,
             Panel::Nets => self.net_inspector.open,
             Panel::Properties => self.properties_open,
-            Panel::Filters => self.views.active.definition.is_none() && self.views.active.filters_open,
+            Panel::Filters => !self.views.active.auxiliary() && self.views.active.filters_open,
         }
     }
 
@@ -117,6 +117,7 @@ mod live {
     use crate::{
         Dialog, PcbApp, ViewId, Workspace,
         arrangements::{Action, Start},
+        canvas_camera::MAX_BOARD_ZOOM,
         editor_layout::HostId,
         editor_windows::ViewAction,
         preferences::{Preferences, ScrollAction, SelectionFollow, ThemeChoice, ZoomAround},
@@ -144,6 +145,8 @@ mod live {
         Arrangement,
         /// An arrangement name: 1 to 80 characters on one line.
         Name,
+        /// Library search text may be empty to clear a filter.
+        Query,
         Bool,
         /// Opaque sRGB #RRGGBB, or null to restore a physical-role default.
         Color,
@@ -177,6 +180,7 @@ mod live {
                     json!({"type": "integer", "minimum": 0})
                 }
                 Self::Object => json!({"type":"string","format":"uuid"}),
+                Self::Query => json!({"type":"string","maxLength":512}),
                 Self::Name => json!({"type": "string", "minLength": 1, "maxLength": 80}),
                 Self::Bool => json!({"type": "boolean"}),
                 Self::Color => json!({"oneOf":[{"type":"string","pattern":"^#[0-9A-Fa-f]{6}$"},{"type":"null"}]}),
@@ -188,7 +192,7 @@ mod live {
                 Self::Selection => {
                     let mut labels = ids.clone();
                     labels["maxItems"] = json!(pcbcraft_engine::net_labels::MAX_LABELS);
-                    json!({"type": "object", "properties": {"symbols": ids, "wires": ids, "net_labels": labels}, "required": ["symbols", "wires"], "additionalProperties": false})
+                    json!({"type": "object", "properties": {"symbols": ids, "wires": ids, "net_labels": labels, "no_connects": pcbcraft_engine::selection::Selection::marker_schema()}, "required": ["symbols", "wires"], "additionalProperties": false})
                 }
                 Self::Footprints => ids,
             }
@@ -209,6 +213,7 @@ mod live {
                 Self::View | Self::Window | Self::Arrangement | Self::LibraryDocument | Self::LibraryRevision | Self::LibraryPrimitive => {
                     value.as_u64().is_some()
                 }
+                Self::Query => value.as_str().is_some_and(|s| s.len() <= 512),
                 Self::Name => value.as_str().is_some(),
                 Self::Bool => value.is_boolean(),
                 Self::Color => value.is_null() || value.as_str().is_some_and(|text| crate::board_appearance::parse_color(text).is_ok()),
@@ -232,6 +237,7 @@ mod live {
                 Self::Window => "must be a window ID from inspect_editor".to_owned(),
                 Self::Arrangement => "must be an arrangement ID from inspect_editor".to_owned(),
                 Self::Object => "must be an object UUID from project inspection".to_owned(),
+                Self::Query => "must be library search text of at most 512 bytes".into(),
                 Self::Name => "must be a name".to_owned(),
                 Self::Bool => "must be true or false".to_owned(),
                 Self::Color => "must be #RRGGBB or null to restore the default".to_owned(),
@@ -332,7 +338,7 @@ mod live {
     const ZOOM_AROUND: &[&str] = &["pointer", "center"];
     const PANELS: &[&str] = &["browser", "parts", "nets", "properties", "selection_filters"];
     const CATALOG_MODES: &[&str] = &["expanded", "compact"];
-    const TABS: &[&str] = &["capture", "layout", "analyze", "libraries", "manage", "view"];
+    const TABS: &[&str] = &["capture", "layout", "sheets", "analyze", "libraries", "manage", "route", "draw", "manufacture", "view"];
     const WORKSPACES: &[&str] = &["schematic", "board"];
     const PLACEMENTS: &[&str] = &["here", "beside", "window"];
     const BOARD_GRIDS: &[&str] = &["off", "dots", "lines"];
@@ -358,10 +364,52 @@ mod live {
                     name: "workspace",
                     summary: "Workspace to enter",
                     required: true,
-                    kind: Kind::Choice(&["schematic", "board", "symbol_editor", "footprint_editor"]),
+                    kind: Kind::Choice(&["schematic", "board", "symbol_editor", "footprint_editor", "library"]),
                 },
                 Param { name: "view", summary: "Source pane; defaults to focused main pane", required: false, kind: Kind::View },
                 Param { name: "placement", summary: "Where to open it", required: false, kind: Kind::Choice(PLACEMENTS) },
+            ],
+        },
+        WindowCommand {
+            id: "app.library_source",
+            title: "Manage Library Source",
+            summary: "Run Library workspace source management. Add/relocate use native pickers; Delete requires the same folder/count confirmation as the GUI. No project edits.",
+            params: &[
+                VIEW,
+                Param {
+                    name: "action",
+                    summary: "Source operation",
+                    required: true,
+                    kind: Kind::Choice(&["add", "refresh", "relocate", "remove", "delete"]),
+                },
+                Param { name: "source", summary: "Registration ID, defaults to selected source", required: false, kind: Kind::Name },
+            ],
+        },
+        WindowCommand {
+            id: "app.library_browse",
+            title: "Browse Library",
+            summary: "Change a Library pane's source, Type, search or selected item without changing project revision/history. Inspect its selection through inspect_editor.",
+            params: &[
+                VIEW,
+                Param { name: "source", summary: "Registration ID", required: false, kind: Kind::Name },
+                Param { name: "query", summary: "Search text; empty clears it", required: false, kind: Kind::Query },
+                Param {
+                    name: "type",
+                    summary: "0 all, 1 symbols, 2 footprints, 3 generic parts, 4 orderable parts",
+                    required: false,
+                    kind: Kind::Integer { min: 0, max: 4, step: 1 },
+                },
+                Param { name: "item", summary: "Item ID within selected source and Type", required: false, kind: Kind::Name },
+                Param {
+                    name: "preview",
+                    summary: "Independent read-only geometry camera",
+                    required: false,
+                    kind: Kind::Choice(&["symbol", "footprint"]),
+                },
+                setting("fit", "Reset the selected preview camera", Kind::Bool),
+                setting("zoom_percent", "Preview zoom relative to Fit", Kind::Integer { min: 25, max: 1600, step: 1 }),
+                setting("pan_x", "Preview horizontal offset in logical points; requires pan_y", Kind::Integer { min: -100000, max: 100000, step: 1 }),
+                setting("pan_y", "Preview vertical offset in logical points; requires pan_x", Kind::Integer { min: -100000, max: 100000, step: 1 }),
             ],
         },
         WindowCommand {
@@ -525,10 +573,15 @@ mod live {
         WindowCommand {
             id: "view.zoom",
             title: "Zoom",
-            summary: "Zoom the view about its center. 100 shows the schematic at its default size.",
+            summary: "Zoom about the view center. The limit is 6400% in PCB layout and 800% in the schematic.",
             params: &[
                 VIEW,
-                Param { name: "zoom_percent", summary: "The zoom in percent", required: true, kind: Kind::Integer { min: 1, max: 800, step: 1 } },
+                Param {
+                    name: "zoom_percent",
+                    summary: "The zoom in percent",
+                    required: true,
+                    kind: Kind::Integer { min: 1, max: (MAX_BOARD_ZOOM * 100.0) as i64, step: 1 },
+                },
             ],
         },
         WindowCommand {
@@ -577,6 +630,12 @@ mod live {
             params: &[VIEW, Param { name: "visible", summary: "Show accepted connections", required: true, kind: Kind::Bool }],
         },
         WindowCommand {
+            id: "view.set_board_flipped",
+            title: "Flip Board View",
+            summary: "View the board from below or above in this PCB view, as Design › Flip view does. Keeps the centered point and zoom; changes no project data or undo history.",
+            params: &[VIEW, Param { name: "flipped", summary: "Show the board from below", required: true, kind: Kind::Bool }],
+        },
+        WindowCommand {
             id: "view.set_layer_color",
             title: "Layer Color",
             summary: "Set or reset a board's personal layer color, through the same handler as its swatch. Shared by every view of that board, saved locally and excluded from project files/undo.",
@@ -610,11 +669,13 @@ mod live {
                     name: "panel",
                     summary: "Which contextual card",
                     required: true,
-                    kind: Kind::Choice(&["layers", "properties", "selection_filters"]),
+                    kind: Kind::Choice(&["layers", "properties", "selection_filters", "preview"]),
                 },
                 Param { name: "position", summary: "Edge anchor or floating", required: true, kind: Kind::Choice(&["left", "right", "floating"]) },
                 setting("x", "Floating offset from the canvas left, in logical points", Kind::Integer { min: -100000, max: 100000, step: 1 }),
                 setting("y", "Floating offset from the canvas top, in logical points", Kind::Integer { min: -100000, max: 100000, step: 1 }),
+                setting("width", "Floating Library Preview width; requires height", Kind::Integer { min: 1, max: 100000, step: 1 }),
+                setting("height", "Floating Library Preview height; requires width", Kind::Integer { min: 1, max: 100000, step: 1 }),
             ],
         },
         WindowCommand {
@@ -627,7 +688,10 @@ mod live {
                 setting("wires", "Select schematic wires", Kind::Bool),
                 setting("sheets", "Select hierarchical sheet symbols", Kind::Bool),
                 setting("labels", "Select hierarchical labels", Kind::Bool),
+                setting("no_connects", "Select no-connect markers", Kind::Bool),
                 setting("footprints", "Select board footprints", Kind::Bool),
+                setting("tracks", "Select board tracks", Kind::Bool),
+                setting("vias", "Select board vias", Kind::Bool),
                 setting("graphics", "Select board graphics", Kind::Bool),
                 setting("collapsed", "Collapse the filter card", Kind::Bool),
                 setting("open", "Show the filter card", Kind::Bool),
@@ -636,13 +700,13 @@ mod live {
         WindowCommand {
             id: "view.select",
             title: "Select",
-            summary: "Replace a schematic view's selection with these symbols, wires and named-net anchors, as clicking or box selection does. Empty lists clear it. Other views highlight it under the Follow selection setting. PCB views take view.select_footprints.",
+            summary: "Replace a schematic view's selection with these symbols, wires, named-net anchors and no-connect markers, as clicking or box selection does. Empty lists clear it. Other views highlight it under the Follow selection setting. PCB views take view.select_footprints.",
             params: &[VIEW, Param { name: "items", summary: "IDs from inspect_project", required: true, kind: Kind::Selection }],
         },
         WindowCommand {
             id: "view.select_footprints",
             title: "Select Footprints",
-            summary: "Replace a PCB view's selection with these footprints, as clicking them or their Browser rows does. An empty list clears it. Other views highlight the counterpart symbols under the Follow selection setting.",
+            summary: "Replace a PCB view's selection with these footprints, or select one footprint's reference text using element=reference. An empty footprint list clears selection. Other views highlight the counterpart symbols under the Follow selection setting.",
             params: &[
                 VIEW,
                 Param {
@@ -650,6 +714,12 @@ mod live {
                     summary: "Footprint IDs on the view's board, from inspect_project",
                     required: true,
                     kind: Kind::Footprints,
+                },
+                Param {
+                    name: "element",
+                    summary: "Select footprint bodies (default) or one placement's reference text and Properties",
+                    required: false,
+                    kind: Kind::Choice(&["footprint", "reference"]),
                 },
             ],
         },
@@ -686,7 +756,7 @@ mod live {
         WindowCommand {
             id: "window.set_ribbon_tab",
             title: "Ribbon Tab",
-            summary: "Show a schematic ribbon tab (Capture, Analyze, Libraries, Manage, View) or a PCB ribbon tab (Layout, Libraries, View).",
+            summary: "Show a schematic tab (Capture, Sheets, Analyze, Libraries, View) or PCB tab (Layout, Draw, Analyze, Manufacture, Libraries, View). Manage aliases Sheets; Route aliases Layout.",
             params: &[WINDOW, Param { name: "tab", summary: "Which tab", required: true, kind: Kind::Choice(TABS) }],
         },
         WindowCommand {
@@ -732,6 +802,8 @@ mod live {
                 setting("scale_percent", "The interface scale", Kind::Integer { min: 75, max: 200, step: 5 }),
                 setting("units", "The unit lengths and coordinates are shown in", Kind::Choice(UNITS)),
                 setting("grid_opacity_percent", "How strongly the grid shows; 0 hides it", Kind::Integer { min: 0, max: 100, step: 5 }),
+                setting("schematic_grid_visible", "Show the schematic grid; true restores zero opacity", Kind::Bool),
+                setting("board_grid_visible", "Show the PCB grid; true overrides Off and zero opacity", Kind::Bool),
                 setting("board_grid_style", "How PCB views draw their grid", Kind::Choice(BOARD_GRIDS)),
                 setting("selection_follow", "Which views pan to reveal another view's selection", Kind::Choice(FOLLOW)),
                 setting("scroll", "What the mouse wheel does on the canvas", Kind::Choice(SCROLL)),
@@ -785,6 +857,8 @@ mod live {
             "scale_percent": preferences.scale_percent,
             "units": preferences.units.symbol(),
             "grid_opacity_percent": preferences.grid_opacity_percent,
+            "schematic_grid_visible": preferences.schematic_grid_visible,
+            "board_grid_visible": preferences.board_grid_visible,
             "board_grid_style": match preferences.board_grid_style {
                 grid::Style::Off => "off",
                 grid::Style::Dots => "dots",
@@ -798,7 +872,9 @@ mod live {
         })
     }
 
-    /// The settings with the given (already validated) changes applied; the rest are kept.
+    /// Apply validated settings, then explicit visibility requests. Visibility wins over an
+    /// accompanying Off style or zero opacity, restoring dots/default opacity when needed.
+    /// Without a visibility request, explicit style and opacity remain unchanged.
     fn updated_preferences(mut preferences: Preferences, params: &Value) -> Preferences {
         let text = |key: &str| params.get(key).and_then(Value::as_str);
         let number = |key: &str| params.get(key).and_then(Value::as_u64);
@@ -824,6 +900,11 @@ mod live {
                 "lines" => grid::Style::Lines,
                 _ => grid::Style::Off,
             };
+        }
+        for (key, board) in [("board_grid_visible", true), ("schematic_grid_visible", false)] {
+            if let Some(visible) = params.get(key).and_then(Value::as_bool) {
+                preferences.set_grid_visible(board, visible);
+            }
         }
         if let Some(follow) = text("selection_follow") {
             preferences.selection_follow = match follow {
@@ -851,6 +932,7 @@ mod live {
     /// Name the view's unfinished gesture, if any.
     fn tool_name(tool: &Tool) -> &'static str {
         match tool {
+            Tool::NoConnect { .. } => "no_connect",
             Tool::Field { .. } => "move_symbol_field",
             Tool::NetLabel { .. } => "net_label",
             Tool::SheetGesture { .. } => "sheet_geometry",
@@ -881,7 +963,7 @@ mod live {
                     "focused_view": host.focused.0,
                     "split": host.split(),
                     "panels": {"browser": panels.browser, "parts": panels.parts, "nets": panels.nets, "properties":panels.properties,
-                        "selection_filters": app.views.view(host.focused).is_some_and(|view| view.definition.is_none() && view.filters_open)},
+                        "selection_filters": app.views.view(host.focused).is_some_and(|view| !view.auxiliary() && view.filters_open)},
                     "catalog_mode": panels.catalog_mode,
                     "repeat_placement": panels.repeat_placement,
                     "ribbon_tab": app.inspect_library_view(host.focused).map(|v|v["ribbon_tab"].clone()).unwrap_or_else(|| json!(match panels.ribbon {
@@ -904,15 +986,16 @@ mod live {
                     "window": window.0,
                     "focused": focused,
                     "primary": id == app.views.primary(),
-                    "workspace": view.definition.and_then(|id|app.library_kind(id)).map(|kind|if kind==pcbcraft_engine::authoring::Kind::Symbol {"symbol_editor"} else {"footprint_editor"}).unwrap_or(match view.workspace {Workspace::Schematic=>"schematic",Workspace::Board=>"board"}),
+                    "workspace": if view.library.is_some() {"library"} else {view.definition.and_then(|id|app.library_kind(id)).map(|kind|if kind==pcbcraft_engine::authoring::Kind::Symbol {"symbol_editor"} else {"footprint_editor"}).unwrap_or(match view.workspace {Workspace::Schematic=>"schematic",Workspace::Board=>"board"})},
                     "definition":view.definition,
                     "library_view":app.inspect_library_view(id),
+                    "library_workspace":view.library.as_ref().map(|state|state.inspect()),
                     "sheet": view.sheet_path(&app.session),
                     "sheet_id": match view.target() {Some(crate::editor_view::DocumentTarget::Sheet(sheet))=>Some(sheet.id()),_=>None},
                     "grid_spacing_nm": view.camera.snap_nm(),
                     "selection_filters": view.filters.inspect(view.workspace),
                     "selection_filters_collapsed": view.filters_collapsed,
-                    "selection_filters_open": view.definition.is_none() && view.filters_open,
+                    "selection_filters_open": !view.auxiliary() && view.filters_open,
                     "panel_positions": crate::workspace_panels::inspect(&view.panels),
                     "zoom_percent": (view.camera.zoom() * 100.0).round(),
                     "center": view.camera.center(),
@@ -921,10 +1004,12 @@ mod live {
                     "tool": view.schematic.tool.as_ref().map(tool_name),
                     "board": (view.workspace == Workspace::Board).then(|| json!({
                         "selection": view.board.selection,
+                        "reference_selection": view.board.reference.selected,
                         "hidden_layers": view.board.hidden_layers,
                         "ratsnest_visible": view.board.target.and_then(|target| app.session.project().and_then(|project| project.board_view(target)))
                             .filter(|board| board.has_accepted_connectivity()).map(|_| !view.board.hidden_layers.contains(crate::editor_view::RATSNEST_KEY)),
                         "active_layer": view.board.active_layer,
+                        "flipped": view.camera.mirrored(),
                         "layer_colors": view.board.target.and_then(|target|app.session.project().and_then(|project|project.board_view(target)))
                             .map(|board|board.layers().iter().map(|layer|json!({"layer":layer.id,"color":crate::board_appearance::hex(app.board_appearance.color(board,layer)),"overridden":app.board_appearance.overridden(board.target,&layer.id.to_string())})).collect::<Vec<_>>()),
                         "copper_colors": view.board.target.and_then(|target|app.session.project().and_then(|project|project.board_view(target)))
@@ -1040,6 +1125,9 @@ mod live {
                 self.bind_editor_host(self.views.main);
                 return result;
             }
+            if matches!(id, "app.library_source" | "app.library_browse") {
+                return self.library_workspace_command(ctx, id, params);
+            }
             if id.starts_with("app.library_") {
                 return self.library_command(ctx, id, params);
             }
@@ -1078,11 +1166,10 @@ mod live {
                 None => None,
             };
             if let Some((view, _)) = view {
-                let definition = self.views.view(view).and_then(|view| view.definition);
-                if definition.is_none() && self.session.project().is_none() {
+                if !self.views.view(view).is_some_and(|v| v.auxiliary()) && self.session.project().is_none() {
                     return Err("No project is open.".into());
                 }
-                if definition.is_some()
+                if self.views.view(view).is_some_and(|v| v.auxiliary())
                     && !matches!(
                         id,
                         "view.focus"
@@ -1163,7 +1250,12 @@ mod live {
                 ("view.zoom", Some((view, _)), _) => {
                     let percent = params["zoom_percent"].as_u64().unwrap_or(100);
                     if let Some(view) = self.views.view_mut(view) {
-                        view.camera.set_zoom(percent as f32 / 100.0);
+                        let max_zoom = view.workspace.max_zoom();
+                        let max_percent = (max_zoom * 100.0) as u64;
+                        if percent > max_percent {
+                            return Err(format!("`zoom_percent` must be at most {max_percent} for this workspace."));
+                        }
+                        view.camera.set_zoom_with_limit(percent as f32 / 100.0, max_zoom);
                     }
                 }
                 ("view.navigate_layer", Some((view, _)), _) => self.navigate_board_layer(view, params["direction"].as_str().unwrap_or_default())?,
@@ -1183,6 +1275,11 @@ mod live {
                         .ok_or("The addressed view closed")?
                         .board
                         .set_ratsnest_visibility(params["visible"].as_bool() == Some(true));
+                }
+                ("view.set_board_flipped", Some((view, _)), _) => {
+                    let state =
+                        self.views.view_mut(view).filter(|view| view.workspace == Workspace::Board).ok_or("The addressed view must show a board")?;
+                    state.camera.set_mirrored(params["flipped"].as_bool() == Some(true));
                 }
                 ("view.set_layer_color", Some((view, _)), _) => {
                     let rgb = params["color"].as_str().map(crate::board_appearance::parse_color).transpose()?;
@@ -1237,6 +1334,10 @@ mod live {
                 }
                 ("view.select_footprints", Some((view, _)), _) => {
                     let wanted = footprints(&params["footprints"]).ok_or("`footprints` must be a list of distinct footprint IDs")?;
+                    let reference = params["element"].as_str() == Some("reference");
+                    if reference && wanted.len() != 1 {
+                        return Err("Reference selection requires exactly one footprint ID".into());
+                    }
                     let placed: std::collections::BTreeSet<String> = self
                         .views
                         .view(view)
@@ -1256,7 +1357,13 @@ mod live {
                     let previous = self.views.active.id();
                     self.views.bind(view);
                     self.views.active.cancel_gesture();
-                    self.views.select_board(wanted, &self.session, self.preferences.selection_follow);
+                    if reference {
+                        if let Some(footprint) = wanted.into_iter().next() {
+                            self.views.select_board_reference(footprint, &self.session, self.preferences.selection_follow);
+                        }
+                    } else {
+                        self.views.select_board(wanted, &self.session, self.preferences.selection_follow);
+                    }
                     self.views.bind(previous);
                 }
                 ("view.open_sheet", Some((view, _)), _) => {
@@ -1274,8 +1381,8 @@ mod live {
                     self.apply_view_action(ctx, view, ViewAction::Workspace { workspace, placement });
                 }
                 ("view.select", Some((view, _)), _) => {
-                    let items =
-                        Selection::parse(&params["items"]).ok_or("`items` must contain symbol, wire and optional named-net anchor ID lists")?;
+                    let items = Selection::parse(&params["items"])
+                        .ok_or("`items` must contain symbol/wire lists and optional named-net anchors or no-connect targets")?;
                     let mut filtered = items.clone();
                     if let Some(state) = self.views.view(view) {
                         state.filters.retain(&mut filtered, state.snapshot(&self.session).as_deref());
@@ -1334,16 +1441,17 @@ mod live {
                     if self.views.hosts.get(&host).and_then(|host| self.views.view(host.focused)).is_some_and(|view| view.definition.is_some()) {
                         return Err("Use app.library_view to select the authoring ribbon tab.".into());
                     }
-                    let tab = crate::ribbon::tab_slot(params["tab"].as_str().unwrap_or_default());
-                    if !crate::ribbon::BOARD_TAB_ORDER.contains(&tab)
-                        && self
-                            .views
-                            .hosts
-                            .get(&host)
-                            .and_then(|host| self.views.view(host.focused))
-                            .is_some_and(|view| view.workspace == Workspace::Board)
-                    {
-                        return Err("This ribbon tab is available in the schematic workspace.".into());
+                    let name = params["tab"].as_str().unwrap_or_default();
+                    let tab = crate::ribbon::tab_slot(name);
+                    let board = self
+                        .views
+                        .hosts
+                        .get(&host)
+                        .and_then(|host| self.views.view(host.focused))
+                        .is_some_and(|view| view.workspace == Workspace::Board);
+                    let allowed: &[usize] = if board { &crate::ribbon::BOARD_TAB_ORDER } else { &crate::ribbon::TAB_ORDER };
+                    if !allowed.contains(&tab) || (board && name == "capture") || (!board && matches!(name, "layout" | "route")) {
+                        return Err(format!("This ribbon tab is available in the {} workspace.", if board { "schematic" } else { "PCB" }));
                     }
                     self.in_window(host, |app| app.ribbon_tab = tab);
                 }
@@ -1469,6 +1577,9 @@ mod live {
             assert_eq!(updated_preferences(Preferences::default(), &inspected), changed);
             assert_eq!(updated_preferences(changed, &json!({})), changed);
             assert_eq!(changed.scale_percent, Preferences::default().scale_percent);
+            let hidden = updated_preferences(changed, &json!({"schematic_grid_visible":false,"board_grid_visible":false,"grid_opacity_percent":0}));
+            assert!(!hidden.grid_visible(false) && !hidden.grid_visible(true));
+            assert_eq!(updated_preferences(Preferences::default(), &inspect_preferences(&hidden)), hidden);
         }
     }
 }

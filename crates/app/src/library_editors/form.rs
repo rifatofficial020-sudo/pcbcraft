@@ -16,7 +16,13 @@ impl Draft {
     pub(super) fn new(item: &Item, object: Option<u64>, revision: u64) -> Self {
         let mut value=object.and_then(|id|item.objects.get(&id)).and_then(|primitive|serde_json::to_value(primitive).ok()).unwrap_or_else(||json!({"operation":"metadata","name":item.name,"license":item.license,"source":item.source,"reference_prefix":item.reference_prefix,"default_value":item.default_value}));
         if object.is_none() && item.kind == Kind::Symbol {
-            value["symbol_settings"] = json!({"behavior":item.behavior,"defaults":item.defaults});
+            value["symbol_settings"] = json!({"behavior":item.behavior,"defaults":item.defaults,"category":item.category});
+        }
+        if object.is_none() && item.kind == Kind::Footprint {
+            value["footprint_reference"] = json!({
+                "enabled": item.reference_font.is_some(),
+                "offset": item.reference_offset.unwrap_or(pcbcraft_engine::board::DEFAULT_REFERENCE_OFFSET),
+            });
         }
         if let Some(pad) = value.get_mut("pad").and_then(Value::as_object_mut) {
             pad.entry("corner_radius_nm").or_insert(json!(0));
@@ -30,16 +36,32 @@ impl Draft {
     }
     /// Use human-readable fields rather than exposing serialization keys or a JSON text editor.
     pub(super) fn show(&mut self, ui: &mut Ui, expanded: bool) {
-        if self.value["type"] == "pin" && self.value.get("appearance").is_none() && ui.button("Add pin lead").clicked() {
+        if self.value["type"] == "pin" && self.value.get("appearance").is_none() && pcbcraft_chrome::controls::button(ui, "Add pin lead").clicked() {
             self.value["appearance"] = serde_json::to_value(pcbcraft_engine::schematic::PinAppearance::default()).unwrap_or(Value::Null);
         }
         let pad = self.value["type"] == "pad";
         let mut hidden = Vec::new();
+        // Preserve category references in metadata edits without exposing raw identity fields
+        // as a substitute for a category-selection workflow.
+        if self.kind == Kind::Symbol {
+            hidden.push("category");
+        }
         if self.kind == Kind::Footprint {
             hidden.push("fill");
         }
         if self.kind == Kind::Footprint && self.object.is_none() {
-            hidden.extend(["reference_prefix", "default_value"]);
+            hidden.extend(["reference_prefix", "default_value", "footprint_reference"]);
+            let reference = &mut self.value["footprint_reference"];
+            let mut enabled = reference["enabled"].as_bool().unwrap_or_default();
+            if ui.checkbox(&mut enabled, "Generate silkscreen reference").changed() {
+                reference["enabled"] = json!(enabled);
+            }
+            if enabled {
+                fields(ui, &mut reference["offset"], &mut self.numbers, ".footprint_reference.offset", expanded, &[]);
+            } else {
+                self.numbers.remove(".footprint_reference.offset.x_nm");
+                self.numbers.remove(".footprint_reference.offset.y_nm");
+            }
         }
         if pad {
             hidden.push("copper");
@@ -54,7 +76,7 @@ impl Draft {
             properties::choice(
                 ui,
                 "Pad type",
-                egui::Id::new("pad_type"),
+                egui::Id::unique("pad_type"),
                 &mut kind,
                 &[("smd", "SMD".into()), ("through_hole", "Through hole".into())],
             );
@@ -111,6 +133,9 @@ pub(super) fn title(draft: &Draft) -> String {
 /// Labels follow geometry semantics; explicit units remain beside length input.
 fn label(path: &str) -> String {
     let path = path.trim_start_matches('.');
+    if let Some(axis) = path.strip_prefix("footprint_reference.offset.") {
+        return if axis == "x_nm" { "Reference X offset (mm)" } else { "Reference Y offset (mm)" }.into();
+    }
     let names = path
         .split('.')
         .map(|part| match part {
@@ -169,6 +194,7 @@ fn choices(path: &str) -> &'static [&'static str] {
         _ => &[],
     }
 }
+
 /// Recurse over typed native properties. Compact forms omit long provenance/point tables;
 /// expanded forms retain the exact same field values and revision as the inspector.
 fn fields(ui: &mut Ui, value: &mut Value, numbers: &mut BTreeMap<String, (String, String)>, path: &str, expanded: bool, hidden: &[&str]) {
@@ -193,7 +219,7 @@ fn fields(ui: &mut Ui, value: &mut Value, numbers: &mut BTreeMap<String, (String
             }
         }
         Value::Bool(value) => {
-            ui.checkbox(value, label(path));
+            pcbcraft_chrome::controls::checkbox(ui, value, label(path));
         }
         Value::Number(number) => {
             let length = path.ends_with("_nm");
@@ -210,7 +236,7 @@ fn fields(ui: &mut Ui, value: &mut Value, numbers: &mut BTreeMap<String, (String
                 properties::text(ui, &label(path), text);
             } else {
                 let options = options.iter().map(|option| (*option, display(option))).collect::<Vec<_>>();
-                properties::choice(ui, &label(path), egui::Id::new(path), text, &options);
+                properties::choice(ui, &label(path), egui::Id::unique(path), text, &options);
             }
         }
         Value::Null if path.ends_with("drill_nm") => {
@@ -302,5 +328,26 @@ fn display(text: &str) -> String {
     match chars.next() {
         Some(first) => first.to_uppercase().chain(chars).collect(),
         None => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod category_tests {
+    use super::*;
+
+    /// Editing ordinary definition metadata must not discard a loaded symbol's typed category.
+    #[test]
+    fn metadata_draft_retains_an_existing_category_binding() {
+        let mut symbol = pcbcraft_engine::library::parse_symbol(include_str!("../../../../examples/native-parts/symbols/resistor.json")).unwrap();
+        symbol.library = "parts-demo".into();
+        symbol.provenance =
+            Some(pcbcraft_engine::library::sources::Provenance { library_name: "Native Parts Demo".into(), license: "MIT OR Apache-2.0".into() });
+        let item = Item::from_symbol(&symbol).unwrap();
+        let mut draft = Draft::new(&item, None, 0);
+        draft.value["name"] = json!("Renamed resistor");
+        let mut session = Session::new(item, false).unwrap();
+        session.execute(0, draft.action().unwrap()).unwrap();
+        assert_eq!(session.snapshot().category, symbol.category);
+        assert_eq!(session.snapshot().export_native().unwrap()["format"], "pcbcraft-symbol/3");
     }
 }

@@ -14,6 +14,7 @@ With Git and Rust 1.95 or later installed, clone a checkout you can edit:
 ```sh
 git clone https://github.com/tangency-labs/pcbcraft.git
 cd pcbcraft
+cargo build --locked -p pcbcraft -p pcbcraft-cli
 cargo run --locked -p pcbcraft
 ```
 
@@ -22,8 +23,31 @@ a working graphical session; a headless shell can run the checks and MCP example
 described below. See [Contributing](../CONTRIBUTING.md) for the toolchain and
 browser build commands.
 
+The Assistant uses `pcbcraft-cli` beside the desktop app to reach the open
+project. Build both binaries in the same profile; for a release build, add
+`--release` to both Cargo commands.
+
+If your existing project uses the previous `project.pc` folder or `.pc.zip`
+package layout, open it normally. Its first Save upgrades it automatically;
+opening it or showing its recent-project preview leaves its files unchanged.
+To create a separate converted copy instead, use
+`./target/debug/pcbcraft-cli convert /path/to/old-project /path/to/new-project`.
+The destination must not exist; a `.pc` destination creates a portable package.
+The [conversion guide](native-project-storage.md#convert-a-previous-split-project)
+explains supported old inputs and failure behavior. Converted copies and new
+projects store each board under its registered `boards/<folder>/board.json` path.
+Supported flat `project.json` projects open unchanged and migrate on their first
+Save, even without design edits; later unchanged saves produce no diff.
+The current format also retains one stable occurrence ID per sheet, stored beside
+the board in `instances.json` or in `project.json` for a schematic-only project.
+First Save adds these [occurrence records](sheet-occurrence-storage.md) to older
+board-folder projects while preserving their existing board paths.
+Named nets and explicitly promoted nets use a [sparse persistent registry](net-registry-storage.md)
+in those same instance homes. Its first record selects project/17, with
+instances/2 for a board; opening or inspecting an older project does not promote nets.
+
 On Home, choose **Open Project**, then **Project file or archive…**, and select
-`crates/app/tests/fixtures/split/two-resistors/project.pc` from your checkout.
+`crates/app/tests/fixtures/split/two-resistors/project.json` from your checkout.
 The folder contains two wired resistors and their pinned symbol definition.
 Use **File → Save As… → Project folder…** to save your own copy in a new or empty
 folder outside the checkout before making changes. This keeps the tracked test
@@ -46,8 +70,8 @@ trunk serve --locked
 ```
 
 Open [the local app](http://127.0.0.1:8781) and upload
-`crates/app/tests/fixtures/split/two-resistors.pc.zip`. The browser needs the
-archive, because uploading `project.pc` alone does not include its companion
+`crates/app/tests/fixtures/split/two-resistors.pc`. The browser needs the
+archive, because uploading `project.json` alone does not include its companion
 documents. To begin an empty design on either platform, choose **New Schematic**
 or **New PCB** on Home. Each opens an **Untitled** project in the chosen workspace,
 with an empty sheet. **New Schematic** starts without a physical board; **New PCB**
@@ -81,7 +105,8 @@ the same `VCC` net name, which can be changed before placement.
 
 1. Drag a resistor on the canvas; its wire endpoint follows. Use **Undo**, then
    **Redo**, to check that the move is one edit. Select a resistor and press
-   **E** to change its reference or value, or **R** to rotate it. Hover and press
+   **E** to change its reference or value, **R** to rotate it, or **X**/**Y** to
+   mirror it horizontally/vertically about its center. Hover and press
    **G** to grab a symbol with its wires attached, then click to place it.
    **M** picks up
    the selected symbol while leaving its wiring in place; with nothing selected,
@@ -90,7 +115,8 @@ the same `VCC` net name, which can be changed before placement.
    to the preserved wire ends.
 2. Press **A** to open the **Parts Catalog** and focus search. The bundled
    **Default** and **Power** libraries load through the same native source path
-   as added libraries. Select a library,
+   as added libraries. Sources marks them **Built-in** and keeps their registrations
+   read-only; external sources remain removable. Select a library,
    search for a capacitor and click the result to inspect its preview. Choose
    **Place**, then click the canvas to place it. **R** rotates the placement
    preview and **Esc** cancels it. **Repeat placement** keeps placing copies with
@@ -98,11 +124,21 @@ the same `VCC` net name, which can be changed before placement.
    catalog or the active tool's right-click menu, then press **Esc** to stop.
    Double-clicking a result or pressing **Enter**
    also starts placement; dragging a result onto the canvas places it directly.
+   Overlapping drawings show an amber count badge with references on hover.
+   Placement remains allowed; finish placement, then right-click → **Select symbol**
+   to choose a hidden symbol before moving it.
    **Manage libraries…** in the catalog or **Libraries → Sources** adds native
    library folders on desktop or uploads a portable library bundle on either
    platform. Try the original [Workshop source example](native-library-sources.md),
    then select Workshop in the catalog. Placed symbols keep their pinned
-   definition and license attribution after the source is removed.
+   definition and license attribution after the source is removed. The
+   [native part example](../examples/native-parts/README.md) also offers a generic
+   resistor with a 0603 package and an optional synthetic manufacturer part.
+   Choose **Unassigned** to defer the package, or select the manufacturer record
+   to place the resolved combination. A placed native part's **Footprint** action
+   opens its package, manufacturer and typed requirement form; changes use one
+   undo step and flag a retained MPN when its specifications no longer meet the
+   requirements. These records travel with folder and `.pc` saves.
    **Dock** switches the large form to a compact catalog beneath Browser; its
    header's **Expand** control returns to the large form with the same library,
    search and selection. The compact catalog stays open during placement and can
@@ -120,6 +156,13 @@ the same `VCC` net name, which can be changed before placement.
    free-end handle onto a pin or segment also connects it; simply crossing a
    wire still leaves the routes separate. Redrawing onto the same net keeps your new
    path when the old alternative has no intermediate pin or branch.
+   For an intentionally unused pin or open wire end, hover its lead or endpoint
+   and press **Q**, or use **Capture → No connect** and click several targets.
+   The X snaps to each attachment. Press **Esc**, select a placed X, then press
+   **Delete** to remove only the marker. Dragging a wire-end X stretches its wire;
+   **Esc** cancels the drag. Right-click **Delete** also removes the marker. **Analyze → Electrical menu → No-connect check** inspects
+   this intent and any saved wiring conflicts. Remove the X before adding a wire;
+   marked endpoints block new connections, including with **W**.
 4. Left-drag empty canvas or right-drag to select several objects. Left-to-right
    selects fully enclosed bodies/routes; right-to-left selects touched ones.
    **Shift** adds and **Ctrl** toggles hits. Drag a selected member to move the
@@ -127,12 +170,26 @@ the same `VCC` net name, which can be changed before placement.
    with attached wires, or **M** to leave its old wiring in place. Press **R** while
    moving to rotate the preview, then click to finish; **Esc** cancels both changes.
    Each edit has one undo step.
+   **Ctrl+C**, **Ctrl+X** and **Ctrl+V** copy/cut/paste through the system
+   clipboard, including between split panes, windows and running instances.
+   Paste previews at the pointer; **R** rotates, a click places, and **Esc** cancels.
+   **Ctrl+Shift+V** opens [Paste Options](clipboard.md) for references, named-net
+   isolation or original-position placement. Use **⌘** instead of Ctrl on macOS.
+   Copying a sheet body includes its child subtree. For a same-project Cut,
+   Paste Options requires **Reuse original unparented sheets** to be enabled
+   explicitly; leaving it unchecked creates independent copies.
 5. Click a wire segment; only that segment turns blue, and **Delete** removes
    it. Use **Undo**, then drag the segment perpendicular to its direction to
    adjust alignment, or hover it and press **G**, then click to finish. Corner
    and free-end handles reshape the adjoining legs; attached pins stay fixed.
    **Esc** cancels a preview. Right-click → **Select Wire** selects the complete
-   route for whole-wire movement or deletion. Capture → **Modify** menu offers
+   route for whole-wire movement or deletion. **M** with one wire or segment selected
+   picks up the whole route; click to place, or press **Esc** or right-click to cancel.
+   **M** also moves a selection of several symbols, wires or labels together,
+   preserving their relative positions and attached no-connect markers.
+   M disconnects contacts to unselected objects and leaves their wiring in place;
+   **G** or dragging the group keeps those connections and stretches attached wires.
+   Capture → **Modify** menu offers
    **Slice**, **Heal** and **Delete** for the selection. The context menu also offers
    **Break** to release the selected leg's attachments, including pins and shared junctions,
    whether one or both ends are connected. An already-free end stays free. The detached
@@ -140,12 +197,13 @@ the same `VCC` net name, which can be changed before placement.
    until pulled clear, after which dropping back onto them reconnects normally. Moves and draws clean up overlapping
    runs, and **Heal** applies that cleanup to existing selected wires. Dropping
    a part with a pin exactly on a wire connects it; a two-pin part placed across
-   a straight run replaces the wire between its pins. **Auto-heal wires** in
+   a straight run replaces the wire between its pins. A filled dot marks a branch
+   connection; unrelated crossing wires have no dot. **Auto-heal wires** in
    **Preferences → Schematic** (also in the Modify menu) defaults on. Retracing a draft shortens the preview as you draw;
    Backspace restores the preceding clicked corner. Switch automatic healing off to keep detours and loops while
    drawing, then select a wire and use **Heal** for cleanup when desired.
-6. Save your desktop copy, reopen its `project.pc`, and check the edit. In the
-   browser, choose **Download**, keep the resulting `.pc.zip`, then reopen that
+6. Save your desktop copy, reopen its `project.json`, and check the edit. In the
+   browser, choose **Download**, keep the resulting `.pc`, then reopen that
    download to check it. A download request does not prove the file was saved,
    so the browser deliberately keeps its unsaved marker.
 7. With unsaved changes, closing the last desktop editor window, **Quit**, **New Project**
@@ -155,17 +213,26 @@ the same `VCC` net name, which can be changed before placement.
 
 The status bar shows the grid point under the pointer; click its unit, or press
 **Ctrl+U**, to read coordinates and the grid in mm instead of mil. The wheel zooms
-and a middle-button drag pans by default. Preferences can change
-wheel behavior, zoom direction/speed, theme and UI scale. Browser and Net Inspector
+smoothly around the pointer and a middle-button drag pans by default. Pinch
+gestures follow your fingers directly, and grid density fades between scales.
+Preferences can change wheel behavior, zoom direction/speed, theme and UI scale.
+Browser and Net Inspector
 use collapsible cards over the canvas; **View** restores a hidden card and opens
 the Parts Catalog in its last presentation. **Help → Keyboard Shortcuts**
 shows the current bindings. Keyboard editing shortcuts apply to the canvas when
 a text field or dialog is not using the keys.
 
+PCB routing is under **Layout → Route**, and **Draw → Line / Rectangle** uses
+the active layer. Copper shapes are conductive linework; technical-layer graphics
+retain a physical stroke. The layer, Track / line width and via dimensions stay
+visible across PCB tabs, with alignment actions in **Layout → Modify**.
+
 The PCB grid is hidden by default. **Preferences → Appearance → PCB grid** offers
 **Off**, **Dots** and **Lines**, remembered across sessions and shared by all PCB
 views and windows. Grid opacity affects visible grids in both workspaces; display
-changes leave snapping and each view's spacing unchanged.
+changes leave snapping and each view's spacing unchanged. Schematic and PCB views
+remember their snap spacing separately, so changing one editor's grid does not
+replace the other's startup choice.
 
 To compare views, choose **View → Split**, pan one pane, and select a symbol:
 the other pane highlights it while keeping its own selection. **View → Settings**
@@ -212,19 +279,19 @@ switching arrangements or moving views elsewhere. A single view has no lower tab
 strip; split panes each show one document header whose **×** closes the pane.
 The engine supports up to 64 sheets and zero or one physical board. Right-click
 **Sheets** in the Browser and choose **New Sheet…**, or use
-**Manage → Sheets → New sheet**; sheet rows also offer
+**Sheets → New sheet**; sheet rows also offer
 **Rename Sheet…** and **Delete Sheet…**. Creating a sheet opens it in that pane.
 The breadcrumb uses the actual sheet name and its position in the sheet count.
 Deletion asks for confirmation and removes its symbols, wires and associated
 footprints together; Undo restores them. Other views of a deleted sheet become
 unavailable until it is restored or another document is opened.
 
-To add a subsheet, press **S** or choose **Capture → Sheets → Subsheet**, click its parent canvas and give the child a name,
+To add a subsheet, press **S** or choose **Sheets → Subsheet**, click its parent canvas and give the child a name,
 or choose an existing unparented sheet in **Child sheet**. Double-click inside
 the placed rectangle to enter it; **Alt+Backspace** returns to its parent.
 The name appears above the outline. Drag the body/name to move the sheet, or
 select it and drag a corner handle to resize; **Esc** cancels an active gesture.
-Place a hierarchical label with **H** or **Capture → Sheets → Hierarchical label**, enter its name and direction, then
+Place a hierarchical label with **H** or **Sheets → Hierarchical label**, enter its name and direction, then
 connect its pointed anchor with **W**. A matching sheet pin appears automatically
 on the parent symbol. Names and directions stay synchronized when you edit the
 label with **E** or its context menu. The Browser shows the same nesting in
@@ -247,6 +314,9 @@ Wayland and X11; Windows and macOS still need platform qualification.
 
 ## Inspect and edit component properties
 
+Typed part values accept engineering prefixes from atto through exa, such as
+`1 fF` or `1 PHz`, within the [documented precision limits](part-schema.md).
+
 Select a symbol to use the compact **Properties** card. Edit reference, value,
 rotation or its **X/Y** position and choose **Apply changes**, or open **More properties** for the
 expanded form. **E** opens the same form. **OK** applies the supported properties
@@ -266,8 +336,8 @@ Generate an original example into a directory that does not already exist:
 cargo run --locked -p pcbcraft-engine --example board_workspace -- /tmp/pcbcraft-board-example
 ```
 
-Open `/tmp/pcbcraft-board-example/board-inspection/project.pc` on desktop, or
-upload the generated `board-inspection.pc.zip` in the browser. The example has a
+Open `/tmp/pcbcraft-board-example/board-inspection/project.json` on desktop, or
+upload the generated `board-inspection.pc` in the browser. The example has a
 resistor, a two-pin connector, two connections and two generic footprint
 placements. It is an inspection fixture, not a fabrication-ready board.
 
@@ -291,7 +361,7 @@ explicitly opens another workspace. The workspace picker remains available.
 In the board workspace, Properties shows its stored reference, value, definition
 and unit-aware coordinate readouts.
 
-Use **Layout → Board → Setup**, or **Board setup…** in Layers, to edit the board.
+Use **Layout → Board → Board setup**, or **Board setup…** in Layers, to edit the board.
 Choose any even copper count from 2 through 64; 10- and 12-layer boards are included.
 **Board editor layers** edits names and unused optional layer membership.
 **Physical stackup** edits copper/dielectric thicknesses, tolerance and core/prepreg
@@ -312,7 +382,7 @@ impedance calculations and manufacturing rules remain future work.
 
 Left-click a footprint to select it, then press **Delete** to remove its board
 placement. Multiple selected footprints are removed together. The **Layout →
-Placement menu → Delete** action does the same thing. Schematic components and physical
+Modify menu → Delete** action does the same thing. Schematic components and physical
 package assignments stay available; **Place on board** can place the assigned
 package again. Undo restores the original placement IDs and geometry.
 
@@ -332,7 +402,7 @@ The selected ribbon layer and its menu rows show matching color patches.
 without changing visibility. Plated lands take the active visible copper color, while front-only surface
 pads stay on front copper. Colors are shared local settings for this board,
 separate from its geometry, saved engineering files and document undo.
-**Layout → Fit** fits the placements, and **Layout → Reveal** brings the current
+**Fit** in the ribbon header fits the placements, and **Analyze → Cross-probe → Reveal schematic** brings the current
 counterpart highlight into view without changing zoom. Switching back restores
 the schematic camera. These actions do not modify project data or undo history.
 
@@ -371,7 +441,7 @@ map terminal 1 to pad 1 and terminal 2 to pad 2, then choose **Assign** and
 **Close**. This pins the package without creating a PCB or placement; folder and
 archive saves retain it offline. Creating your first board later adopts these
 choices for Update PCB. In PCB layout,
-open **Layout → Components → Footprints**, select the component, enter X/Y and
+open **Layout → Place → Footprint**, select the component, enter X/Y and
 choose **Place on board**. Assignment and placement are separate undo steps;
 save/reopen retains the package and mapping offline. The chooser also supports
 assigning an unassigned component directly from PCB layout. On a board with
@@ -380,8 +450,21 @@ next reviewed update. See the
 [footprint contract](footprint-library.md#assigning-and-placing-a-package) for
 mapping constraints and source limits.
 
+Click a placed reference designator to select its text and open **Properties**.
+The owning footprint highlights in lighter layer colors, and a dashed leader
+connects the lettering to its footprint. Remaining airwires also appear. Drag the
+lettering, or press **M** and click, to move it; **R** rotates the text and
+**Delete** hides it. Properties offers local printed words, the bundled fonts,
+size/stroke, rotation, alignment, visibility and offsets. Clear **Use component
+reference** to print other words without changing the component's identity.
+**Rename…** explicitly changes the shared component reference, including the
+schematic. **Reset silkscreen** restores inherited text, appearance and position;
+select the footprint body and **Edit silkscreen text** to recover hidden text.
+To set a library default position, open the footprint in **Footprint Editor**,
+select **Definition**, and edit the reference offsets in Properties.
+
 To forward a captured schematic, choose **Capture → PCB → Update PCB**; from PCB
-layout use **Layout → Schematic → Update PCB**. **Create board** explicitly adds
+layout use **Layout → Board → Update PCB**. **Create board** explicitly adds
 the first PCB when needed. Existing footprints without recorded accepted state
 first require **Use current state**, which adopts today's schematic, packages and
 connections as the starting point rather than reconstructing earlier history.
@@ -401,7 +484,7 @@ and place later. **Copy report** includes all message categories.
 adoption remain separate edits. External changes or another client's preview
 require **Review again**; a reopened/replaced project requires a fresh dialog.
 
-In **Layers → Board**, select **Board Outline**, then choose **Layout → Draw → Line**
+In **Layers → Board**, select **Board Outline**, then choose **Draw → Line**
 or **Rectangle**. Click successive vertices for a line path; click its first vertex
 to close it, or press **Enter** to finish an open path. Rectangle uses two opposite
 corner clicks. Points snap to the current grid and nearby existing edge vertices.
@@ -415,20 +498,58 @@ Saving retains drawing and layer identities without moving footprints or creatin
 a copper stackup. Open paths are editing geometry, and this slice does not check
 closure across drawings, edge clearance or manufacturing validity.
 
-Arcs, slots, routing, individual pad selection and Flip view still need
-implementation. After reviewed updates are initialized, removing the last
+To route a track, activate a copper layer and press **X**. The crosshair follows
+the pointer, and the target marker shows nearby grid points and copper contacts.
+The preview uses a lighter shade of the layer color and shows the default
+clearance around it. Starting on a trace brightens its copper and dims the rest
+of the board while you route. Hold **Ctrl** to bypass the grid. Click a pad,
+track end or via to finish on copper, or press **Enter** after placing the last
+corner in free space. Right-click opens the route menu, which includes **Cancel**.
+Zoom in with the wheel to inspect copper, then use **Fit board** to frame the board again.
+
+Use **Analyze → Rules** to save board limits and preferred routing dimensions.
+Clear **Use built-in defaults** to author values, then Apply; checking it restores
+the built-in values. New routes use those preferences, while existing copper
+keeps its dimensions. See [board rules](board-rules.md) for overrides and sources.
+
+Run **Analyze → DRC** to check the board. The check shows its current stage while
+pan and zoom remain available. **Cancel check**, **Esc** or leaving the view stops
+unfinished work; **Run again** replaces it with a check of the current revision.
+Edits and project reopening invalidate unfinished reports.
+
+Pad clearance is measured against the
+resolved circular, oval, rounded-rectangle or rectangular copper contour, including
+rotation and board side. A gap exactly equal to the selected clearance passes;
+clearance enforcement while routing remains separate. DRC also reports existing
+copper islands that join different intended nets, including direct pad and through-via
+contact at zero clearance. Once board updates are initialized, the check uses accepted
+connectivity until you review and accept a later schematic change.
+
+After reviewed updates are initialized, removing the last
 schematic unit retains its footprint until an update accepts the removal. A
 legacy board retains its prior deletion behavior until explicit current-state
 adoption, so establish that starting point before editing its schematic.
 
-Share the entire project folder or its `.pc.zip` archive, rather than the entry
+Share the entire project folder or its `.pc` archive, rather than the entry
 point alone. Used symbol definitions are pinned so the recipient does not need
 your source library. The folder is the Git-friendly working form; opening and
 saving a current project without edits preserves its document bytes. The
-[storage guide](native-project-storage.md) explains legacy migration and failed
+[storage guide](native-project-storage.md) explains the compatibility break and failed
 or interrupted saves.
 
+Selected tracks and vias brighten in their copper colors, like footprint pads,
+and have a **Lock** choice in Properties. **Locked** keeps
+them selectable while protecting geometry and sizes from edits; unlock them
+before moving, reshaping or deleting them. Copy/duplicate retain locks, and Cut
+refuses protected copper. See the [lock policy](pcb-layout-workflow.md#fixed-tracks-and-vias)
+for mixed selections and indirect footprint/segment changes.
+
 ## Try the same project through MCP
+
+For repeatable UI demonstrations in the native app, the live connection can
+[locate controls and send ordinary input](ui-automation.md). Start with
+`ui.handles` for the intended window, send a named `ui.click`, and wait for its
+completion ticket through `ui.inspect` before continuing.
 
 Build the two desktop binaries from the repository root:
 
@@ -438,7 +559,7 @@ cargo build --locked -p pcbcraft -p pcbcraft-cli
 
 To inspect a separate, headless copy of the example, configure an MCP client to
 launch `target/debug/pcbcraft-cli` with arguments
-`mcp --project crates/app/tests/fixtures/split/two-resistors/project.pc` and the
+`mcp --project crates/app/tests/fixtures/split/two-resistors/project.json` and the
 repository as its working directory. Use `.exe` on Windows. Running that command
 in a terminal waits for MCP input; it is not an interactive command prompt.
 Headless edits change only that process's in-memory session. They do not edit an
@@ -554,6 +675,11 @@ definition to a project is follow-up work; see the
 
 ## Inspect accepted board connections
 
+With typed quantities captured by a board update, deleting a part from the
+schematic keeps its SI-formatted value in PCB Properties and Browser while
+its footprint awaits reviewed removal. Older accepted snapshots retain their
+stored value text until a real board update captures typed history.
+
 When a board has an accepted update baseline, the PCB canvas shows thin airwires
 between its mapped physical pads. **Layers → Ratsnest** hides or shows them for
 that view, and the status bar reports airwires and missing endpoints. Schematic
@@ -561,3 +687,32 @@ changes affect those connections after a reviewed board update accepts them;
 footprint moves and rotations update the displayed geometry immediately. These
 lines show logical connections and do not establish routed copper or fabrication
 readiness; see [accepted board connections](board-ratsnest.md).
+
+### Copying PCB groups
+
+Select a group with a directional marquee, or use Ctrl/Command+A for visible
+supported objects. Layout → Clipboard and the PCB context menu provide system
+Copy, Cut, Paste and Duplicate; keyboard shortcuts match the schematic. Copied
+footprints duplicate their schematic counterparts too, so PCB Paste Options
+shows the destination sheet and schematic anchor for each source circuit.
+Same-project Cut/Paste can reuse the original unplaced components. Review the
+[clipboard guide](clipboard.md) for layer mapping, named nets and relocation.
+
+Ctrl+Shift+X (macOS: Command+Shift+X) starts the standalone via tool. On native
+non-Latin layouts, it uses physical X when the logical character has no key
+mapping; Windows Shift+Delete remains Cut.
+
+With a configured board and a closed Board Outline, **Manufacture → Fabrication → Outputs**
+saves a fabrication ZIP without editing the design. Output names remain unique
+when layer names collide after sanitization; the [editor guide](editor-guide.md)
+describes the generated files and desktop save behavior.
+
+### Browse libraries
+
+Choose **Parts Library** in the workspace picker, or **Libraries → Sources**. Select a
+library and Type in Browser, search its items, and select a row for Preview.
+**Add library** opens a folder or bundle; desktop bundles install into a new
+folder. Remove leaves files intact, while Delete moves an eligible folder to
+system trash after confirmation. In the browser, added libraries need reopening
+after a reload. Projects keep their pinned copies. See the
+[native source guide](native-library-sources.md) for limits and source diagnostics.

@@ -26,7 +26,15 @@ fn rotated_led_labels_clear_the_drawing() {
             let symbol = &project.symbols()[0];
             ctx.begin_pass(egui::RawInput::default());
             let painter = ctx.layer_painter(egui::LayerId::background());
-            paint_symbol(&painter, &definition, pos2(250.0, 250.0), step, turns, Stroke::new(theme::SCHEMATIC_SYMBOL_STROKE, egui::Color32::WHITE));
+            paint_symbol(
+                &painter,
+                definition.default_unit(),
+                pos2(250.0, 250.0),
+                step,
+                turns,
+                false,
+                Stroke::new(theme::SCHEMATIC_SYMBOL_STROKE, egui::Color32::WHITE),
+            );
             fields::paint_labels(
                 &painter,
                 symbol,
@@ -66,9 +74,9 @@ fn integrated_pin_labels_do_not_enlarge_the_symbol_body_hitbox() {
     }
     let after = item.symbol().unwrap();
     for turns in 0..4 {
-        assert_eq!(body(&before, turns), body(&after, turns));
+        assert_eq!(body(before.default_unit(), turns, false), body(after.default_unit(), turns, false));
     }
-    assert!(grid_bounds(&after, 0).width() > grid_bounds(&before, 0).width());
+    assert!(grid_bounds(after.default_unit(), 0, false).width() > grid_bounds(before.default_unit(), 0, false).width());
 }
 
 /// Generated stroke lettering follows the same zoom cutoff as ordinary schematic labels;
@@ -90,7 +98,15 @@ fn integrated_pin_text_obeys_the_schematic_detail_threshold() {
     pcbcraft_chrome::fonts::install(&ctx);
     let count = |definition: &SymbolDefinition, step| {
         ctx.begin_pass(egui::RawInput::default());
-        paint_symbol(&ctx.layer_painter(egui::LayerId::background()), definition, pos2(100., 100.), step, 0, Stroke::new(1., egui::Color32::WHITE));
+        paint_symbol(
+            &ctx.layer_painter(egui::LayerId::background()),
+            definition.default_unit(),
+            pos2(100., 100.),
+            step,
+            0,
+            false,
+            Stroke::new(1., egui::Color32::WHITE),
+        );
         let mut output = ctx.end_pass();
         output.textures_delta.clear();
         output.shapes.len()
@@ -99,4 +115,46 @@ fn integrated_pin_text_obeys_the_schematic_detail_threshold() {
     assert!(count(&visible, low) > 0);
     assert_eq!(count(&visible, low), count(&hidden, low));
     assert!(count(&visible, theme::SCHEMATIC_MIN_GRID_SPACING) > count(&hidden, theme::SCHEMATIC_MIN_GRID_SPACING));
+}
+
+/// The canvas must return cancellation on a disabled focus-loss frame even when its caller
+/// does not proactively release tools; input suppression must not swallow cleanup actions.
+#[test]
+fn disabled_no_connect_canvas_returns_focus_loss_cancellation() {
+    let mut session = Session::default();
+    session.apply("project.new", &json!({})).unwrap();
+    let project = session.snapshot().unwrap();
+    let ctx = egui::Context::default();
+    pcbcraft_chrome::fonts::install(&ctx);
+    let mut camera = Camera::default();
+    let mut overlaps = OverlapCache::default();
+    let mut result = None;
+    let mut output = ctx.run_ui(egui::RawInput { focused: false, events: vec![egui::Event::WindowFocused(false)], ..Default::default() }, |ui| {
+        result = show(
+            ui,
+            &project,
+            session.revision(),
+            &mut camera,
+            &mut overlaps,
+            Some(Tool::NoConnect { revision: session.revision() }),
+            &Selection::default(),
+            None,
+            false,
+            None,
+            &Selection::default(),
+            Default::default(),
+            false,
+            false,
+            Navigation::default(),
+            35,
+            true,
+            false,
+            pcbcraft_chrome::units::Unit::Mil,
+            &Draft::default(),
+            "Schematic canvas",
+            None,
+        );
+    });
+    output.textures_delta.clear();
+    assert!(matches!(result, Some(Click::CancelNoConnect)));
 }

@@ -2,6 +2,61 @@
 
 PCBCraft's own code is MIT OR Apache-2.0. This file lists what came from elsewhere. Add to it in the same PR whenever you bring something in: source, revision, license, and what changed.
 
+## Layer-aware spatial queries
+
+The #244 implementation uses `geo-index` 0.4.0 (MIT OR Apache-2.0), pinned by
+Cargo.lock, for immutable packed Hilbert R-trees. Its published API documentation
+at https://docs.rs/geo-index/0.4.0/geo_index/rtree/ was consulted; no source was
+copied. `rstar` 0.14.0 (MIT OR Apache-2.0) is a benchmark-only alternative, using
+its published bulk-loading API. Both packages are unmodified and retain their
+upstream package notices. Dependency source/license/ban checks qualify their
+locked dependency closure under deny.toml.
+
+The layer grouping, bounded session cache, disposable overlay and original
+BVH/grid comparison prototypes are PCBcraft work under MIT OR Apache-2.0.
+The curve/diagonal stress generator uses original analytic geometry and synthetic
+intent tags; its output is not an imported EDA design or native curve contract.
+Algorithm background was read in Flatbush's published README
+(https://github.com/mourner/flatbush) and Box2D's dynamic-tree documentation
+(https://box2d.org/documentation/group__tree.html); neither implementation was
+copied or linked. No EDA implementation, artwork or project-format change is added.
+
+## Intentional no-connect markers
+
+Logical terminal and wire-end intent, captured electrical-type evidence, shared
+commands, bounded diagnostic inspection and project/19 plus sheet/8 storage are original MIT OR
+Apache-2.0 PCBcraft work for #285. The attachment-centered X, larger X cursor and lead-and-cross ribbon
+glyph are original geometry; the pinned Craft kit has no electronics no-connect
+command glyph, so
+the host draws that mark and its selection outline while reusing existing
+ribbon, menu, modal, filter checkbox and control adapters. Stable marker
+selection and atomic intent deletion are original PCBcraft work; the blue mark
+color is a separate host canvas token. The shared immutable no-connect attachment
+policy and magnetic-target suppression are original engine/view-cache changes;
+no external implementation or dependency was introduced. Wire-end X dragging
+reuses the existing junction reshape/departure path and shared move command;
+placement selection cleanup reuses view-owned selection/counterpart routing.
+Selected-wire and multi-item M pickup reuse the existing bounded group translation
+command, revision/filter guards and preview rather than adding another movement transaction.
+The explicit disconnected group candidate partitions only selection-boundary contacts
+through the existing wire allocator; G and held group dragging retain connected movement.
+Interaction follows the published
+[KiCad schematic editor manual](https://docs.kicad.org/10.0/en/eeschema/eeschema.html),
+consulted November 12, 2026. Tests use shared commands, original starter/native
+example definitions and production codecs; no external EDA implementation,
+artwork, fixture, dependency or library data was incorporated.
+
+## Schematic overlap visibility
+
+The drawing-bound warnings, view-owned candidate cache and stacked-symbol context
+chooser are original PCBcraft code using the existing Craft menu rows, fonts,
+tokens and semantic state badge. The canvas badge adapter uses the pinned kit's
+warning presentation and leaves positioning and overlap counts in PCBcraft.
+The public [KiCad 9 schematic editor manual](https://docs.kicad.org/9.0/en/eeschema/eeschema.html)
+was consulted for its selection-clarification workflow; no implementation source,
+artwork or library asset was used. Regression schematics use shared native commands.
+No dependency, saved-format or electrical connectivity rule was added.
+
 ## Component fields and text placement
 
 Component metadata, population/exclusion intent, per-unit field appearance and
@@ -85,6 +140,10 @@ with egui 0.36.2's color picker through its public API. No new dependency or
 external artwork is imported. Front/back colors retain the shared board palette;
 the alternate internal-layer green is an original palette extension. Color
 choices are presentation settings and make no material/manufacturing claim.
+
+Copper selection reuses PCBcraft's existing layer-color emphasis helper for
+tracks and through vias, matching footprint pads without accent outlines. This
+is original PCBcraft drawing work; no new controls, artwork or dependencies were added.
 
 ## Layer controls
 
@@ -472,8 +531,8 @@ proxies; the later SMD geometry and its dimensional references are recorded belo
 
 ## Eframe native window lifecycle patch
 
-`vendor/eframe/` contains the crates.io eframe 0.36.2 package from egui revision
-`49682f8baa058bf49e011035cfbd6e825f88a5ef`, copyright (c) 2018-2021 Emil Ernerfeldt,
+`vendor/eframe/` contains the crates.io eframe 0.37.0 package from egui revision
+`3c6eb8261c3293ad9c7ea1ed58487e038860ebef`, copyright (c) 2018-2021 Emil Ernerfeldt,
 MIT OR Apache-2.0. Both license texts are retained alongside it. Local changes add
 an opt-in WGPU root-window retirement request so a surviving editor keeps its
 native window when the original closes. The patch boundary and upgrade procedure
@@ -839,6 +898,12 @@ reuse this repository's already qualified pinned definitions and Craft chooser;
 no external implementation, data, dependency or asset was added. Board creation
 adopts existing package intent without creating physical placements.
 
+The standalone-via shortcut follows KiCad 10's documented Ctrl+Shift+X binding
+(https://docs.kicad.org/10.0/en/pcbnew/pcbnew.html). The original local eframe
+0.36.2 input patch preserves this key before egui-winit's Cut conversion when
+no widget owns keyboard input. See vendor/eframe/PATCH.md; upstream MIT/Apache
+licenses remain unchanged. No KiCad implementation or artwork was consulted.
+
 ## Bundled Default and Power native libraries
 
 The original PCBcraft power-marker geometry is represented as native symbol
@@ -853,3 +918,363 @@ The separate Power/Ground annotation styles and marker-only text tools have been
 removed. Native power Home-preview and shared field-tool regressions use original
 command-built circuits, production save/load and the existing thumbnail painter.
 No external source, asset, dependency or project fixture was introduced.
+
+
+## Portable schematic clipboard
+
+The versioned native fragment contract, identity remapping, cut/paste transactions,
+canvas preview and Paste Options are original PCBcraft work over the existing
+engine codecs and Craft controls. Clipboard exchange uses eframe/egui's already
+qualified system clipboard events and output; no new dependency, external EDA
+implementation, artwork, library data or saved-project format is introduced.
+Regression circuits are built through shared native commands.
+
+The existing MIT/Apache-2.0 eframe 0.36.2 patch additionally reports empty native
+and browser clipboard reads as completed paste events. The change and upstream
+revision are recorded in `vendor/eframe/PATCH.md`; original upstream notices
+remain intact. No new dependency or clipboard implementation is introduced.
+
+## Portable PCB clipboard commands
+
+The board fragment contract, typed layer and schematic destination mapping,
+component relocation/duplication, cached preview and mixed physical transactions
+are original PCBcraft work using the existing native codecs, board update and
+copper contact model. Command-built tests use native bundled definitions. No
+external implementation, fixture, asset, dependency or saved-format change was
+introduced; the separate EDA importer/source boundary remains unchanged.
+
+## PCB clipboard presentation
+
+The view-owned PCB clipboard form/preview, mixed physical selection and shared
+platform routing are original PCBcraft work over the portable board engine
+contract, independent board renderer and existing Craft controls. Native
+regressions extend the existing two-process eframe clipboard harness; fixtures
+are created with shared commands. No dependency, external source, artwork,
+library data or native saved-format change was introduced.
+
+## Ordinary-text clipboard conversions
+
+The bounded net-name and numeric CSV/TSV conversion commands, editable conversion
+form, dimension preview and regression data are original PCBcraft work using
+shared native commands and codecs. No external EDA implementation, source-derived
+fixture, artwork, library data, parser dependency or saved-format change was
+introduced. These explicit text conversions do not use the paused importer.
+
+## Hierarchical clipboard contract
+
+The rooted hierarchy envelope, closed-subtree capture, independent document and
+interface remapping, Cut relocation, incident-route preservation and cached
+schematic snapshot API are original PCBcraft work over existing native codecs
+and commands. The contract creates independent sheets, not repeated instances;
+native saved formats are unchanged. The PCB export topology guard compares only
+selected terminals and carried global names. Command-built tests introduce no
+external EDA source, source-derived fixture, artwork, data or dependency.
+
+## Hierarchical clipboard presentation
+
+The hierarchy context/keyboard actions, per-view cached ghost, explicit Paste
+Options and navigation/input separation are original PCBcraft work over the
+rooted engine contract and existing Craft controls. Regression fixtures use
+shared native commands; the native two-process harness uses eframe's existing
+clipboard path. No external EDA implementation, source-derived fixture, asset,
+dependency or native saved-format change was introduced.
+
+## Shared Craft UI migration
+
+`solidcraft-ui-kit`, `solidcraft-look` and `solidcraft-theme` are pinned to
+SolidCraft revision `73bdb6cdd39efc3899fb54e7217289a630a89efe`, copyright
+2026 the SolidCraft maintainers, under the SolidCraft Brand and Interface
+Licence. They retain that licence independently of PCBcraft's MIT OR Apache-2.0
+code. The retained text is
+`crates/chrome/assets/shared-ui/SOLIDCRAFT-UI-LICENSE`, SHA-256
+`3cabf11ab54508ee3c5a0c2573239a2e34eee715d1802c229188a33bc92dda11`.
+Travis Lowe explicitly directed local inclusion on November 10, 2026 as an
+official Tangency Labs subproject. The upstream written record is requested in
+[SolidCraft #14690](https://github.com/tangency-labs/solidcraft/issues/14690).
+
+The shared look's Plex face bytes match the previously qualified copies in
+`crates/chrome/assets/fonts`; their OFL notices are retained. PCBcraft also keeps
+the unmodified `NotoEmoji-Regular.ttf` from the original crates.io
+`epaint_default_fonts` 0.36.2 package under OFL-1.1, with that package's `OFL.txt`.
+The font's SHA-256 is
+`415dc6290378574135b64c808dc640c1df7531973290c4970c51fdeb849cb0c5`;
+the notice's SHA-256 is
+`6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2`.
+This preserves the emoji coverage supplied by egui before 0.37 moved it to
+platform providers. Fonts are data, and no egui 0.36 code dependency is retained.
+
+Shared Preferences dropdowns draw their chevron from `solidcraft-look`'s
+embedded icon set at the same pinned revision, under the licence recorded above.
+
+The shared ribbon reserves icon slots through a registered transparent host
+master in the extended icon set. PCBcraft paints its existing qualified
+electronics glyphs into those slots, preserving their sources and notices from
+the ribbon asset record above. This avoids the toolkit's unknown-icon artwork
+without duplicating its command button rendering.
+
+The pinned SolidCraft source also supplies its `egui-wgpu` 0.37.0 patch
+(MIT OR Apache-2.0, Emil Ernerfeldt and contributors) and winit 0.30.13 patch
+(Apache-2.0, the winit contributors). Their original notices remain in the
+dependency packages, and upstream's `vendor/README.md` at the pinned revision
+documents the rendering, surface lifecycle and Wayland gesture changes. The
+shared renderer and SolidCore library dependency closure is recorded in
+[the migration notes](docs/shared-ui-migration.md); PCBcraft does not depend on
+SolidCraft's executable or mechanical application orchestration.
+
+The task-oriented ribbon regrouping, tab compatibility aliases and compact
+header wrapping are original PCBcraft changes using these existing shared
+components and qualified glyphs. No external implementation or artwork was
+introduced.
+
+## Smooth canvas zoom and adaptive grid
+
+The per-camera timed zoom transition, input cancellation and grid-density fade
+are original PCBcraft work under MIT OR Apache-2.0. The wheel-smoothing and direct
+pinch behavior in SolidCraft's `crates/ui-egui/src/navigation.rs` at the pinned
+`f56114219b2d7f6d16de8dd58700479646948f8a` revision was reviewed as a behavioral
+reference (MIT OR Apache-2.0, SolidCraft contributors). No SolidCraft application
+engine or camera implementation was imported; the existing shared egui renderer
+and PCBcraft's 2D camera remain the rendering path. No dependency or asset was added.
+
+The persistent PCB ribbon controls, Draw tab and physical technical-layer graphics
+are original PCBcraft work using the existing shared chrome, drawing and conductive
+segment commands. Board format 16 extends the upstream format 15 reference-label
+work; no external EDA implementation, asset or dependency was introduced.
+
+The PCB width/via dropdowns, custom-size drafts and local reusable numeric presets
+are original PCBcraft code using the already qualified Craft dropdowns and modal
+controls. No dependency, external source, asset or project-format change was added.
+
+The contextual-card header spacing reuses the existing compact Parts Catalog
+composition. Plain titles use original PCBcraft interaction/rendering code with
+the shared grip, fonts and keyboard-focus outline, without hover fills or
+duplicate tooltips. This adaptation adds no external source or dependency.
+
+## Explicit previous-layout conversion
+
+The source-preserving split-layout converter is original PCBcraft work using
+the existing MIT/Apache native document codecs, bounded ZIP reader and recoverable
+folder publication. It introduces no external implementation, dependency, artwork
+or library data. Regression inputs are generated through native commands and
+encoders. User-provided project copies used for local verification remain outside
+the repository and are not distributed with the code.
+
+The project/14 board-folder codec, namespace selection, first-save migration and
+save-metadata adoption across Undo/Redo are original PCBcraft work over the
+existing native model and journaled publication. Regression circuits use shared
+commands and original repository fixtures. No external implementation, data,
+dependency or asset was added.
+
+Handle-bound recovery publication is original PCBcraft work using `rustix` 1.1.6,
+already present in the qualified dependency graph and now a direct Unix storage
+dependency. The crate remains independently licensed `Apache-2.0 WITH
+LLVM-exception OR Apache-2.0 OR MIT`, with its package notices retained. Its
+[safe descriptor-relative filesystem API](https://docs.rs/rustix/1.1.6/rustix/fs/index.html)
+and Microsoft's [CreateFile sharing/reparse-point contract](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew)
+were consulted on November 11, 2026. Windows directory handles omit delete sharing
+and reject reparse points; no Windows implementation source was copied. No new
+crate version, external EDA source or asset was added.
+
+## Native part/category definitions and symbol schemas
+
+The native `pcbcraft-part/1`, `pcbcraft-category/1` and `pcbcraft-symbol/3`
+contracts, semantic resolver, exact decimal normalization and schema tooling
+are original PCBcraft work based on this repository's library-model document.
+`examples/native-parts` derives its resistor, four-pin schematic drawings and
+0603 land pattern from the existing original starter definitions at
+`0ed4f13986a4b08364b963f8b3dde4303166b6f1`, retaining MIT OR Apache-2.0 and the
+footprint's recorded dimensional provenance. The IC example is an original
+illustrative definition with no claimed manufacturer qualification. The format-4
+dual-amplifier symbol, linked part, illustrative six-pad package and multi-unit
+runtime/authoring extension are original PCBcraft work following the repository's
+circuit-instance and library contracts. No external
+EDA implementation, library data, artwork or new runtime dependency was introduced.
+
+### Native part selections and manufacturer records
+
+The typed requirement comparison, native manufacturer record/schema, project
+selection transactions, dependency pinning and presentation in this slice are
+original MIT OR Apache-2.0 PCBcraft code. The manufacturer fixture under
+`examples/native-parts/manufacturer-parts/` is explicitly synthetic, with no real
+vendor product, supplier stock or pricing claim. It links the original example
+part and footprint, whose existing provenance remains attached. No KiCad import,
+implementation source or external vendor adapter is included.
+
+The single-use sheet occurrence codec, deterministic compatibility UUID roles,
+board/schematic ownership transfer and save-history adoption are original
+PCBcraft work based on this repository's circuit-instance and storage contracts.
+Regression projects use shared commands and original repository fixtures. The
+existing qualified `sha2`, `uuid` and native publication dependencies are reused;
+no external implementation, library data, artwork or dependency was added.
+
+## Fixed track and via locks
+
+The per-object copper lock flags, board/18 and board-kind clipboard/3 extensions,
+shared command, snapshot publication guard and selection property controls are
+original MIT OR Apache-2.0 PCBcraft work following #249 and this repository's
+layout/storage contracts. The choice control reuses the pinned Craft toolkit
+through the existing chrome adapter. Regression boards use shared commands and
+original bundled definitions; no external EDA implementation, source-derived
+fixtures, artwork, library data or new dependency was introduced.
+
+## Shared copper contours and snapshot clearance query
+
+The contour extraction, conservative candidate query, snapshot authority and
+intended-membership evaluation are original PCBcraft work over the existing
+rounded-pad DRC and copper-connectivity implementation. Original regression
+boards use shared commands and existing qualified native definitions. No external
+EDA implementation, fixture, artwork, dependency or native-format change was
+introduced. Circular-arc representation remains separate work under #259.
+
+The WASI runner regression compiles original exit-only Rust programs and checks
+their statuses through the production Node runner. Exit propagation follows the
+published [Node WASI API contract](https://r2.nodejs.org/dist/v22.13.0/docs/api/wasi.html),
+consulted November 11, 2026; no Node implementation source or third-party test
+fixture was incorporated.
+
+## Sparse persistent net identities
+
+The sparse net registry, canonical anchor-key codec, continuation/split/merge
+reconciliation, shared promotion/resolution commands and format-17/instances-2
+storage are original MIT OR Apache-2.0 PCBcraft work following this repository's
+net-identity and storage contracts. Regression circuits are generated with native
+commands and original repository fixtures. The existing qualified UUID, hashing,
+serialization and publication dependencies are reused; no external EDA source,
+library data, artwork or dependency was added.
+
+## Shared length parsing
+
+`crates/units` extracts the existing original MIT OR Apache-2.0 length parser,
+conversion factors, unit type and exact editable formatter from
+`crates/chrome/src/units.rs` at `e72f743248e95c9f3af36b3c3aca8211eb39d4aa`.
+Chrome retains display formatting and its existing qualified unit button, with
+re-exports preserving current callers. The extraction reuses the existing serde
+dependency and parser regressions; no external implementation, library data,
+artwork or dependency version was introduced.
+
+## Saved board rules
+
+The versioned board-default records, shared effective-rule resolver, GUI/MCP
+transactions, DRC/query integration and original regression fixtures are original
+MIT OR Apache-2.0 PCBcraft work following #242 and this repository's rule/storage
+contracts. The form reuses the pinned Craft toolkit through the existing chrome
+settings, field and control adapters. No external EDA implementation, library data,
+artwork or new dependency was introduced.
+
+## Quantity prefix range
+
+The atto–exa quantity prefix extension and shared input/display table are original
+MIT OR Apache-2.0 PCBcraft work over #291's exact decimal formatter. Prefix names,
+symbols and powers follow the published NIST SI prefix table
+(https://www.nist.gov/pml/owm/metric-si-prefixes). Boundary and notation regressions
+are original test inputs; no dependency, external implementation, library asset
+or native storage vocabulary was added.
+
+## Retained part quantities
+
+The `PartInstanceState` internal rename, baseline/3 historical primary quantities,
+typed capture/retirement and shared retained-footprint presentation are original
+MIT OR Apache-2.0 PCBcraft work following #292. They reuse the exact formatter
+from #291 and existing native part/category validation. Regression inputs derive
+from original repository library records and shared commands, using production
+folder/archive codecs. No external source, artwork, dependency or library data
+was introduced.
+
+## Shared quantity and unit model
+
+The shared quantity parser/formatter and standard registry extract original
+MIT OR Apache-2.0 PCBcraft code from PR 291's `4b8d82c` quantity implementation.
+The immutable metadata registry, validated canonical value, native typed-value
+adapter and registry/schema regressions are original PCBcraft work. Existing
+serde and shared units dependencies are reused; no external implementation,
+asset, dependency version or native saved-format change is introduced.
+
+## Performance fixtures and CPU replay
+
+The opt-in #240 harness, fixed-pattern workload recipes, input traces and evidence
+comparison tools are original MIT OR Apache-2.0 PCBcraft work. Fixtures use shared
+commands, the production archive encoder and existing qualified bundled definitions.
+Editor replay uses PCBcraft's production app and pinned Craft chrome. SHA-256
+reuses the already qualified sha2 dependency; no external EDA implementation,
+source-derived fixture, artwork or additional dependency version was introduced.
+
+## Rendered performance and resource diagnostics
+
+The native/browser rendered replay, authenticated MCP timing, supported-limit
+and branch/channel recipes, process-resource collector and evidence validators
+are original MIT OR Apache-2.0 PCBcraft work over the existing #240 harness and
+qualified eframe/wgpu renderer. The existing `web-sys` package is referenced
+directly only by the opt-in browser diagnostic; no package version or renderer
+patch is added. Native callback polling follows wgpu 30.0.1's published
+`Device::poll` / `Buffer::map_async` contracts
+(https://docs.rs/wgpu/30.0.1/wgpu/struct.Device.html and
+https://docs.rs/wgpu/30.0.1/wgpu/struct.Buffer.html). Fixtures use shared commands
+and production codecs; no external EDA implementation, asset or project data
+was introduced. Valgrind is an optional external diagnostic executable, not a
+linked or bundled dependency.
+
+## Bounded snapshot checker jobs
+
+The captured DRC authority, resumable copper contact/checker phases, bounded finding
+retention, native worker limits, browser cooperative runner and deferred live MCP
+completion are original MIT OR Apache-2.0 PCBcraft work for #243. The progress meter
+reuses the pinned Craft toolkit through `crates/chrome`, under its existing retained
+licence and notices. Checker diagnostics extend the original #240 fixtures and
+runner; no new dependency, external implementation, artwork, library data or saved
+project format was introduced.
+
+## Library workspace
+
+The per-pane library browser, nested/flat record views, host source lifecycle and
+regressions are original MIT OR Apache-2.0 PCBcraft work for #315. The composition
+follows @travle1's original rendered mockups; interface presentation reuses the
+already qualified pinned Craft tree, tables, surfaces, controls and icon set,
+including its `library` books master. Electronics previews reuse existing original
+PCBcraft painters. No new dependency, third-party EDA source, artwork, library data
+or native project/library format was introduced.
+
+Library workspace follow-up chrome composes the same qualified panel host and
+menu rows for reserved Preview columns and acquisition choices. Native edge
+gestures and pane headers remain PCBcraft's existing shared host framework;
+these corrections add no assets or dependencies.
+
+Library Preview navigation reuses PCBcraft's original footprint-picker camera and
+native geometry painters for symbol and footprint inspection. Floating-card size
+controls compose the already qualified pinned Craft panel sashes, surfaces and
+menu rows through the shared chrome adapter. It uses the existing shared dependency
+family without external model data, artwork or EDA implementation; local arrangement dimensions do not
+change native project or library formats.
+
+
+On November 13, 2026, @travle1 explicitly authorized pinning the latest shared
+UI and fixing compatibility. The coupled UI kit, look, theme, registry and text
+crates now use SolidCraft 0.41.0 at
+`73bdb6cdd39efc3899fb54e7217289a630a89efe`, replacing the initial migration's
+`f56114219b2d7f6d16de8dd58700479646948f8a` pin. The egui-wgpu and winit patches
+use the same revision; their source directories are unchanged between these pins.
+The Brand and Interface licence bytes and retained SHA-256 are unchanged, and
+`deny.toml` keeps its exceptions limited to the three covered 0.41.0 packages.
+The existing upstream written-record request remains separate from this local
+official-project authorization; no release or publication is part of this work.
+
+`solidcraft-ui-text` and `solidcraft-ui-registry` retain MIT OR Apache-2.0.
+`crates/chrome/assets/shared-ui/en.json` retains the English entries referenced
+as literals by the shared kit/look/theme from that revision's
+`assets/locales/en.json`. PCBcraft installs this host catalog before shared
+controls render, including text-edit context menus. Application/electronics copy
+remains host-owned. The extracted shared UI English data follows the same retained
+Brand and Interface notice; no new fonts or unrelated application assets were copied.
+
+## UI automation adapter
+
+The native UI automation adapter uses the existing pinned
+`solidcraft-ui-registry` target-publication API, originally qualified at SolidCraft
+revision `f56114219b2d7f6d16de8dd58700479646948f8a` and now using main's
+0.41.0 pin recorded above. It adds PCBcraft-owned enabled,
+clipping, window and input-lifecycle metadata around shared toolkit responses;
+it does not introduce a toolkit dependency upgrade. SolidCraft's public
+`examples/demo/record_ui.sh` and `enclosure_ui_mcp.py` were read as workflow
+references on November 13, 2026. Their source was not copied into this adapter.
+The existing shared toolkit licence and authorization records above continue
+to apply. The pinned registry does not track per-host enabled/covered state or
+queue native input; those concrete host responsibilities remain in PCBcraft.

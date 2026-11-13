@@ -26,15 +26,38 @@ pub fn input(value: &mut String) -> egui::TextEdit<'_> {
     egui::TextEdit::singleline(value)
         .margin(egui::Margin::symmetric(t.space_8 as i8, t.space_4 as i8))
         .min_size(vec2(0., t.control_height))
-        .vertical_align(Align::Center)
+        .align(egui::Align2::LEFT_CENTER)
 }
 
 /// A single-line editable field with a stable accessible name, independent of label placement.
 pub fn text(ui: &mut Ui, label: &str, value: &mut String) -> egui::Response {
     let t = Tokens::get();
     ui.horizontal(|ui| {
-        let label = ui.add_sized(vec2(72.0, t.control_height), egui::Label::new(label).halign(Align::Min));
-        ui.add(input(value).desired_width(ui.available_width())).labelled_by(label.id)
+        let label_response = ui.add_sized(vec2(72.0, t.control_height), egui::Label::new(label).halign(Align::Min));
+        let response = crate::controls::text(ui, value).labelled_by(label_response.id);
+        crate::automation::publish(ui, &response, format!("field:{label}"));
+        response
+    })
+    .inner
+}
+
+/// Keep a labelled value and its trailing action inside the form, reserving the action's measured width.
+/// The returned flag reports only the action; its accessible name includes the field label.
+pub fn text_action(ui: &mut Ui, label: &str, value: &mut String, action: &str) -> bool {
+    let t = Tokens::get();
+    ui.horizontal(|ui| {
+        let label_response = ui.add_sized(vec2(72.0, t.control_height), egui::Label::new(label).halign(Align::Min));
+        let action_width =
+            egui::WidgetText::from(action).into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Button).size().x
+                + ui.spacing().button_padding.x * 2.0
+                + ui.spacing().item_spacing.x;
+        let field_width = (ui.available_width() - action_width).max(0.0);
+        ui.allocate_ui_with_layout(vec2(field_width, t.control_height), Layout::left_to_right(Align::Center), |ui| {
+            crate::controls::text(ui, value).labelled_by(label_response.id);
+        });
+        let response = crate::controls::bounded_button(ui, label, action, action_width - ui.spacing().item_spacing.x, true);
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("{action} {label}")));
+        response.clicked()
     })
     .inner
 }
@@ -46,17 +69,41 @@ pub fn choice(ui: &mut Ui, label: &str, id: egui::Id, value: &mut String, option
     ui.horizontal(|ui| {
         let label = ui.add_sized(vec2(72.0, t.control_height), egui::Label::new(label).halign(Align::Min));
         let selected = options.iter().find(|(key, _)| *key == value.as_str()).map(|(_, text)| text.as_str()).unwrap_or(value.as_str()).to_owned();
-        egui::ComboBox::from_id_salt(id)
-            .selected_text(selected)
-            .show_ui(ui, |ui| {
-                for (key, text) in options {
-                    ui.selectable_value(value, (*key).into(), text);
-                }
-            })
-            .response
-            .labelled_by(label.id)
+        solidcraft_ui_kit::dropdown_menu(ui, id, &selected, |ui| {
+            for (key, text) in options {
+                ui.selectable_value(value, (*key).into(), text);
+            }
+        })
+        .labelled_by(label.id)
     })
     .inner
+}
+
+/// Align a typed selector with the inspector's text fields, using the full value column and shared control height.
+pub fn select(ui: &mut Ui, label: &str, id: egui::Id, selected: &str, add: impl FnOnce(&mut Ui)) -> egui::Response {
+    let t = Tokens::get();
+    ui.horizontal(|ui| {
+        let label = ui.add_sized(vec2(72., t.control_height), egui::Label::new(label).halign(Align::Min));
+        ui.spacing_mut().interact_size.y = t.control_height;
+        egui::ComboBox::from_id_salt(id).width(ui.available_width()).selected_text(selected).show_ui(ui, add).response.labelled_by(label.id)
+    })
+    .inner
+}
+
+/// Present a whole-degree angle with the same label column, width and height as adjacent inputs.
+pub fn angle(ui: &mut Ui, label: &str, degrees: &mut u16) -> egui::Response {
+    let t = Tokens::get();
+    ui.horizontal(|ui| {
+        let label = ui.add_sized(vec2(72., t.control_height), egui::Label::new(label).halign(Align::Min));
+        ui.add_sized(vec2(ui.available_width(), t.control_height), egui::DragValue::new(degrees).range(0..=359).suffix("°")).labelled_by(label.id)
+    })
+    .inner
+}
+
+/// Reserve the inspector's heading and action footer when scrolling a form in a short host.
+pub fn form_body_height(area: egui::Rect) -> f32 {
+    let height = Tokens::get().control_height;
+    (area.height() - 6. * height).max(2. * height)
 }
 
 /// Distinguish symbol terminal identities from footprint pad identities above mapping rows.
@@ -80,7 +127,7 @@ pub fn mapping_choice(ui: &mut Ui, label: &str, id: egui::Id, value: &mut String
         ui.spacing_mut().interact_size.y = t.control_height;
         let label = field_name(ui, label, label_width, false);
         let selected = options.iter().find(|(key, _)| *key == value.as_str()).map(|(_, text)| text.as_str()).unwrap_or(value.as_str());
-        egui::ComboBox::from_id_salt(id)
+        crate::controls::Choice::from_id_salt(id)
             .width(ui.available_width())
             .selected_text(selected)
             .show_ui(ui, |ui| {
@@ -90,6 +137,33 @@ pub fn mapping_choice(ui: &mut Ui, label: &str, id: egui::Id, value: &mut String
             })
             .response
             .labelled_by(label.id)
+    })
+    .inner
+}
+
+/// Edit a terminal's physical pad set in the same aligned row as a single-pad mapping.
+/// Checkbox choices keep the popup open; callers validate exclusive ownership across rows.
+pub fn mapping_multi_choice(ui: &mut Ui, label: &str, id: egui::Id, values: &mut Vec<String>, options: &[(&str, String)]) -> egui::Response {
+    let t = Tokens::get();
+    let label_width = mapping_label_width(ui.available_width());
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = t.space_8;
+        ui.spacing_mut().interact_size.y = t.control_height;
+        let label = field_name(ui, label, label_width, false);
+        let selected = if values.is_empty() { "None".into() } else { values.join(", ") };
+        solidcraft_ui_kit::dropdown_menu_with_close_behavior(ui, id, &selected, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+            for (key, text) in options {
+                let mut checked = values.iter().any(|value| value == key);
+                if crate::controls::checkbox(ui, &mut checked, text).changed() {
+                    if checked {
+                        values.push((*key).into());
+                    } else {
+                        values.retain(|value| value != key);
+                    }
+                }
+            }
+        })
+        .labelled_by(label.id)
     })
     .inner
 }
@@ -104,7 +178,7 @@ pub fn rotation(ui: &mut Ui, degrees: &mut u16) {
     let t = Tokens::get();
     ui.horizontal(|ui| {
         let label = ui.add_sized(vec2(72.0, t.control_height), egui::Label::new("Rotation").halign(Align::Min));
-        egui::ComboBox::from_id_salt("property_rotation")
+        crate::controls::Choice::from_id_salt("property_rotation")
             .selected_text(format!("{degrees}°"))
             .show_ui(ui, |ui| {
                 for rotation in [0, 90, 180, 270] {
@@ -193,7 +267,7 @@ pub fn footprint_preview(ui: &mut Ui, label: &str) -> (egui::Rect, egui::Respons
     let t = Tokens::get();
     let height = if ui.available_width() > 360. { 320. } else { 240. };
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), height), egui::Sense::click_and_drag());
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Panel, true, label));
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Pane, true, label));
     ui.painter_at(rect).rect_filled(rect, t.radius_md, t.board_canvas);
     (rect.shrink(t.space_12), response)
 }
@@ -216,12 +290,12 @@ pub fn field_action(ui: &mut Ui, name: &str, action: &str, enabled: bool) -> egu
     let label_width = field_label_width(width);
     ui.horizontal(|ui| {
         field_name(ui, name, label_width, false);
-        ui.add_enabled(
+        crate::controls::bounded_button(
+            ui,
+            ("field_action", name),
+            action,
+            (width - label_width - 3. * t.space_8 - 2. * t.space_24).max(40.),
             enabled,
-            egui::Button::new(action)
-                .right_text(())
-                .truncate()
-                .min_size(vec2((width - label_width - 3. * t.space_8 - 2. * t.space_24).max(40.), t.control_height)),
         )
     })
     .inner
@@ -306,24 +380,10 @@ fn field_label_width(width: f32) -> f32 {
     if width >= 600. { Tokens::get().form_label_width * 2. + Tokens::get().space_8 } else { 112. }
 }
 
-/// Property navigation uses a quiet underline instead of another row of filled buttons.
+/// Property navigation uses shared segmented choices, falling back to a dropdown in narrow rows.
 pub fn tabs<T: Copy + PartialEq>(ui: &mut Ui, current: &mut T, options: &[(T, &str)]) {
-    let t = Tokens::get();
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing.x = t.space_16;
-        for (value, label) in options {
-            let selected = *current == *value;
-            let response =
-                ui.add(egui::Button::selectable(selected, RichText::new(*label).color(if selected { t.text } else { t.text_dim })).frame(false));
-            if selected {
-                ui.painter().hline(response.rect.x_range(), response.rect.bottom() + t.space_4, egui::Stroke::new(2., t.accent));
-            }
-            if response.clicked() {
-                *current = *value;
-            }
-        }
-    });
-    ui.add_space(t.space_8);
+    crate::settings::segmented(ui, current, options);
+    ui.add_space(Tokens::get().space_8);
 }
 
 /// Recognize absolute HTTP(S) field links with a nonempty authority. Whitespace, control
@@ -362,7 +422,7 @@ pub fn inline_text(
     let top = (anchor.center().y - height / 2.).clamp(canvas.top(), (canvas.bottom() - height).max(canvas.top()));
     let rect = egui::Rect::from_min_size(egui::pos2(left, top), vec2(width, height));
     let response = ui.put(rect, input(value).id(id).font(font).char_limit(2048));
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, label));
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TextInput, true, label));
     if focus {
         response.request_focus();
         if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), id) {
@@ -382,6 +442,17 @@ pub fn inline_text(
         );
     }
     response
+}
+
+/// Read-only Library geometry grows with the Preview's width and shares the
+/// ordinary symbol/board palettes, card corners, hit target and inset rhythm.
+pub fn geometry_preview(ui: &mut Ui, label: &str, footprint: bool) -> (egui::Rect, egui::Response) {
+    let t = Tokens::get();
+    let height = (ui.available_width() * 0.75).clamp(180., 360.);
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), height), egui::Sense::click_and_drag());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Pane, ui.is_enabled(), label));
+    ui.painter_at(rect).rect_filled(rect, t.radius_md, if footprint { t.board_canvas } else { t.canvas });
+    (rect.shrink(t.space_12), response)
 }
 
 #[cfg(test)]

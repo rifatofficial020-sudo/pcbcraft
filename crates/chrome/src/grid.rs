@@ -18,6 +18,13 @@ pub use crate::units::NM_PER_MIL;
 pub const SCHEMATIC_SPACING_DEFAULT_NM: i64 = 50 * NM_PER_MIL;
 /// The schematic spacings offered in the grid menu, coarsest first.
 pub const SCHEMATIC_SPACING_PRESETS_NM: [i64; 5] = [100 * NM_PER_MIL, 50 * NM_PER_MIL, 25 * NM_PER_MIL, 10 * NM_PER_MIL, 5 * NM_PER_MIL];
+/// The PCB grid when nothing has been chosen: 50 mil (1.27 mm), retaining the spacing PCB views
+/// inherited before they remembered their own. It can diverge from the schematic default later
+/// without changing existing schematic or board behavior.
+pub const BOARD_SPACING_DEFAULT_NM: i64 = 50 * NM_PER_MIL;
+/// The PCB spacings offered in the grid menu, coarsest first. They currently match the schematic
+/// presets but stay a separate list so board work can choose different defaults in one place.
+pub const BOARD_SPACING_PRESETS_NM: [i64; 5] = [100 * NM_PER_MIL, 50 * NM_PER_MIL, 25 * NM_PER_MIL, 10 * NM_PER_MIL, 5 * NM_PER_MIL];
 /// The spacings a person can choose: 0.01 mm up to 1000 mil (25.4 mm).
 pub const SPACING_RANGE_NM: RangeInclusive<i64> = 10_000..=1000 * NM_PER_MIL;
 /// Drawn grid points are at least this many times their spacing apart after thinning out.
@@ -136,44 +143,68 @@ pub fn paint(painter: &Painter, rect: Rect, origin: Pos2, step: f32, opacity_per
 /// Draw dots or lines using the supplied workspace color. Off paints nothing, and both
 /// visible styles use the same origin and zoom thinning without changing the snap interval.
 pub fn paint_style(painter: &Painter, rect: Rect, origin: Pos2, step: f32, color: Color32, style: Style) {
+    painter.extend(shapes(rect, origin, step, color, style));
+}
+
+/// Build the same bounded grid for canvas and deferred ribbon painting. Fine marks fade
+/// near the density threshold while every fifth mark retains its color, so changing the
+/// displayed interval is continuous. Snapping is independent of these presentation levels.
+/// Off and invalid spacing return no shapes.
+pub fn shapes(rect: Rect, origin: Pos2, step: f32, color: Color32, style: Style) -> Vec<egui::Shape> {
+    let mut shapes = Vec::new();
     if style == Style::Off {
-        return;
+        return shapes;
     }
     let Some(every) = shown_every(step) else {
-        return;
+        return shapes;
     };
     let step = step * every as f32;
+    let fade = (step / theme::SCHEMATIC_MIN_GRID_SPACING - 1.0).clamp(0.0, 1.0);
+    let fade = fade * fade * (3.0 - 2.0 * fade);
+    let minor = (fade > 0.0).then(|| color.gamma_multiply(fade)).filter(|color| color.a() > 0);
     let first_x = ((rect.left() - origin.x) / step).ceil() as i32;
     let last_x = ((rect.right() - origin.x) / step).floor() as i32;
     let first_y = ((rect.top() - origin.y) / step).ceil() as i32;
     let last_y = ((rect.bottom() - origin.y) / step).floor() as i32;
     if style == Style::Lines {
         for x in first_x..=last_x {
-            painter.vline(origin.x + x as f32 * step, rect.y_range(), Stroke::new(1.0, color));
+            let Some(color) = (if x % THIN_FACTOR as i32 == 0 { Some(color) } else { minor }) else { continue };
+            shapes.push(egui::Shape::line_segment(
+                [pos2(origin.x + x as f32 * step, rect.top()), pos2(origin.x + x as f32 * step, rect.bottom())],
+                Stroke::new(1.0, color),
+            ));
         }
         for y in first_y..=last_y {
-            painter.hline(rect.x_range(), origin.y + y as f32 * step, Stroke::new(1.0, color));
+            let Some(color) = (if y % THIN_FACTOR as i32 == 0 { Some(color) } else { minor }) else { continue };
+            shapes.push(egui::Shape::line_segment(
+                [pos2(rect.left(), origin.y + y as f32 * step), pos2(rect.right(), origin.y + y as f32 * step)],
+                Stroke::new(1.0, color),
+            ));
         }
-        return;
+        return shapes;
     }
     for x in first_x..=last_x {
         for y in first_y..=last_y {
+            let major = x % THIN_FACTOR as i32 == 0 && y % THIN_FACTOR as i32 == 0;
+            let Some(color) = (if major { Some(color) } else { minor }) else { continue };
             let center = pos2(origin.x + x as f32 * step, origin.y + y as f32 * step);
-            painter.circle_filled(center, theme::SCHEMATIC_GRID_DOT_RADIUS, color);
+            shapes.push(egui::Shape::circle_filled(center, theme::SCHEMATIC_GRID_DOT_RADIUS, color));
         }
     }
+    shapes
 }
 
 /// A percentage slider for grid opacity and a Reset button that returns it to
 /// [`OPACITY_DEFAULT`]. Reset is disabled while the value is already the default. Returns true
 /// when the value changed this frame.
 pub fn opacity_control(ui: &mut Ui, opacity_percent: &mut u8) -> bool {
-    let t = Tokens::get();
     let before = *opacity_percent;
     let slider = egui::Slider::new(opacity_percent, OPACITY_RANGE).step_by(f64::from(OPACITY_STEP)).suffix("%");
-    ui.add(slider);
-    let reset = egui::Button::new(egui::RichText::new("Reset").size(t.font_label));
-    if ui.add_enabled(*opacity_percent != OPACITY_DEFAULT, reset).on_hover_text(format!("Back to {OPACITY_DEFAULT}%")).clicked() {
+    ui.add(slider).accessible_name("Grid opacity");
+    if crate::controls::enabled_button(ui, *opacity_percent != OPACITY_DEFAULT, "Reset")
+        .on_hover_text(format!("Back to {OPACITY_DEFAULT}%"))
+        .clicked()
+    {
         *opacity_percent = OPACITY_DEFAULT;
     }
     *opacity_percent != before
@@ -198,9 +229,8 @@ pub fn spacing_menu(ui: &mut Ui, spacing_nm: &mut i64, presets: &[i64], default_
         format!("Grid {current}")
     };
     let caption = text.replace(&format!(" {}", unit.symbol()), "");
-    let button = egui::Button::new(RichText::new(caption).size(t.font_label)).frame(false);
-    let response = ui.add(button).on_hover_text("Grid spacing of the focused view (N, Shift+N)");
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), &text));
+    let response = solidcraft_ui_kit::text_button(ui, &caption, true).on_hover_text("Grid spacing of the focused view (N, Shift+N)");
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), &text));
     let field_id = response.id.with("custom_spacing");
     egui::Popup::menu(&response)
         .frame(menu::frame())
@@ -215,12 +245,12 @@ pub fn spacing_menu(ui: &mut Ui, spacing_nm: &mut i64, presets: &[i64], default_
             for &preset in presets {
                 let label = spacing_label(preset, unit);
                 let label = if preset == default_nm { format!("{label} (default)") } else { label };
-                if MenuItem::new(&label).checked(*spacing_nm == preset).show(ui) {
+                if MenuItem::new(&label).choice(*spacing_nm == preset).show(ui) {
                     *spacing_nm = preset;
                 }
             }
             if !presets.contains(spacing_nm) {
-                MenuItem::new(&format!("{current} (custom)")).checked(true).show(ui);
+                MenuItem::new(&format!("{current} (custom)")).choice(true).show(ui);
             }
             menu::separator(ui);
             let (mut draft, mut error) = ui.data(|d| d.get_temp::<(String, Option<String>)>(field_id)).unwrap_or_default();
@@ -235,7 +265,7 @@ pub fn spacing_menu(ui: &mut Ui, spacing_nm: &mut i64, presets: &[i64], default_
                     if field.changed() {
                         error = None;
                     }
-                    if ui.button(RichText::new("Apply").size(t.font_label)).clicked() || entered {
+                    if crate::controls::button(ui, RichText::new("Apply").size(t.font_label)).clicked() || entered {
                         match parse_spacing(&draft, unit) {
                             Ok(nm) => {
                                 *spacing_nm = nm;
@@ -320,6 +350,44 @@ mod tests {
         assert_eq!(dots(rect, f32::NAN, 100), 0);
     }
 
+    /// Fine marks fade before the fivefold density change; the surviving coarse marks
+    /// retain their positions and ink on both sides of the boundary, for dots and lines.
+    #[test]
+    fn grid_density_changes_preserve_the_surviving_marks() {
+        let area = Rect::from_min_max(pos2(-99., -99.), pos2(99., 99.));
+        for style in [Style::Dots, Style::Lines] {
+            let exact = shapes(area, Pos2::ZERO, 5., Color32::WHITE, style);
+            let below = shapes(area, Pos2::ZERO, 4.99999, Color32::WHITE, style);
+            assert_eq!(exact.len(), below.len());
+            for (a, b) in exact.iter().zip(&below) {
+                match (a, b) {
+                    (egui::Shape::Circle(a), egui::Shape::Circle(b)) => {
+                        assert!(a.center.distance(b.center) < 0.001);
+                        assert_eq!(a.fill, b.fill);
+                    }
+                    (egui::Shape::LineSegment { points: a, stroke: sa }, egui::Shape::LineSegment { points: b, stroke: sb }) => {
+                        assert!(a[0].distance(b[0]) < 0.001 && a[1].distance(b[1]) < 0.001);
+                        assert_eq!(sa, sb);
+                    }
+                    _ => panic!("unexpected grid shape"),
+                }
+            }
+        }
+        let minor_alpha = |step| {
+            shapes(area, Pos2::ZERO, step, Color32::WHITE, Style::Dots)
+                .iter()
+                .find_map(|shape| match shape {
+                    egui::Shape::Circle(dot) if dot.center == pos2(step, 0.) => Some(dot.fill.a()),
+                    _ => None,
+                })
+                .unwrap_or(0)
+        };
+        assert_eq!(minor_alpha(5.), 0);
+        assert!(minor_alpha(5.5) > 0 && minor_alpha(5.5) < minor_alpha(7.5));
+        assert!(minor_alpha(7.5) < minor_alpha(10.));
+        assert_eq!(minor_alpha(10.), 255);
+    }
+
     #[test]
     fn typed_spacing_reads_mils_millimetres_and_inches() {
         assert_eq!(parse_spacing_mil("25"), Ok(25 * NM_PER_MIL));
@@ -392,5 +460,13 @@ mod tests {
         assert_eq!(cycle(30 * NM_PER_MIL, &presets, true), Some(25 * NM_PER_MIL));
         assert_eq!(cycle(30 * NM_PER_MIL, &presets, false), Some(50 * NM_PER_MIL));
         assert_eq!(cycle(30 * NM_PER_MIL, &[], false), None);
+    }
+
+    /// The PCB list is independent but must stay usable by the same typed-entry and cycle rules.
+    #[test]
+    fn board_presets_include_the_board_default_and_stay_in_range() {
+        assert!(BOARD_SPACING_PRESETS_NM.contains(&BOARD_SPACING_DEFAULT_NM));
+        assert!(BOARD_SPACING_PRESETS_NM.iter().chain([&BOARD_SPACING_DEFAULT_NM]).all(|nm| SPACING_RANGE_NM.contains(nm)));
+        assert_eq!(cycle(BOARD_SPACING_DEFAULT_NM, &BOARD_SPACING_PRESETS_NM, true), Some(25 * NM_PER_MIL));
     }
 }

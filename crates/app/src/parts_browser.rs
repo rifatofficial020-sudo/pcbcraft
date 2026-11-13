@@ -20,35 +20,15 @@ enum Collection {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Key {
     Symbol(String, String, u32),
+    Part(String, String, u32),
 }
 
-/// Every catalog row retains the same validated native definition, independent of delivery.
-#[derive(Clone, Debug)]
-struct Entry(Arc<SymbolDefinition>);
-impl Entry {
-    /// Qualified item identity remains independent of display names and source paths.
-    fn key(&self) -> Key {
-        Key::Symbol(self.0.library.clone(), self.0.id.clone(), self.0.revision())
-    }
-    /// Display names come from native definitions, never from collection membership.
-    fn name(&self) -> &str {
-        &self.0.name
-    }
-    /// The editable template starts with the same Value as direct engine placement.
-    fn default_value(&self) -> &str {
-        self.0.default_value()
-    }
-    /// Libraries are presentation filters; electrical roles do not define a second item kind.
-    fn in_collection(&self, collection: &Collection) -> bool {
-        match collection {
-            Collection::All => true,
-            Collection::Library(id) => *id == self.0.library,
-        }
-    }
-}
+mod native_parts;
+use native_parts::Entry;
 /// The host owns the placement tool or source manager; compact catalogs can remain visible.
 pub(crate) enum Pick {
     Place(Placement),
+    Unit { definition: Arc<SymbolDefinition>, component: String, unit: String, value: String },
     Libraries,
     Stale,
 }
@@ -58,11 +38,12 @@ pub(crate) enum Pick {
 pub(crate) struct Placement {
     pub definition: Arc<SymbolDefinition>,
     pub value: String,
+    pub part: Option<pcbcraft_engine::part_instances::Selection>,
 }
 impl Placement {
     /// Copy definition defaults without altering the pinned library item.
     pub fn new(definition: Arc<SymbolDefinition>) -> Self {
-        Self { value: definition.default_value().to_owned(), definition }
+        Self { value: definition.default_value().to_owned(), definition, part: None }
     }
 }
 
@@ -90,6 +71,7 @@ pub(crate) struct PartsBrowser {
     collection: Collection,
     selected: Option<Key>,
     value: String,
+    part: Option<pcbcraft_engine::part_instances::Selection>,
     source: Option<ViewInput>,
     focus: bool,
     focus_ids: Vec<egui::Id>,
@@ -109,6 +91,7 @@ impl Default for PartsBrowser {
             collection: Collection::All,
             selected: None,
             value: String::new(),
+            part: None,
             source: None,
             focus: false,
             focus_ids: Vec::new(),
@@ -305,7 +288,15 @@ impl PartsBrowser {
 
     /// Share catalog state across the expanded chooser and compact dock. Modal choices retain
     /// their opening view/revision; nonmodal placement gestures capture the current view.
-    pub(crate) fn show(&mut self, ui: &Ui, canvas: Rect, browser: Rect, source: ViewInput, libraries: &library::sources::Catalog) -> Option<Pick> {
+    pub(crate) fn show(
+        &mut self,
+        ui: &Ui,
+        canvas: Rect,
+        browser: Rect,
+        source: ViewInput,
+        libraries: &library::sources::Catalog,
+        project: Option<&pcbcraft_engine::Project>,
+    ) -> Option<Pick> {
         if !self.open {
             return None;
         }
@@ -315,21 +306,25 @@ impl PartsBrowser {
         let sources = libraries.inspect();
         let query = self.query.trim().to_lowercase();
         let entries: Vec<_> = entries(&query, libraries).into_iter().filter(|e| e.in_collection(&self.collection)).collect();
-        if self.selected.is_none() {
-            self.selected = entries.first().map(Entry::key);
-            self.value = entries.first().map(Entry::default_value).unwrap_or_default().into();
+        if self.selected.is_none()
+            && let Some(entry) = entries.first()
+        {
+            self.select_entry(entry);
         }
         self.focus_ids.clear();
-        let enabled = entries.iter().any(|e| Some(e.key()) == self.selected) && valid_value(&self.value);
+        let enabled =
+            entries.iter().find(|e| Some(e.key()) == self.selected).is_some_and(|entry| self.capture_placement(entry, &self.value).is_some());
         let mut choices = Choices::default();
+        let mut picked_unit = None;
         let mut action = if expanded {
-            chrome::form(ui.ctx(), "parts_catalog", "Parts Catalog", 1108., "Place", enabled, true, ui.is_enabled(), |ui| {
+            chrome::parts_form(ui.ctx(), enabled, ui.is_enabled(), |ui| {
                 chrome::toolbar(ui, if ui.available_width() < 900. { 3 } else { 2 }, |ui| {
                     self.search(ui);
                     if ui.available_width() < 900. {
                         self.library_selector(ui, &sources);
                     }
                     self.placement_options(ui);
+                    picked_unit = existing_units(ui, project);
                 });
                 chrome::panes(ui, |ui, region| match region {
                     chrome::Region::Libraries => {
@@ -340,7 +335,7 @@ impl PartsBrowser {
                         pcbcraft_chrome::library_sources::heading(ui, "Parts", entries.len());
                         choices = self.results(ui, &entries, owner, false);
                     }
-                    chrome::Region::Preview => self.preview(ui, &entries, &sources),
+                    chrome::Region::Preview => self.preview(ui, &entries, &sources, libraries),
                 });
                 choices.confirm |= ui.is_enabled() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !egui::Popup::is_any_open(ui.ctx());
             })
@@ -351,18 +346,20 @@ impl PartsBrowser {
                 self.search(ui);
                 self.library_selector(ui, &sources);
                 self.placement_options(ui);
+                picked_unit = existing_units(ui, project);
                 let field = properties::text(ui, "Value", &mut self.value);
+                self.part_controls(ui, libraries);
                 self.focus_ids.push(field.id);
                 choices = self.results(ui, &entries, owner, short);
                 choices.confirm |= ui.input(|i| i.key_pressed(egui::Key::Enter))
                     && (choices.focused || self.focused(ui.ctx()))
                     && !egui::Popup::is_any_open(ui.ctx());
                 ui.horizontal(|ui| {
-                    let response = ui.button("Libraries…");
-                    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "Manage libraries…"));
+                    let response = pcbcraft_chrome::controls::button(ui, "Libraries…");
+                    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), "Manage libraries…"));
                     action.libraries = response.clicked();
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        action.primary = ui.add_enabled(enabled, egui::Button::new("Place")).clicked();
+                        action.primary = pcbcraft_chrome::controls::enabled_button(ui, enabled, "Place").clicked();
                     });
                 });
             });
@@ -377,6 +374,10 @@ impl PartsBrowser {
         };
         if !ui.is_enabled() {
             return None;
+        }
+        if let Some(pick) = picked_unit {
+            self.close(ui.ctx());
+            return Some(if owner == source { pick } else { Pick::Stale });
         }
         if action.compact {
             self.set_compact(ui.ctx(), true);
@@ -404,7 +405,8 @@ impl PartsBrowser {
                 self.close(ui.ctx());
                 return Some(Pick::Stale);
             }
-            let picked = entries.iter().find(|e| Some(e.key()) == self.selected).and_then(|entry| placement(entry, &self.value)).map(Pick::Place);
+            let picked =
+                entries.iter().find(|e| Some(e.key()) == self.selected).and_then(|entry| self.capture_placement(entry, &self.value)).map(Pick::Place);
             if expanded {
                 self.close(ui.ctx());
             } else {
@@ -417,11 +419,7 @@ impl PartsBrowser {
 
     /// Both catalog presentations edit the same query and explicitly own their search focus.
     fn search(&mut self, ui: &mut Ui) {
-        let response = ui.add_sized(
-            [ui.available_width(), pcbcraft_chrome::Tokens::get().control_height],
-            egui::TextEdit::singleline(&mut self.query).hint_text("Search parts"),
-        );
-        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, ui.is_enabled(), "Search parts"));
+        let response = catalog::search(ui, &mut self.query);
         self.focus_ids.push(response.id);
         if response.changed() {
             self.selected = None;
@@ -450,7 +448,7 @@ impl PartsBrowser {
             .collect();
         let mut value = choices.iter().position(|(choice, _)| *choice == self.collection).map(|i| keys[i].clone()).unwrap_or_else(|| "all".into());
         let options: Vec<_> = keys.iter().zip(&choices).map(|(key, (_, name))| (key.as_str(), name.clone())).collect();
-        properties::choice(ui, "Library", ui.id().with("catalog_library"), &mut value, &options);
+        properties::choice(ui, "Library", ui.scope_id().with("catalog_library"), &mut value, &options);
         if let Some(index) = keys.iter().position(|key| *key == value)
             && self.collection != choices[index].0
         {
@@ -470,10 +468,9 @@ impl PartsBrowser {
             self.reveal_selection = false;
         }
         catalog::grid(ui, view, entries, reveal, |ui, entry, width| {
-            let symbol = &entry.0;
-            let identity = (entries.iter().filter(|other| other.name() == entry.name()).count() > 1)
-                .then(|| format!("{}/{} r{}", symbol.library, symbol.id, symbol.revision()));
-            let value = symbol.default_value();
+            let (Key::Part(library, id, revision) | Key::Symbol(library, id, revision)) = entry.key();
+            let identity = (entries.iter().filter(|other| other.name() == entry.name()).count() > 1).then(|| format!("{library}/{id} r{revision}"));
+            let value = entry.default_value();
             let response = catalog::tile(
                 ui,
                 view,
@@ -482,15 +479,12 @@ impl PartsBrowser {
                 |p, r, ink| paint_entry(p, r, entry, ink),
             );
             let name = if self.selected == Some(entry.key()) { &self.value } else { entry.default_value() };
-            if let Some(placement) = placement(entry, name) {
+            if let Some(placement) = self.capture_placement(entry, name) {
                 response.dnd_set_drag_payload(crate::schematic_canvas::PartDrag { placement, source: owner });
                 choices.dragging |= response.drag_started();
             }
-            if response.clicked() || response.drag_started() {
-                if self.selected != Some(entry.key()) {
-                    self.value = entry.default_value().into();
-                }
-                self.selected = Some(entry.key());
+            if (response.clicked() || response.drag_started()) && self.selected != Some(entry.key()) {
+                self.select_entry(entry);
             }
             choices.confirm |= response.double_clicked();
             choices.focused |= response.has_focus();
@@ -500,7 +494,7 @@ impl PartsBrowser {
 
     /// Keep definition metadata and custom rail names in the full preview pane; compact mode
     /// uses the same tile painter and name field without duplicating this large preview.
-    fn preview(&mut self, ui: &mut Ui, entries: &[Entry], sources: &serde_json::Value) {
+    fn preview(&mut self, ui: &mut Ui, entries: &[Entry], sources: &serde_json::Value, catalog: &library::sources::Catalog) {
         let Some(entry) = entries.iter().find(|e| Some(e.key()) == self.selected) else {
             return;
         };
@@ -510,6 +504,7 @@ impl PartsBrowser {
         properties::section(ui, "Symbol");
         let field = properties::text(ui, "Value", &mut self.value);
         self.focus_ids.push(field.id);
+        self.part_controls(ui, catalog);
         properties::field(ui, "Pins", |ui| {
             ui.label(symbol.pins().len().to_string());
         });
@@ -522,8 +517,7 @@ impl PartsBrowser {
         for (collection, name) in collections(sources) {
             let count = entries.iter().filter(|entry| entry.in_collection(&collection)).count();
             let response = ui.selectable_label(self.collection == collection, format!("{name}  {count}"));
-            response
-                .widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, self.collection == collection, name.as_str()));
+            response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, self.collection == collection, name.as_str()));
             if response.clicked() {
                 self.collection = collection;
                 self.selected = None;
@@ -531,11 +525,6 @@ impl PartsBrowser {
             }
         }
     }
-}
-
-/// Click and drag capture the same editable Value and exact native definition.
-fn placement(entry: &Entry, value: &str) -> Option<Placement> {
-    valid_value(value).then(|| Placement { definition: entry.0.clone(), value: value.to_owned() })
 }
 
 /// Native drawings use one painter for bundled, folder and portable-bundle sources.
@@ -572,7 +561,7 @@ fn valid_value(value: &str) -> bool {
 }
 /// Search current unambiguous source revisions without separately injecting bundled items.
 fn entries(query: &str, catalog: &library::sources::Catalog) -> Vec<Entry> {
-    matches_sources(query, catalog).into_iter().map(Entry).collect()
+    native_parts::entries(query, catalog)
 }
 /// Qualified source identities, revisions and attribution survive into placement.
 fn matches_sources(query: &str, catalog: &library::sources::Catalog) -> Vec<Arc<SymbolDefinition>> {
@@ -584,3 +573,28 @@ fn matches_sources(query: &str, catalog: &library::sources::Catalog) -> Vec<Arc<
 
 #[cfg(test)]
 mod tests;
+
+/// Offer unplaced units of pinned project parts on whichever sheet owns this chooser.
+fn existing_units(ui: &mut Ui, project: Option<&pcbcraft_engine::Project>) -> Option<Pick> {
+    let project = project?;
+    let available: Vec<_> =
+        project.components().flat_map(|part| project.available_units(&part.id()).into_iter().map(move |unit| (part, unit))).collect();
+    if available.is_empty() {
+        return None;
+    }
+    let mut picked = None;
+    ui.menu_button("Existing part units", |ui| {
+        for (part, unit) in &available {
+            if ui.button(format!("{} {} · {}", part.reference(), unit.unit_id().to_uppercase(), part.definition.name)).clicked() {
+                picked = Some(Pick::Unit {
+                    definition: part.definition.clone(),
+                    component: part.id(),
+                    unit: unit.unit_id().to_owned(),
+                    value: part.value().to_owned(),
+                });
+                ui.close();
+            }
+        }
+    });
+    picked
+}

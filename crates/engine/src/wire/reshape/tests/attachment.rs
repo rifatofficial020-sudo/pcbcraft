@@ -42,12 +42,12 @@ fn attaching_a_branched_junction_to_a_pin_is_one_persistent_edit() {
         assert!(after.wire_path(new).windows(2).all(|p| p[0] != p[1] && (p[0].x_nm == p[1].x_nm || p[0].y_nm == p[1].y_nm)));
     }
     for encoding in [Encoding::Json, Encoding::Zip] {
-        let bytes = persistence::encode_file(after.clone(), encoding).unwrap();
-        let (loaded, _) = persistence::decode_file(&bytes).unwrap();
+        let bytes = persistence::diagnostic_test_file(after.clone(), encoding).unwrap();
+        let (loaded, _) = persistence::decode_diagnostic_file(&bytes).unwrap();
         assert_eq!(loaded.wires, after.wires);
         assert_eq!(loaded.junctions, after.junctions);
         assert_eq!(loaded.connectivity().nets.len(), 1);
-        assert_eq!(persistence::encode_file(loaded, encoding).unwrap(), bytes, "a no-op save is byte stable");
+        assert_eq!(persistence::diagnostic_test_file(loaded, encoding).unwrap(), bytes, "a no-op save is byte stable");
     }
     let documents = persistence::encode_documents(after.clone()).unwrap();
     let loaded = persistence::decode_documents(&documents).unwrap();
@@ -56,7 +56,7 @@ fn attaching_a_branched_junction_to_a_pin_is_one_persistent_edit() {
     assert_eq!(persistence::encode_documents(loaded).unwrap(), documents);
     let packed = persistence::encode_packed(after.clone()).unwrap();
     let loaded = persistence::decode_packed(&packed).unwrap();
-    assert_eq!(loaded.documents.as_ref(), Some(&documents));
+    assert_eq!(&loaded.documents, &documents);
     assert_eq!(persistence::encode_packed(loaded.project).unwrap(), packed);
     session.apply("edit.undo", &Value::Null).unwrap();
     assert!(Arc::ptr_eq(&before, &session.snapshot().unwrap()));

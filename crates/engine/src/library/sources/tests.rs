@@ -51,6 +51,34 @@ fn source_commands_place_and_pin_offline_through_the_existing_command_path() {
     crate::assert_same_content(&before, &session.snapshot().unwrap());
 }
 
+/// Bundled registrations reject mutation without changing project/catalog state; protection
+/// follows their delivery origin, while external registrations remain removable.
+#[test]
+fn bundled_sources_are_read_only_without_changing_project_or_catalog() {
+    let mut session = Session::default();
+    session.apply("project.new", &json!({})).unwrap();
+    let project = session.snapshot().unwrap();
+    let revision = session.revision();
+    let catalog = session.libraries().inspect();
+    let generation = session.libraries().generation();
+    let bytes = encode_documents(project.clone()).unwrap();
+    for source in ["bundled-starter", "bundled-power"] {
+        assert!(session.execute(REMOVE, &json!({"source":source})).unwrap_err().to_string().contains("read-only"));
+        assert!(session.execute(LOAD, &json!({"source":source,"documents":documents()})).unwrap_err().to_string().contains("read-only"));
+        session.mark_library_unavailable(source);
+        assert_eq!(session.libraries().inspect(), catalog);
+        assert_eq!(session.libraries().generation(), generation);
+        assert!(catalog.as_array().unwrap().iter().any(|entry| entry["source"] == source && entry["builtin"] == true));
+    }
+    session.execute(LOAD, &json!({"source":"bundled-personal","documents":documents()})).unwrap();
+    assert!(session.libraries().inspect().as_array().unwrap().iter().any(|entry| entry["source"] == "bundled-personal" && entry["builtin"] == false));
+    session.execute(REMOVE, &json!({"source":"bundled-personal"})).unwrap();
+    assert_eq!(session.libraries().inspect(), catalog);
+    assert!(Arc::ptr_eq(&project, &session.snapshot().unwrap()));
+    assert_eq!(session.revision(), revision);
+    assert_eq!(encode_documents(session.snapshot().unwrap()).unwrap(), bytes);
+}
+
 /// Invalid files are isolated, malformed manifests/transport bounds fail, and upload/folder data agree.
 #[test]
 fn native_validation_reports_paths_and_bounds_before_adoption() {
@@ -156,4 +184,28 @@ fn external_symbol_placement_names_missing_revision_and_digest_parameters() {
     }
     session.apply(crate::PLACE_SYMBOL, &params).unwrap();
     assert_eq!(session.project().unwrap().symbols().len(), 1);
+}
+
+/// Source browsing retains old/quarantined revisions without weakening placement search.
+#[test]
+fn browse_retains_revisions_and_quarantine_and_redundancy_is_content_exact() {
+    let documents = super::super::bundled_documents().next().unwrap().1;
+    let source = Arc::new(NativeSource::load(&documents).unwrap());
+    let mut catalog = Catalog::default();
+    catalog.install("first", source.clone()).unwrap();
+    assert!(catalog.contains_source(&source));
+    assert_eq!(catalog.source_items("first").len(), source.items().len());
+    catalog.mark_unavailable("first");
+    assert!(catalog.source_items("first").is_empty());
+    assert!(!catalog.contains_source(&source));
+    catalog.install("first", source.clone()).unwrap();
+    let mut different = documents.clone();
+    let path = different.keys().find(|p| p.starts_with("symbols/")).unwrap().clone();
+    let mut symbol: Value = serde_json::from_str(&different[&path]).unwrap();
+    symbol["name"] = json!("Conflicting original test name");
+    different.insert(path, symbol.to_string());
+    let conflicting = Arc::new(NativeSource::load(&different).unwrap());
+    catalog.install("other", conflicting).unwrap();
+    assert!(catalog.source_items("first").iter().any(|item| catalog.conflicting(&item.key)));
+    assert!(!catalog.contains_source(&source));
 }

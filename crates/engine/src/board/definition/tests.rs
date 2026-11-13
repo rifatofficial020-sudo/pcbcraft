@@ -24,6 +24,46 @@ fn assign(s: &mut Session, symbol: &str, definition: &str, mapping: Value) -> St
     s.inspect()["project"]["board"]["footprints"].as_array().unwrap().last().unwrap()["id"].as_str().unwrap().into()
 }
 
+/// Library defaults and board adjustments compose before clipping, while authoring preserves pads.
+#[test]
+fn library_and_board_reference_offsets_are_additive() {
+    use crate::authoring::{Action, FootprintReferenceSettings, Item};
+    let original = starter("resistor-0402").unwrap();
+    let mut editor = crate::authoring::Session::new(Item::from_footprint(&original).unwrap(), false).unwrap();
+    let before = editor.snapshot();
+    let default = Point { x_nm: 2_000_000, y_nm: -1_000_000 };
+    editor
+        .execute(
+            editor.revision(),
+            Action::Metadata {
+                name: before.name.clone(),
+                license: before.license.clone(),
+                source: before.source.clone(),
+                reference_prefix: before.reference_prefix.clone(),
+                default_value: before.default_value.clone(),
+                symbol_settings: None,
+                footprint_reference: Some(FootprintReferenceSettings { enabled: true, offset: default }),
+            },
+        )
+        .unwrap();
+    let changed = editor.snapshot().footprint().unwrap();
+    assert_eq!(changed.pads, original.pads);
+    assert_eq!(changed.graphics, original.graphics);
+    assert_eq!(changed.silkscreen, original.silkscreen);
+    let offset = Point { x_nm: -1_000_000, y_nm: -2_000_000 };
+    let baseline = original.reference_paths("R12", Default::default(), super::super::DEFAULT_REFERENCE_OFFSET);
+    let expected: Vec<Vec<Point>> = baseline
+        .iter()
+        .map(|path| path.iter().map(|p| Point { x_nm: p.x_nm + default.x_nm + offset.x_nm, y_nm: p.y_nm + default.y_nm + offset.y_nm }).collect())
+        .collect();
+    assert!(!expected.is_empty());
+    assert_eq!(changed.reference_paths("R12", Default::default(), offset), expected);
+    let exported = editor.snapshot().export_native().unwrap();
+    let parsed = read_saved(&serde_json::to_vec(&exported).unwrap()).unwrap();
+    assert_eq!(parsed.reference_offset, Some(default));
+    assert_eq!(parsed.reference_paths("R12", Default::default(), offset), expected);
+}
+
 /// All original definitions validate; rectangular geometry and a three-pin bijection survive
 /// rotation, history and offline folder/archive decoding without changing schematic intent.
 #[test]
@@ -66,7 +106,7 @@ fn smd_geometry_and_three_terminal_mappings_are_pinned_and_persistent() {
     let bytes = encode_documents(snapshot.clone()).unwrap();
     assert!(bytes.contains_key("library/footprints/starter/resistor-0402.r4.json"));
     assert!(bytes.contains_key("library/footprints/starter/sot23.r4.json"));
-    assert!(std::str::from_utf8(&bytes["board.json"]).unwrap().contains("pcbcraft-board/5"));
+    assert!(std::str::from_utf8(&bytes[&crate::persistence::test_board_path(&bytes)]).unwrap().contains("pcbcraft-board/5"));
     assert_eq!(encode_documents(decode_documents(&bytes).unwrap()).unwrap(), bytes);
     assert_eq!(encode_documents(decode_packed(&encode_packed(snapshot.clone()).unwrap()).unwrap().project).unwrap(), bytes);
     let schematic = s.inspect()["project"]["schematic"].clone();
@@ -94,10 +134,10 @@ fn pinned_custom_footprints_reopen_without_a_catalog_source() {
     definition["id"] = json!("custom-resistor");
     definition["pads"][0]["width_nm"] = json!(900_000);
     docs.insert("library/footprints/offline-fixture/custom-resistor.r4.json".into(), serde_json::to_vec_pretty(&definition).unwrap());
-    let mut board: Value = serde_json::from_slice(&docs["board.json"]).unwrap();
+    let mut board: Value = serde_json::from_slice(&docs[&crate::persistence::test_board_path(&docs)]).unwrap();
     board["footprints"][0]["library"] = json!("offline-fixture");
     board["footprints"][0]["definition"] = json!("custom-resistor");
-    docs.insert("board.json".into(), serde_json::to_vec_pretty(&board).unwrap());
+    docs.insert(crate::persistence::test_board_path(&docs), serde_json::to_vec_pretty(&board).unwrap());
     let reopened = decode_documents(&docs).unwrap();
     let footprint = reopened.board_view(reopened.board_target().unwrap()).unwrap().footprints().next().unwrap();
     let copper = footprint.pads[0].copper.unwrap();
@@ -147,9 +187,9 @@ fn invalid_physical_footprints_and_mappings_are_atomic() {
     missing.remove(path);
     assert!(decode_documents(&missing).is_err());
     let mut old = docs.clone();
-    let mut b: Value = serde_json::from_slice(&old["board.json"]).unwrap();
+    let mut b: Value = serde_json::from_slice(&old[&crate::persistence::test_board_path(&old)]).unwrap();
     b["format"] = json!("pcbcraft-board/4");
-    old.insert("board.json".into(), serde_json::to_vec(&b).unwrap());
+    old.insert(crate::persistence::test_board_path(&old), serde_json::to_vec(&b).unwrap());
     assert!(decode_documents(&old).unwrap_err().contains("format 5"));
     assert!(crate::persistence::encode(s.snapshot().unwrap()).is_err());
 }

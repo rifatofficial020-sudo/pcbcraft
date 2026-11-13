@@ -106,15 +106,23 @@ impl std::fmt::Debug for Form {
 }
 
 impl Assistant {
-    /// Render the AI page and return a request to open the agent editor.
+    /// Render human-controlled AI settings and return a request to open the agent editor.
+    /// Synthetic input cannot operate this page or change permission policy.
     pub(crate) fn settings_page(&mut self, ui: &mut Ui) -> Option<Request> {
+        let human = pcbcraft_chrome::automation::human_input(ui.ctx());
+        ui.add_enabled_ui(human, |ui| self.settings_contents(ui)).inner
+    }
+
+    /// Keep permission policy and agent configuration under human control, including popups
+    /// that were opened before a synthetic input pass began.
+    fn settings_contents(&mut self, ui: &mut Ui) -> Option<Request> {
         let mut request = None;
         if self.settings.show_features {
             self.ensure_detection(ui.ctx());
         }
         ui.heading("AI");
         ui.separator();
-        if ui.checkbox(&mut self.settings.show_features, "Show AI features").changed() {
+        if pcbcraft_chrome::controls::checkbox(ui, &mut self.settings.show_features, "Show AI features").changed() {
             self.settings_changed = true;
             if !self.settings.show_features {
                 self.hide(ui.ctx(), Visibility::Hidden);
@@ -123,33 +131,41 @@ impl Assistant {
         }
 
         ui.add_enabled_ui(self.settings.show_features, |ui| {
-            self.settings_changed |= ui.checkbox(&mut self.settings.toolbar, "Show Assistant button in application bar").changed();
+            self.settings_changed |=
+                pcbcraft_chrome::controls::checkbox(ui, &mut self.settings.toolbar, "Show Assistant button in application bar").changed();
             ui.separator();
             ui.strong("Permissions");
             ui.label(dim("What agents may do without asking. Reading the project always runs."));
             ui.horizontal_wrapped(|ui| {
                 for mode in Mode::ALL {
-                    if ui.selectable_label(self.settings.agents.ai_permissions == mode, mode.label()).clicked() {
+                    if ui.selectable_label(self.settings.agents.ai_permissions == mode, mode.label()).clicked()
+                        && pcbcraft_chrome::automation::human_input(ui.ctx())
+                    {
                         self.settings.agents.ai_permissions = mode;
                         self.settings_changed = true;
                     }
                 }
             });
-            let auto = ui
-                .checkbox(&mut self.settings.agents.auto_approve_bridge, "Approve agents' requests to use PCBCraft's tools automatically")
-                .on_hover_text(
-                    "PCBCraft still applies the permission mode to every command. Turn this off to also confirm each \
+            let mut automatic = self.settings.agents.auto_approve_bridge;
+            let auto = ui.checkbox(&mut automatic, "Approve agents' requests to use PCBCraft's tools automatically").on_hover_text(
+                "PCBCraft still applies the permission mode to every command. Turn this off to also confirm each \
                      request in the agent's own words, which shows that the call comes from it, at the cost of a \
                      second question for commands the mode asks about.",
-                );
-            self.settings_changed |= auto.changed();
+            );
+            if auto.changed() && pcbcraft_chrome::automation::human_input(ui.ctx()) {
+                self.settings.agents.auto_approve_bridge = automatic;
+                self.settings_changed = true;
+            }
             ui.separator();
             ui.horizontal(|ui| {
                 ui.strong("Agents");
-                if ui.add_enabled(self.settings.agents.agents.len() < MAX_AGENTS, egui::Button::new("Add agent…")).clicked() {
+                if pcbcraft_chrome::controls::enabled_button(ui, self.settings.agents.agents.len() < MAX_AGENTS, "Add agent…").clicked() {
                     request = Some(Request::Add(Box::default()));
                 }
-                if ui.add_enabled(self.detecting.is_none(), egui::Button::new("Refresh")).on_hover_text("Look for installed agents again").clicked() {
+                if pcbcraft_chrome::controls::enabled_button(ui, self.detecting.is_none(), "Refresh")
+                    .on_hover_text("Look for installed agents again")
+                    .clicked()
+                {
                     self.detect(ui.ctx());
                 }
             });
@@ -172,7 +188,7 @@ impl Assistant {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(name);
                             ui.label(dim(install));
-                            if ui.small_button("Copy").on_hover_text("Copy the install command").clicked() {
+                            if pcbcraft_chrome::controls::small_button(ui, "Copy").on_hover_text("Copy the install command").clicked() {
                                 ui.ctx().copy_text(install.to_owned());
                             }
                         });
@@ -196,8 +212,9 @@ impl Assistant {
             });
             ui.separator();
             ui.strong("Startup");
-            self.settings_changed |= ui.checkbox(&mut self.settings.connect_at_start, "Connect the default agent at startup").changed();
-            self.settings_changed |= ui.checkbox(&mut self.settings.open_at_start, "Open Assistant at startup").changed();
+            self.settings_changed |=
+                pcbcraft_chrome::controls::checkbox(ui, &mut self.settings.connect_at_start, "Connect the default agent at startup").changed();
+            self.settings_changed |= pcbcraft_chrome::controls::checkbox(ui, &mut self.settings.open_at_start, "Open Assistant at startup").changed();
         });
         request
     }
@@ -215,38 +232,42 @@ impl Assistant {
         ui.label(dim(format!("{}{login}", entry.detail())));
         ui.horizontal_wrapped(|ui| {
             let testing = self.tests.iter().any(|(id, _)| *id == entry.id);
-            if ui.add_enabled(!testing, egui::Button::new("Test")).on_hover_text("Start the agent and check that it answers").clicked() {
+            if pcbcraft_chrome::controls::enabled_button(ui, !testing, "Test").on_hover_text("Start the agent and check that it answers").clicked() {
                 self.test_agent(ui.ctx(), entry);
             }
             if self.settings.agents.agent_default == entry.id {
                 ui.label(dim("Default"));
-            } else if ui.button("Make default").clicked() {
+            } else if pcbcraft_chrome::controls::button(ui, "Make default").clicked() {
                 self.settings.agents.agent_default.clone_from(&entry.id);
                 self.settings_changed = true;
             }
             let own = self.settings.agents.agent_permissions.get(&entry.id).copied();
             let shown = own.map_or("Use the global mode", Mode::label);
-            egui::ComboBox::from_id_salt("agent_mode").selected_text(shown).show_ui(ui, |ui| {
-                let mut chosen = own;
-                ui.selectable_value(&mut chosen, None, "Use the global mode");
-                for mode in Mode::ALL {
-                    ui.selectable_value(&mut chosen, Some(mode), mode.label());
-                }
-                if chosen != own {
-                    match chosen {
-                        Some(mode) => self.settings.agents.agent_permissions.insert(entry.id.clone(), mode),
-                        None => self.settings.agents.agent_permissions.remove(&entry.id),
-                    };
-                    self.settings_changed = true;
-                }
-            });
+            pcbcraft_chrome::controls::Choice::from_id_salt("agent_mode")
+                .selected_text(shown)
+                .show_ui(ui, |ui| {
+                    let mut chosen = own;
+                    ui.selectable_value(&mut chosen, None, "Use the global mode");
+                    for mode in Mode::ALL {
+                        ui.selectable_value(&mut chosen, Some(mode), mode.label());
+                    }
+                    if chosen != own && pcbcraft_chrome::automation::human_input(ui.ctx()) {
+                        match chosen {
+                            Some(mode) => self.settings.agents.agent_permissions.insert(entry.id.clone(), mode),
+                            None => self.settings.agents.agent_permissions.remove(&entry.id),
+                        };
+                        self.settings_changed = true;
+                    }
+                })
+                .response
+                .accessible_name("Agent permission mode");
             let remembered = self.settings.agents.agent_always_allow.get(&entry.id).map_or(0, Vec::len);
-            if remembered > 0 && ui.button(format!("Forget {remembered} always-allowed")).clicked() {
+            if remembered > 0 && pcbcraft_chrome::controls::button(ui, format!("Forget {remembered} always-allowed")).clicked() {
                 self.settings.agents.agent_always_allow.remove(&entry.id);
                 self.settings_changed = true;
             }
             if !entry.found {
-                if ui.button("Edit").clicked()
+                if pcbcraft_chrome::controls::button(ui, "Edit").clicked()
                     && let Some(agent) = self.settings.agents.agents.iter().find(|agent| agent.id == entry.id)
                 {
                     *request = Some(Request::Add(Box::new(Form {
@@ -262,7 +283,7 @@ impl Assistant {
                         ..Form::default()
                     })));
                 }
-                if ui.button("Remove").clicked() {
+                if pcbcraft_chrome::controls::button(ui, "Remove").clicked() {
                     self.remove_agent(&entry.id);
                 }
             }
@@ -325,6 +346,9 @@ impl Assistant {
         let mut done = false;
         let title = if form.editing.is_some() { "Edit agent" } else { "Add agent" };
         let closing = shell::dialog(ctx, "assistant_agent_dialog", title, |ui| {
+            if !pcbcraft_chrome::automation::human_input(ui.ctx()) {
+                ui.disable();
+            }
             let t = Tokens::get();
             if form.editing.is_none() {
                 ui.horizontal_wrapped(|ui| {
@@ -335,7 +359,7 @@ impl Assistant {
                 if let Some(protocol) = form.kind.protocol() {
                     ui.horizontal_wrapped(|ui| {
                         for preset in agents::presets(protocol) {
-                            if ui.small_button(preset.name).on_hover_text(preset.base_url).clicked() {
+                            if pcbcraft_chrome::controls::small_button(ui, preset.name).on_hover_text(preset.base_url).clicked() {
                                 form.name = preset.name.to_owned();
                                 form.base_url = preset.base_url.to_owned();
                             }
@@ -403,16 +427,18 @@ impl Assistant {
                     "PCBCraft runs the conversation itself and gives the model the project tools. A key is kept in the system keychain and only sent over HTTPS or to this computer.",
                 ));
                 if form.key_stored {
-                    ui.checkbox(&mut form.forget_key, "Remove the stored key");
+                    pcbcraft_chrome::controls::checkbox(ui, &mut form.forget_key, "Remove the stored key");
                 }
             }
             if let Some(error) = &form.error {
                 ui.label(shell::error(error));
             }
             ui.horizontal(|ui| {
-                if ui.button("Cancel").clicked() {
+                if pcbcraft_chrome::controls::button(ui, "Cancel").clicked() {
                     done = true;
-                } else if ui.button(if form.editing.is_some() { "Save" } else { "Add" }).clicked() {
+                } else if pcbcraft_chrome::controls::button(ui, if form.editing.is_some() { "Save" } else { "Add" }).clicked()
+                    && pcbcraft_chrome::automation::human_input(ui.ctx())
+                {
                     match self.save_agent(form) {
                         Ok(()) => done = true,
                         Err(error) => form.error = Some(error),
@@ -501,6 +527,90 @@ impl Assistant {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Raw synthetic pointer/keyboard input cannot broaden the global mode or bridge policy;
+    /// genuine user input keeps the existing settings behavior.
+    #[test]
+    fn synthetic_input_cannot_change_global_permission_policy() {
+        use egui_kittest::{Harness, kittest::Queryable};
+        let mut assistant = Assistant { detection: Some(Default::default()), ..Default::default() };
+        assistant.settings.agents.auto_approve_bridge = false;
+        let mut h = Harness::builder().with_size(egui::vec2(1400.0, 1000.0)).build_ui_state(
+            |ui, a: &mut Assistant| {
+                a.settings_page(ui);
+            },
+            assistant,
+        );
+        h.run();
+        for label in [Mode::All.label(), "Approve agents' requests to use PCBCraft's tools automatically"] {
+            let at = h.get_by_label(label).rect().center();
+            pcbcraft_chrome::automation::mark_synthetic_input(&h.ctx, true);
+            h.input_mut().events.extend([
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
+                egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE },
+            ]);
+            h.step();
+            assert_eq!(h.state().settings.agents.ai_permissions, Mode::Edits);
+            assert!(!h.state().settings.agents.auto_approve_bridge);
+            pcbcraft_chrome::automation::mark_synthetic_input(&h.ctx, false);
+            h.run();
+        }
+        h.get_by_label(Mode::All.label()).focus();
+        h.run();
+        pcbcraft_chrome::automation::mark_synthetic_input(&h.ctx, true);
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(h.state().settings.agents.ai_permissions, Mode::Edits);
+        pcbcraft_chrome::automation::mark_synthetic_input(&h.ctx, false);
+        h.run();
+        h.get_by_label(Mode::All.label()).click();
+        h.run();
+        assert_eq!(h.state().settings.agents.ai_permissions, Mode::All);
+    }
+
+    /// A permission popup opened by a person cannot apply a synthetic selection, including
+    /// when its rows are rendered independently of the surrounding settings page.
+    #[test]
+    fn synthetic_input_cannot_change_an_open_agent_permission_popup() {
+        use egui_kittest::{Harness, kittest::Queryable};
+        let mut assistant = Assistant { detection: Some(Default::default()), ..Default::default() };
+        assistant.settings.agents.agents.push(AgentConfig {
+            id: "fixture".into(),
+            name: "Fixture".into(),
+            command: "fake".into(),
+            ..Default::default()
+        });
+        assistant.settings.agents.agent_permissions.insert("fixture".into(), Mode::Ask);
+        let entry = assistant.entries().into_iter().find(|a| a.id == "fixture").unwrap();
+        let mut h = Harness::builder().with_size(egui::vec2(1000.0, 700.0)).build_ui_state(
+            move |ui, a: &mut Assistant| {
+                a.agent_row(ui, &entry, &mut None);
+            },
+            assistant,
+        );
+        h.run();
+        h.get_by_label("Agent permission mode").click();
+        h.run();
+        let at = h.get_by_label(Mode::All.label()).rect().center();
+        pcbcraft_chrome::automation::mark_synthetic_input(&h.ctx, true);
+        h.input_mut().events.extend([
+            egui::Event::PointerMoved(at),
+            egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
+            egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE },
+        ]);
+        h.step();
+        assert_eq!(h.state().settings.agents.agent_permissions.get("fixture"), Some(&Mode::Ask));
+        pcbcraft_chrome::automation::mark_synthetic_input(&h.ctx, false);
+        h.run();
+        if h.query_by_label(Mode::All.label()).is_none() {
+            h.get_by_label("Agent permission mode").click();
+            h.run();
+        }
+        h.get_by_label(Mode::All.label()).click();
+        h.run();
+        assert_eq!(h.state().settings.agents.agent_permissions.get("fixture"), Some(&Mode::All));
+    }
 
     /// Settings from the earlier Assistant load as defaults; unusable added agents are dropped.
     #[test]

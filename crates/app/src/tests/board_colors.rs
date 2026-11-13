@@ -18,7 +18,7 @@ fn board<'a>() -> Harness<'a, PcbApp> {
     }
     h.run();
     click(&mut h, "Choose workspace");
-    click(&mut h, "PCB layout");
+    click(&mut h, "PCB Layout");
     h.query_all_by_label("Fit board").next().unwrap().click();
     h.run();
     h
@@ -178,7 +178,7 @@ fn shared_colors_survive_renaming_and_do_not_leak_to_other_boards() {
     h.state_mut().set_layer_color(original, &top, Some([35, 180, 130])).unwrap();
     let before = h.state().board_appearance.storage_text();
     click(&mut h, "Choose workspace");
-    click(&mut h, "Open PCB layout beside current view");
+    click(&mut h, "Open PCB Layout beside current view");
     let inspected = crate::window_commands::inspect_editor(h.state());
     let palettes: Vec<_> = inspected["views"]
         .as_array()
@@ -192,7 +192,7 @@ fn shared_colors_survive_renaming_and_do_not_leak_to_other_boards() {
     let mut setup = h.state().session.inspect()["project"]["board"]["setup"].clone();
     for layer in setup["layers"].as_array_mut().unwrap() {
         if layer["id"] == top {
-            layer["name"] = json!("Component copper");
+            layer["name"] = json!("Part copper");
         }
     }
     let revision = h.state().session.revision();
@@ -265,6 +265,43 @@ fn app_settings_save_retains_palette_without_writing_engineering_data() {
     assert_eq!(encode_documents(h.state().session.snapshot().unwrap()).unwrap(), bytes);
 }
 
+/// Body and reference selection lighten each configured layer, including fixed silk and generated letters.
+#[test]
+fn footprint_selection_preserves_custom_copper_and_silkscreen_colors() {
+    let mut h = board();
+    let view = h.state().views.active.id();
+    let copper = egui::Color32::from_rgb(160, 32, 48);
+    let silk = egui::Color32::from_rgb(176, 142, 34);
+    let top = layer(&h, "Top");
+    let front_silk = layer(&h, "Front silkscreen");
+    h.state_mut().set_layer_color(view, &top, Some([160, 32, 48])).unwrap();
+    h.state_mut().set_layer_color(view, &front_silk, Some([176, 142, 34])).unwrap();
+    let snapshot = h.state().session.snapshot().unwrap();
+    let footprint = snapshot.board_view(snapshot.board_target().unwrap()).unwrap().footprints().next().unwrap();
+    let id = footprint.id;
+    let before = encode_documents(snapshot.clone()).unwrap();
+    for reference in [false, true] {
+        let policy = h.state().preferences.selection_follow;
+        let app = h.state_mut();
+        if reference {
+            app.views.select_board_reference(id.clone(), &app.session, policy);
+        } else {
+            app.views.select_board(std::collections::BTreeSet::from([id.clone()]), &app.session, policy);
+        }
+        h.run();
+        assert_eq!(lands(&h, copper.lerp_to_gamma(egui::Color32::WHITE, 0.35)), 2);
+        let expected = silk.lerp_to_gamma(egui::Color32::WHITE, 0.35);
+        let paths = h
+            .output()
+            .shapes
+            .iter()
+            .filter(|shape| matches!(&shape.shape,egui::Shape::Path(path) if path.stroke.color==egui::epaint::ColorMode::Solid(expected)))
+            .count();
+        assert!(paths > 2, "Fixed silk and generated reference paths keep the silk hue");
+        assert_eq!(encode_documents(h.state().session.snapshot().unwrap()).unwrap(), before);
+    }
+}
+
 /// Every registered layer has an editable palette entry; supported technical graphics use it.
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
@@ -291,6 +328,7 @@ fn technical_layer_colors_reach_edges_silkscreen_and_ribbon_patches() {
     };
     assert!(path_color(&h, egui::Color32::from_rgb(0xAE, 0x63, 0xD1)));
     assert!(path_color(&h, egui::Color32::from_rgb(0x40, 0xC8, 0xD0)));
+    click(&mut h, "Layout");
     click(&mut h, "Active layer");
     click(&mut h, "Board Outline");
     let field = h.get_by_label("Active layer").rect();
@@ -298,6 +336,7 @@ fn technical_layer_colors_reach_edges_silkscreen_and_ribbon_patches() {
     assert!(
         h.output().shapes.iter().any(|shape| matches!(&shape.shape,egui::Shape::Rect(rect) if rect.fill==color && field.contains_rect(rect.rect)))
     );
+    click(&mut h, "Layout");
     click(&mut h, "Active layer");
     assert!(
         h.output().shapes.iter().filter(|shape| matches!(&shape.shape,egui::Shape::Rect(rect) if rect.fill==color)).count() >= 2,

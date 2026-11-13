@@ -1,7 +1,7 @@
 //! Revision-bound package selection works in either editor; assignment never creates geometry.
 use crate::{Dialog, PcbApp, ViewInput, Workspace};
 use pcbcraft_chrome::{shell, units};
-use pcbcraft_engine::{ASSIGN_FOOTPRINT, PLACE_ASSIGNED_FOOTPRINT, board::definition::FootprintDefinition};
+use pcbcraft_engine::{ASSIGN_FOOTPRINT, PLACE_ASSIGNED_FOOTPRINT, board::definition::FootprintDefinition, library::parts::PadIds};
 use serde_json::json;
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -13,12 +13,13 @@ pub(super) struct Edit {
     component_browser: bool,
     component_query: String,
     definition: Option<Arc<FootprintDefinition>>,
-    mapping: BTreeMap<String, String>,
+    mapping: BTreeMap<String, PadIds>,
+    unconnected_pads: Vec<String>,
     query: String,
     library: String,
     compatible: bool,
     mounting: Mounting,
-    camera: crate::library_preview::FootprintCamera,
+    camera: crate::library_preview::Camera,
     x: String,
     y: String,
     units: units::Unit,
@@ -40,12 +41,14 @@ impl Edit {
         self.camera = Default::default();
         self.definition = None;
         self.mapping.clear();
+        self.unconnected_pads.clear();
         if let Some(a) = project.footprint_assignments().into_iter().find(|a| a["component"] == self.component) {
             self.definition = project
                 .footprint_catalog()
                 .into_iter()
                 .find(|d| a["library"] == d.library && a["definition"] == d.id && a["definition_revision"] == d.revision);
             self.mapping = serde_json::from_value(a["mapping"].clone()).unwrap_or_default();
+            self.unconnected_pads = serde_json::from_value(a["unconnected_pads"].clone()).unwrap_or_default();
         }
         self.error = None;
         self.reveal_error = false;
@@ -74,7 +77,11 @@ impl Edit {
     fn matches_assignment(&self, project: &pcbcraft_engine::Project) -> bool {
         project.footprint_assignments().iter().find(|a| a["component"] == self.component).is_some_and(|a| {
             self.definition.as_ref().is_some_and(|d| {
-                a["library"] == d.library && a["definition"] == d.id && a["definition_revision"] == d.revision && a["mapping"] == json!(self.mapping)
+                a["library"] == d.library
+                    && a["definition"] == d.id
+                    && a["definition_revision"] == d.revision
+                    && a["mapping"] == json!(self.mapping)
+                    && serde_json::from_value::<Vec<String>>(a["unconnected_pads"].clone()).unwrap_or_default() == self.unconnected_pads
             })
         })
     }
@@ -83,12 +90,18 @@ impl Edit {
 impl PcbApp {
     /// Capture the originating view/project/revision. A schematic action supplies its component;
     /// the PCB entry point offers all project components, including those not yet placed.
+    /// Native parts open their package/requirements form after resolving the initial component.
     /// Package selection needs no board; placement requires an existing physical target.
     pub(super) fn begin_footprint_assignment(&mut self, component: Option<String>) {
+        let component_browser = component.is_none();
+        let Some(component) = component.or_else(|| self.session.project()?.components().next().map(|c| c.id())) else { return };
+        if self.session.project().and_then(|project| project.components().find(|part| part.id() == component)).is_some_and(|part| part.part.is_some())
+        {
+            self.begin_native_part_properties(component);
+            return;
+        }
         let Some(source) = self.views.active.input(&self.session) else { return };
         let Some(project) = self.session.project() else { return };
-        let component_browser = component.is_none();
-        let Some(component) = component.or_else(|| project.components().next().map(|c| c.id())) else { return };
         let mut edit = Edit {
             source,
             update_review: None,
@@ -97,6 +110,7 @@ impl PcbApp {
             component_query: String::new(),
             definition: None,
             mapping: BTreeMap::new(),
+            unconnected_pads: Vec::new(),
             query: String::new(),
             library: String::new(),
             compatible: true,
@@ -115,6 +129,7 @@ impl PcbApp {
     /// Show package provenance and an explicit terminal map. Assign and Place are separate undoable
     /// commands; a stale form closes before dispatch. Placed choices remain proposals until
     /// reviewed update acceptance, and legacy boards first need explicit adoption.
+    /// Native browser selections route to part properties without discarding the parent board review.
     /// Source/library files are never edited by this dialog.
     pub(super) fn footprint_assignment_dialog(&mut self, ctx: &egui::Context, mut edit: Edit) {
         if !self.views.view(edit.source.view()).is_some_and(|v| v.input(&self.session) == Some(edit.source)) {
@@ -126,7 +141,16 @@ impl PcbApp {
             return;
         }
         let Some(project) = self.session.snapshot() else { return };
-        let catalog = project.footprint_catalog();
+        let mut catalog = project.footprint_catalog();
+        for (_, item) in self.session.libraries().search("", Some(pcbcraft_engine::library::sources::Kind::Footprint)) {
+            if let Some(definition) = item.footprint()
+                && !catalog
+                    .iter()
+                    .any(|current| current.library == definition.library && current.id == definition.id && current.revision == definition.revision)
+            {
+                catalog.push(definition);
+            }
+        }
         let component = project.components().find(|c| c.id() == edit.component);
         let placed = project
             .board_target()
@@ -156,8 +180,11 @@ impl PcbApp {
                             ui.add(form::input(&mut edit.component_query).desired_width(ui.available_width()).hint_text("Reference or value"))
                                 .labelled_by(label.id);
                             let query = edit.component_query.to_lowercase();
-                            let components: Vec<_> =
-                                project.components().filter(|c| format!("{} {}", c.reference(), c.value()).to_lowercase().contains(&query)).collect();
+                            let components: Vec<_> = project
+                                .components()
+                                // Match the stored text too, so `1000` still finds a value shown as `1 kΩ`.
+                                .filter(|c| format!("{} {} {}", c.reference(), c.value(), c.display_value()).to_lowercase().contains(&query))
+                                .collect();
                             if components.is_empty() {
                                 ui.label("No components match");
                             }
@@ -169,7 +196,7 @@ impl PcbApp {
                                 |ui, rows| {
                                     for component in &components[rows] {
                                         let id = component.id();
-                                        let name = format!("{} · {}", component.reference(), component.value());
+                                        let name = format!("{} · {}", component.reference(), component.display_value());
                                         if ui
                                             .add_sized(
                                                 egui::vec2(ui.available_width(), row_height),
@@ -202,7 +229,7 @@ impl PcbApp {
                             form::choice(
                                 ui,
                                 "Library",
-                                ui.id().with("footprint_library"),
+                                ui.scope_id().with("footprint_library"),
                                 &mut edit.library,
                                 &std::iter::once(("", "All libraries".into()))
                                     .chain(
@@ -219,7 +246,7 @@ impl PcbApp {
                     }
                     Region::Results => {
                         if let Some(component) = project.components().find(|c| c.id() == edit.component) {
-                            form::identity(ui, component.reference(), component.value());
+                            form::identity(ui, component.reference(), &component.display_value());
                         }
                         ui.label(if excluded {
                             "Excluded from board"
@@ -238,8 +265,8 @@ impl PcbApp {
                             ui.add(form::input(&mut edit.query).desired_width(ui.available_width()).hint_text("Name or package"))
                                 .labelled_by(label.id);
                             ui.horizontal_wrapped(|ui| {
-                                ui.checkbox(&mut edit.compatible, "Match pin count");
-                                egui::ComboBox::from_id_salt("mounting_filter")
+                                pcbcraft_chrome::controls::checkbox(ui, &mut edit.compatible, "Match pin count");
+                                pcbcraft_chrome::controls::Choice::from_id_salt("mounting_filter")
                                     .selected_text(match edit.mounting {
                                         Mounting::All => "All mounting types",
                                         Mounting::Surface => "Surface mount",
@@ -251,7 +278,7 @@ impl PcbApp {
                                         ui.selectable_value(&mut edit.mounting, Mounting::Through, "Through hole");
                                     })
                                     .response
-                                    .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, true, "Mounting type"));
+                                    .widget_info(|| egui::WidgetInfo::labeled(egui::Role::ComboBox, true, "Mounting type"));
                             });
                             let pin_count = project.components().find(|c| c.id() == edit.component).map(|c| c.definition.pins().len());
                             let matches: Vec<_> = catalog.iter().filter(|d| edit.matches(d, pin_count)).cloned().collect();
@@ -260,7 +287,7 @@ impl PcbApp {
                             egui::ScrollArea::vertical().id_salt("package_results").max_height(height).show(ui, |ui| {
                                 if matches.is_empty() {
                                     ui.label("No footprints match");
-                                    if ui.button("Clear filters").clicked() {
+                                    if pcbcraft_chrome::controls::button(ui, "Clear filters").clicked() {
                                         edit.query.clear();
                                         edit.library.clear();
                                         edit.compatible = false;
@@ -281,6 +308,17 @@ impl PcbApp {
                                         && !selected
                                     {
                                         edit.mapping = project.default_footprint_mapping(&edit.component, &definition).unwrap_or_default();
+                                        edit.unconnected_pads = project
+                                            .footprint_assignments()
+                                            .iter()
+                                            .find(|a| {
+                                                a["component"] == edit.component
+                                                    && a["library"] == definition.library
+                                                    && a["definition"] == definition.id
+                                                    && a["definition_revision"] == definition.revision
+                                            })
+                                            .and_then(|a| serde_json::from_value(a["unconnected_pads"].clone()).ok())
+                                            .unwrap_or_default();
                                         edit.definition = Some(definition);
                                         edit.camera = Default::default();
                                         edit.error = None;
@@ -310,19 +348,41 @@ impl PcbApp {
                                         let numbers: std::collections::BTreeSet<_> = pins.iter().map(|p| p.number.as_str()).collect();
                                         let pads: std::collections::BTreeSet<_> = definition.pads.iter().map(|p| p.number.as_str()).collect();
                                         form::mapping_header(ui);
+                                        let multiple = pads.len() > numbers.len()
+                                            || !edit.unconnected_pads.is_empty()
+                                            || edit.mapping.values().any(|ids| ids.pads().len() > 1);
+                                        let options: Vec<_> =
+                                            definition.pads.iter().map(|pad| (pad.number.as_str(), format!("Pad {}", pad.number))).collect();
                                         for pin in pins {
-                                            let mapped = edit.mapping.entry(pin.number.clone()).or_default();
-                                            let options: Vec<_> = std::iter::once(("", "Choose pad".into()))
-                                                .chain(definition.pads.iter().map(|pad| (pad.number.as_str(), format!("Pad {}", pad.number))))
-                                                .collect();
-                                            form::mapping_choice(
+                                            let mapped = edit.mapping.entry(pin.number.clone()).or_insert_with(|| PadIds::Many(Vec::new()));
+                                            let label = pin.name.as_ref().filter(|name| *name != &pin.number).map_or_else(
+                                                || format!("Terminal {}", pin.number),
+                                                |name| format!("Terminal {} · {name}", pin.number),
+                                            );
+                                            let id = ui.scope_id().with((&edit.component, &pin.number));
+                                            if multiple {
+                                                let mut values = mapped.pads().to_vec();
+                                                form::mapping_multi_choice(ui, &label, id, &mut values, &options);
+                                                if values != mapped.pads() {
+                                                    *mapped = values.into();
+                                                }
+                                            } else {
+                                                let mut value = mapped.pads().first().cloned().unwrap_or_default();
+                                                let previous = value.clone();
+                                                let options: Vec<_> =
+                                                    std::iter::once(("", "Choose pad".into())).chain(options.iter().cloned()).collect();
+                                                form::mapping_choice(ui, &label, id, &mut value, &options);
+                                                if value != previous {
+                                                    *mapped = if value.is_empty() { PadIds::Many(Vec::new()) } else { value.into() };
+                                                }
+                                            }
+                                        }
+                                        if multiple {
+                                            form::mapping_multi_choice(
                                                 ui,
-                                                &pin.name.as_ref().filter(|name| *name != &pin.number).map_or_else(
-                                                    || format!("Terminal {}", pin.number),
-                                                    |name| format!("Terminal {} · {name}", pin.number),
-                                                ),
-                                                ui.id().with((&edit.component, &pin.number)),
-                                                mapped,
+                                                "Unconnected pads",
+                                                ui.scope_id().with("unconnected_pads"),
+                                                &mut edit.unconnected_pads,
                                                 &options,
                                             );
                                         }
@@ -335,7 +395,8 @@ impl PcbApp {
                                                     .on_hover_text("Replace all connections with matching terminal and pad numbers")
                                                     .clicked()
                                                 {
-                                                    edit.mapping = numbers.into_iter().map(|id| (id.into(), id.into())).collect();
+                                                    edit.mapping = numbers.into_iter().map(|id| (id.into(), PadIds::from(id))).collect();
+                                                    edit.unconnected_pads.clear();
                                                 }
                                             },
                                         );
@@ -375,6 +436,13 @@ impl PcbApp {
                 }
             });
         });
+        if project.components().find(|part| part.id() == edit.component).is_some_and(|part| part.part.is_some()) {
+            self.begin_native_part_properties(edit.component);
+            if let Dialog::NativePart(native) = &mut self.dialog {
+                native.update_review = edit.update_review;
+            }
+            return;
+        }
         let assign = action.primary;
         let place = action.secondary;
         if place && !edit.matches_assignment(&project) {
@@ -397,6 +465,7 @@ impl PcbApp {
                 params["definition"] = json!(d.id);
                 params["definition_revision"] = json!(d.revision);
                 params["mapping"] = json!(edit.mapping);
+                params["unconnected_pads"] = json!(edit.unconnected_pads);
                 ASSIGN_FOOTPRINT
             } else {
                 match (units::parse_length(&edit.x, edit.units), units::parse_length(&edit.y, edit.units)) {

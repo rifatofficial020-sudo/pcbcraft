@@ -164,7 +164,7 @@ impl SheetItems {
             .iter()
             .map(|symbol| {
                 let reference = project.reference(symbol);
-                let value = project.value(symbol);
+                let value = project.display_value(symbol);
                 let reference = if reference.is_empty() { symbol.id() } else { reference };
                 // Reference and value, two spaces apart, as PCBcraft Next lists them.
                 let item = Item {
@@ -457,7 +457,7 @@ impl Tree<'_> {
         let Some(label) = action.open_label() else {
             return false;
         };
-        let clicked = ui.button(label).clicked();
+        let clicked = pcbcraft_chrome::controls::button(ui, label).clicked();
         if clicked {
             self.picked = Some(action.clone());
             ui.close();
@@ -499,22 +499,23 @@ impl Tree<'_> {
                 {
                     self.reset = Some(node);
                 }
-                if matches!(node, Node::Sheet(_) | Node::Board(_)) && ui.button("Update PCB from schematic…").clicked() {
+                if matches!(node, Node::Sheet(_) | Node::Board(_)) && pcbcraft_chrome::controls::button(ui, "Update PCB from schematic…").clicked()
+                {
                     self.picked = Some(Action::UpdatePcb);
                     ui.close();
                 }
                 if matches!(node, Node::Sheets | Node::Sheet(_))
-                    && ui.add_enabled(self.sheet_count < pcbcraft_engine::sheets::MAX_SHEETS, egui::Button::new("New Sheet…")).clicked()
+                    && pcbcraft_chrome::controls::enabled_button(ui, self.sheet_count < pcbcraft_engine::sheets::MAX_SHEETS, "New Sheet…").clicked()
                 {
                     self.picked = Some(Action::ManageSheet { command: pcbcraft_engine::sheets::CREATE_SHEET, sheet: None });
                     ui.close();
                 }
                 if let Node::Sheet(sheet) = node {
-                    if ui.button("Rename Sheet…").clicked() {
+                    if pcbcraft_chrome::controls::button(ui, "Rename Sheet…").clicked() {
                         self.picked = Some(Action::ManageSheet { command: pcbcraft_engine::sheets::RENAME_SHEET, sheet: Some(sheet) });
                         ui.close();
                     }
-                    if ui.add_enabled(self.sheet_count > 1, egui::Button::new("Delete Sheet…")).clicked() {
+                    if pcbcraft_chrome::controls::enabled_button(ui, self.sheet_count > 1, "Delete Sheet…").clicked() {
                         self.picked = Some(Action::ManageSheet { command: pcbcraft_engine::sheets::DELETE_SHEET, sheet: Some(sheet) });
                         ui.close();
                     }

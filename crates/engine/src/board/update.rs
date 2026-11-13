@@ -1,10 +1,11 @@
 //! Immutable schematic-to-board inputs and deterministic reviewed update planning.
 //!
-//! Baselines retain historical component and terminal data independently of live
+//! Baselines retain historical part and terminal data independently of live
 //! schematic placements. Session commands own revision authority and publication;
 //! these helpers validate and construct candidates without mutating a session.
 
 use super::{Board, Footprint};
+use crate::library::parts::Value;
 use crate::{MAX_OBJECT_ID, MAX_SYMBOLS, Project, schematic::PinNumber};
 use serde::{
     Deserialize, Deserializer, Serialize,
@@ -22,6 +23,9 @@ pub use commands::{APPLY_UPDATE, BoardUpdatePreview, CANCEL_UPDATE, PREVIEW_UPDA
 
 /// Persisted accepted-input vocabulary; future shapes require an explicit migration.
 pub const FORMAT: &str = "pcbcraft-board-baseline/1";
+const MULTIPAD_FORMAT: &str = "pcbcraft-board-baseline/2";
+/// Historical typed quantities require this vocabulary; older baselines remain text-only.
+pub(crate) const QUANTITY_FORMAT: &str = "pcbcraft-board-baseline/3";
 /// Bound decoded history independently of the live component count.
 pub const MAX_BASELINE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -94,10 +98,16 @@ pub struct Package {
     pub definition: String,
     pub revision: u32,
     #[serde(deserialize_with = "mapping_records")]
-    pub mapping: BTreeMap<String, String>,
+    pub mapping: BTreeMap<String, crate::library::parts::PadIds>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unconnected_pads: Vec<String>,
 }
 
 impl Package {
+    /// Historical multi-pad and unconnected-pad choices retain an explicit version guard.
+    pub(crate) fn extended(&self) -> bool {
+        crate::library::parts::mapping::extended(&self.mapping, &self.unconnected_pads)
+    }
     /// Capture a pinned assignment without copying its placement or coordinates.
     pub(crate) fn from_assignment(assignment: &super::assignment::Assignment) -> Self {
         Self {
@@ -105,28 +115,36 @@ impl Package {
             definition: assignment.definition.clone(),
             revision: assignment.definition_revision,
             mapping: assignment.mapping.clone(),
+            unconnected_pads: assignment.unconnected_pads.clone(),
         }
     }
 
     /// Preserve a physical or legacy placement's exact logical pad correspondence.
     fn from_footprint(footprint: &Footprint) -> Self {
-        let mapping = footprint
-            .mapping
-            .clone()
-            .unwrap_or_else(|| BTreeMap::from([("1".into(), footprint.pin_1_pad.to_string()), ("2".into(), (3 - footprint.pin_1_pad).to_string())]));
-        Self { library: footprint.library.clone(), definition: footprint.definition.clone(), revision: footprint.definition_revision, mapping }
+        let mapping = footprint.mapping.clone().unwrap_or_else(|| {
+            BTreeMap::from([("1".into(), footprint.pin_1_pad.to_string().into()), ("2".into(), (3 - footprint.pin_1_pad).to_string().into())])
+        });
+        Self {
+            library: footprint.library.clone(),
+            definition: footprint.definition.clone(),
+            revision: footprint.definition_revision,
+            mapping,
+            unconnected_pads: footprint.unconnected_pads.clone(),
+        }
     }
 
-    /// Validate the serialized shape and exact one-to-one terminal correspondence.
+    /// Validate bounded complete pad coverage with exclusive physical-pad ownership.
     fn validate(&self, terminals: &[String]) -> Result<(), String> {
         let keys: BTreeSet<_> = self.mapping.keys().cloned().collect();
-        let values: BTreeSet<_> = self.mapping.values().collect();
+        let values: BTreeSet<_> = self.mapping.values().flat_map(|pads| pads.pads()).chain(&self.unconnected_pads).collect();
         if self.revision == 0
             || !super::definition::valid_id(&self.definition)
             || self.library.as_ref().is_some_and(|library| !super::definition::valid_id(library))
             || keys != terminals.iter().cloned().collect()
-            || self.mapping.len() != values.len()
-            || self.mapping.values().any(|value| PinNumber::new(value).is_none())
+            || values.len() > 128
+            || self.mapping.values().map(|pads| pads.pads().len()).sum::<usize>() + self.unconnected_pads.len() != values.len()
+            || self.mapping.values().any(|value| !value.valid())
+            || self.unconnected_pads.iter().any(|pad| PinNumber::new(pad).is_none())
         {
             return Err("invalid accepted package identity or terminal mapping".into());
         }
@@ -147,7 +165,14 @@ impl Package {
         let key = (library.clone(), self.definition.clone(), self.revision);
         let definition = board.definitions.get(&key).ok_or("missing pinned board-update package")?;
         let pads: BTreeSet<_> = definition.pads.iter().map(|pad| pad.number.as_str()).collect();
-        if pads != self.mapping.values().map(String::as_str).collect() {
+        if pads
+            != self
+                .mapping
+                .values()
+                .flat_map(|pads| pads.pads().iter().map(String::as_str))
+                .chain(self.unconnected_pads.iter().map(String::as_str))
+                .collect()
+        {
             return Err("accepted package mapping does not cover its exact pinned pads".into());
         }
         Ok(())
@@ -156,6 +181,7 @@ impl Package {
     /// Construct an accepted assignment only for real physical package definitions.
     fn assignment(&self, component: u64) -> Option<super::assignment::Assignment> {
         Some(super::assignment::Assignment {
+            unconnected_pads: self.unconnected_pads.clone(),
             component,
             library: self.library.clone()?,
             definition: self.definition.clone(),
@@ -166,17 +192,38 @@ impl Package {
 }
 
 /// Enough historical logical information to inspect a retained footprint without
-/// a live component, a schematic placement or an installed symbol source.
+/// a live part instance, a schematic placement or an installed symbol source.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ComponentState {
+pub struct PartInstanceState {
     pub library: String,
     pub definition: String,
     pub revision: u32,
     pub reference: String,
     pub value: String,
+    /// Exact primary quantity captured from a typed part; absent for legacy or untyped history.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "primary_quantity_record")]
+    pub primary_quantity: Option<Value>,
     pub terminals: Vec<String>,
     pub package: Option<Package>,
+}
+
+impl PartInstanceState {
+    /// Format captured typed data without inferring units from historical free text.
+    pub fn display_value(&self) -> std::borrow::Cow<'_, str> {
+        self.primary_quantity.as_ref().map_or_else(|| self.value.as_str().into(), |value| value.display().into())
+    }
+
+    /// Copy only the exact primary quantity resolved by the part's pinned category.
+    pub(crate) fn quantity_for(part: &crate::PartInstance) -> Option<Value> {
+        let (value, unit) = part.part.as_ref()?.primary_quantity()?;
+        Some(Value::Quantity { value: value.into(), unit: unit.into() })
+    }
+}
+
+/// A present quantity must be a record, never null; absence retains legacy encoding.
+fn primary_quantity_record<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(deserializer).map(Some)
 }
 
 /// Historical terminal membership, not a second editable connectivity graph or
@@ -198,7 +245,7 @@ pub struct Baseline {
     pub board: Uuid,
     pub source: SourceCapture,
     #[serde(deserialize_with = "component_records")]
-    pub components: BTreeMap<u64, ComponentState>,
+    pub components: BTreeMap<u64, PartInstanceState>,
     pub nets: Vec<NetState>,
 }
 
@@ -236,17 +283,19 @@ impl Baseline {
             let mut terminals: Vec<_> = component.definition.pins().iter().map(|pin| pin.number.as_str().to_owned()).collect();
             terminals.sort();
             for pin in &terminals {
-                let terminal = project.component_terminal(id, pin).ok_or("component terminal has no schematic unit")?;
-                terminal_keys.insert(terminal, TerminalKey { component: id, terminal: pin.clone() });
+                for terminal in project.component_terminals(id, pin) {
+                    terminal_keys.insert(terminal, TerminalKey { component: id, terminal: pin.clone() });
+                }
             }
             components.insert(
                 id,
-                ComponentState {
+                PartInstanceState {
                     library: component.definition.library.clone(),
                     definition: component.definition.id.clone(),
                     revision: component.definition.revision(),
                     reference: component.reference.clone(),
                     value: component.value.clone(),
+                    primary_quantity: PartInstanceState::quantity_for(component),
                     terminals,
                     package: desired.get(&id).cloned(),
                 },
@@ -258,12 +307,35 @@ impl Baseline {
             let mut terminals: Vec<_> = terminals.iter().filter_map(|pin| terminal_keys.get(pin).cloned()).collect();
             terminals.sort();
             terminals.dedup();
-            if terminals.len() >= 2 || (!terminals.is_empty() && !graph.net_names(index).is_empty()) {
+            let multiple_lands = terminals.iter().any(|terminal| {
+                desired.get(&terminal.component).and_then(|package| package.mapping.get(&terminal.terminal)).is_some_and(|pads| pads.pads().len() > 1)
+            });
+            if terminals.len() >= 2 || (!terminals.is_empty() && (!graph.net_names(index).is_empty() || multiple_lands)) {
                 nets.push(NetState { terminals, names: graph.net_names(index).to_vec() });
             }
         }
+        // Unwired terminals are absent from the electrical graph, but their multiple
+        // lands still require copper joining them on this physical board.
+        let connected: BTreeSet<_> = nets.iter().flat_map(|net| net.terminals.iter().cloned()).collect();
+        for (&component, state) in &components {
+            if let Some(package) = &state.package {
+                for (terminal, pads) in &package.mapping {
+                    let key = TerminalKey { component, terminal: terminal.clone() };
+                    if pads.pads().len() > 1 && !connected.contains(&key) {
+                        nets.push(NetState { terminals: vec![key], names: Vec::new() });
+                    }
+                }
+            }
+        }
         nets.sort_by(|left, right| left.terminals.cmp(&right.terminals));
-        let baseline = Self { format: FORMAT.into(), project: target.project, board: target.board, source, components, nets };
+        let format = if components.values().any(|part| part.primary_quantity.is_some()) {
+            QUANTITY_FORMAT
+        } else if components.values().any(|component| component.package.as_ref().is_some_and(Package::extended)) {
+            MULTIPAD_FORMAT
+        } else {
+            FORMAT
+        };
+        let baseline = Self { format: format.into(), project: target.project, board: target.board, source, components, nets };
         baseline.validate()?;
         baseline.validate_assets(project)?;
         baseline.encode()?;
@@ -315,8 +387,12 @@ impl Baseline {
         use std::io::Write;
         self.validate()?;
         let mut bytes = BaselineWriter { bytes: Vec::new() };
-        write!(&mut bytes, "{{\n  \"format\": \"{FORMAT}\",\n  \"project\": \"{}\",\n  \"board\": \"{}\",\n  \"source\": ", self.project, self.board)
-            .map_err(|error| error.to_string())?;
+        write!(
+            &mut bytes,
+            "{{\n  \"format\": \"{}\",\n  \"project\": \"{}\",\n  \"board\": \"{}\",\n  \"source\": ",
+            self.format, self.project, self.board
+        )
+        .map_err(|error| error.to_string())?;
         serde_json::to_writer(&mut bytes, &self.source).map_err(|error| error.to_string())?;
         bytes.write_all(b",\n  \"components\": {\n").map_err(|error| error.to_string())?;
         for (index, (id, component)) in self.components.iter().enumerate() {
@@ -344,7 +420,12 @@ impl Baseline {
     /// historical component IDs against the current schematic.
     pub fn validate(&self) -> Result<(), String> {
         self.source.validate()?;
-        if self.format != FORMAT || self.project.is_nil() || self.board.is_nil() || self.components.len() > MAX_SYMBOLS {
+        if !matches!(self.format.as_str(), FORMAT | MULTIPAD_FORMAT | QUANTITY_FORMAT)
+            || (self.format == FORMAT && self.components.values().any(|component| component.package.as_ref().is_some_and(Package::extended)))
+            || self.project.is_nil()
+            || self.board.is_nil()
+            || self.components.len() > MAX_SYMBOLS
+        {
             return Err("unsupported or invalid board baseline header".into());
         }
         for (&id, component) in &self.components {
@@ -361,6 +442,18 @@ impl Baseline {
             }
             crate::schematic::check_reference(&component.reference)?;
             crate::schematic::check_value(&component.value)?;
+            if let Some(quantity) = &component.primary_quantity {
+                if self.format != QUANTITY_FORMAT {
+                    return Err("historical primary quantities require board baseline format 3".into());
+                }
+                quantity.validate()?;
+                let Value::Quantity { value, unit } = quantity else {
+                    return Err("historical primary value must be a typed quantity".into());
+                };
+                if component.value != format!("{value} {unit}") {
+                    return Err("historical primary quantity disagrees with stored value text".into());
+                }
+            }
             if let Some(package) = &component.package {
                 package.validate(&component.terminals)?;
             }
@@ -371,7 +464,15 @@ impl Baseline {
         let mut seen = BTreeSet::new();
         for net in &self.nets {
             if net.terminals.is_empty()
-                || (net.terminals.len() < 2 && net.names.is_empty())
+                || (net.terminals.len() < 2
+                    && net.names.is_empty()
+                    && !net.terminals.iter().any(|terminal| {
+                        self.components
+                            .get(&terminal.component)
+                            .and_then(|component| component.package.as_ref())
+                            .and_then(|package| package.mapping.get(&terminal.terminal))
+                            .is_some_and(|pads| pads.pads().len() > 1)
+                    }))
                 || net.terminals.len() > MAX_SYMBOLS * 128
                 || !strictly_sorted(&net.terminals)
                 || net.names.len() > crate::net_labels::MAX_LABELS * crate::sheets::MAX_SHEETS
@@ -488,7 +589,7 @@ impl crate::Session {
         let mut next = project.clone();
         Arc::make_mut(&mut next.board).baseline = Some(Arc::new(baseline));
         crate::persistence::encode_documents(Arc::new(next.clone())).map_err(crate::CommandError::InvalidParams)?;
-        self.change(next);
+        self.change(next)?;
         Ok(())
     }
 }
@@ -496,7 +597,7 @@ impl crate::Session {
 /// Hash the complete canonical pre-Apply native bundle, including prior accepted
 /// state. A fresh incarnation is attached only after hashing, so repeated previews
 /// of equal input have equal digests without recursively including their new ID.
-fn capture_source(project: &Project) -> Result<SourceCapture, crate::CommandError> {
+pub(crate) fn capture_source(project: &Project) -> Result<SourceCapture, crate::CommandError> {
     use sha2::{Digest, Sha256};
     let documents = crate::persistence::encode_documents(Arc::new(project.clone())).map_err(crate::CommandError::InvalidParams)?;
     let mut digest = Sha256::new();
@@ -622,10 +723,11 @@ pub fn apply_candidate(project: &Project, accepted: &Baseline, proposed: &Baseli
         footprint.definition = package.definition.clone();
         footprint.definition_revision = package.revision;
         footprint.mapping = package.library.as_ref().map(|_| package.mapping.clone());
+        footprint.unconnected_pads = package.unconnected_pads.clone();
         footprint.pin_1_pad = if package.library.is_some() {
             0
         } else {
-            match package.mapping.get("1").map(String::as_str) {
+            match package.mapping.get("1").and_then(|pads| pads.first()) {
                 Some("1") => 1,
                 Some("2") => 2,
                 _ => return Err("invalid legacy marker mapping".into()),
@@ -658,10 +760,10 @@ fn strictly_sorted<T: Ord>(values: &[T]) -> bool {
 
 /// Bound accepted terminal mappings while decoding and reject duplicate JSON keys
 /// before a later entry can silently replace the historical pin correspondence.
-fn mapping_records<'de, D: Deserializer<'de>>(deserializer: D) -> Result<BTreeMap<String, String>, D::Error> {
+fn mapping_records<'de, D: Deserializer<'de>>(deserializer: D) -> Result<BTreeMap<String, crate::library::parts::PadIds>, D::Error> {
     struct Mapping;
     impl<'de> Visitor<'de> for Mapping {
-        type Value = BTreeMap<String, String>;
+        type Value = BTreeMap<String, crate::library::parts::PadIds>;
 
         /// Describe the exact mapping vocabulary and its supported terminal count.
         fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -672,12 +774,8 @@ fn mapping_records<'de, D: Deserializer<'de>>(deserializer: D) -> Result<BTreeMa
         /// keys whose final overwritten value would otherwise form a valid bijection.
         fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
             let mut mapping = BTreeMap::new();
-            while let Some((terminal, pad)) = map.next_entry::<String, String>()? {
-                if mapping.len() >= 128
-                    || PinNumber::new(&terminal).is_none()
-                    || PinNumber::new(&pad).is_none()
-                    || mapping.insert(terminal, pad).is_some()
-                {
+            while let Some((terminal, pad)) = map.next_entry::<String, crate::library::parts::PadIds>()? {
+                if mapping.len() >= 128 || PinNumber::new(&terminal).is_none() || !pad.valid() || mapping.insert(terminal, pad).is_some() {
                     return Err(serde::de::Error::custom("duplicate, excessive or invalid accepted terminal mapping"));
                 }
             }
@@ -689,10 +787,10 @@ fn mapping_records<'de, D: Deserializer<'de>>(deserializer: D) -> Result<BTreeMa
 
 /// Reject duplicate and noncanonical numeric map keys rather than letting JSON
 /// silently overwrite one historical component with another spelling of its ID.
-fn component_records<'de, D: Deserializer<'de>>(deserializer: D) -> Result<BTreeMap<u64, ComponentState>, D::Error> {
+fn component_records<'de, D: Deserializer<'de>>(deserializer: D) -> Result<BTreeMap<u64, PartInstanceState>, D::Error> {
     struct Records;
     impl<'de> Visitor<'de> for Records {
-        type Value = BTreeMap<u64, ComponentState>;
+        type Value = BTreeMap<u64, PartInstanceState>;
 
         /// Describe the bounded canonical object expected from the native codec.
         fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -702,7 +800,7 @@ fn component_records<'de, D: Deserializer<'de>>(deserializer: D) -> Result<BTree
         /// Enforce uniqueness while parsing, before a duplicate entry can overwrite history.
         fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
             let mut records = BTreeMap::new();
-            while let Some((key, value)) = map.next_entry::<String, ComponentState>()? {
+            while let Some((key, value)) = map.next_entry::<String, PartInstanceState>()? {
                 let id = key.parse::<u64>().map_err(serde::de::Error::custom)?;
                 if key != id.to_string() || records.len() >= MAX_SYMBOLS || records.insert(id, value).is_some() {
                     return Err(serde::de::Error::custom("duplicate, excessive or noncanonical baseline component ID"));

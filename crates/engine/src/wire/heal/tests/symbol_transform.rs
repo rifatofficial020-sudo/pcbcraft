@@ -23,7 +23,8 @@ fn symbol_transform_preview_and_commit_are_one_atomic_edit() {
                 let before = s.snapshot().unwrap();
                 let symbol = before.symbols()[0].clone();
                 let paths: Vec<_> = before.wires().iter().map(|wire| before.wire_path(wire)).collect();
-                let preview = before.transformed_symbol(&symbol.id(), to, Some((degrees / 90) as u8), disconnect, s.revision(), auto_heal).unwrap();
+                let preview =
+                    before.transformed_symbol(&symbol.id(), to, Some((degrees / 90) as u8), None, disconnect, s.revision(), auto_heal).unwrap();
                 assert!(Arc::ptr_eq(&before, &s.snapshot().unwrap()));
                 run(
                     &mut s,
@@ -76,6 +77,32 @@ fn symbol_transform_defaults_noops_and_rejections_preserve_history() {
         assert_eq!(s.revision(), revision);
         assert!(Arc::ptr_eq(&before, &s.snapshot().unwrap()));
     }
-    assert!(before.transformed_symbol(&symbol, p(0, 0), Some(4), false, revision, true).is_err());
+    assert!(before.transformed_symbol(&symbol, p(0, 0), Some(4), None, false, revision, true).is_err());
     assert_eq!(crate::command(MOVE_SYMBOL).unwrap().to_json()["params"]["properties"]["rotation"]["enum"], json!([0, 90, 180, 270]));
+}
+
+/// Cleanup after a pose must allow a merge at the vacated marked coordinate and still refuse
+/// a merge at the moved pin. Exercise downstream merge behavior for translation/rotation/mirror.
+#[test]
+fn posed_marker_policy_tracks_cleanup_contacts() {
+    for (to, rotation, mirrored) in [(p(0, 12), 0, false), (p(0, 0), 2, false), (p(0, 0), 0, true)] {
+        let mut s = session();
+        run(&mut s, PLACE_SYMBOL, json!({"definition":"resistor","x_nm":0,"y_nm":0}));
+        let symbol = s.project().unwrap().symbols()[0].clone();
+        run(&mut s, crate::no_connect::SET, json!({"target":{"part":symbol.component_id(),"terminal":"1"},"marked":true}));
+        let before = s.snapshot().unwrap();
+        let terminal = WireEndpoint::Terminal(symbol.terminals()[0]);
+        let old = before.endpoint_position(terminal).unwrap();
+        let mut edit = Edit::new(&before, s.revision());
+        edit.pose_symbol(0, to, rotation, mirrored).unwrap();
+        let new = edit.project.endpoint_position(terminal).unwrap();
+        assert_ne!(new, old);
+        let a = edit.free(old).unwrap();
+        let b = edit.free(old).unwrap();
+        edit.merge(a, b).unwrap();
+        let a = edit.free(new).unwrap();
+        let b = edit.free(new).unwrap();
+        assert!(edit.merge(a, b).unwrap_err().to_string().contains("no-connect"));
+        assert!(Arc::ptr_eq(&before, &s.snapshot().unwrap()));
+    }
 }

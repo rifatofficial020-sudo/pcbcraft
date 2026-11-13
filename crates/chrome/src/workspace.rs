@@ -1,42 +1,53 @@
 //! Shared workspace surfaces and tool buttons. Command state stays with the caller.
 
 use egui::{
-    Align, Align2, Color32, CornerRadius, FontId, Frame, Label, Layout, Margin, Panel, Pos2, Rect, Response, RichText, ScrollArea, Sense, Shape,
-    Stroke, Ui, WidgetInfo, WidgetType, pos2, vec2,
+    Align, Align2, Color32, FontId, Frame, Label, Layout, Margin, Panel, Pos2, Rect, Response, RichText, Role, ScrollArea, Sense, Shape, Stroke, Ui,
+    WidgetInfo, pos2, vec2,
 };
 
-use crate::{Tokens, fonts};
+use crate::{Tokens, fonts, menu::CheckKind};
 
 pub mod catalog;
 pub mod panels;
 
 /// The card is tall enough for the tabs, the groups and PCBcraft Next's 5 point gutter under them.
-const RIBBON_HEIGHT: f32 = 121.0;
-const WORKSPACE_WIDTH: f32 = 88.0;
+const RIBBON_HEIGHT: f32 = 135.0;
+/// Every workspace uses the same tile, including long editor names.
+const WORKSPACE_WIDTH: f32 = 120.0;
 const RIBBON_COMPACT_WIDTH: f32 = 1000.0;
 
 /// Compact ribbons promote working tools while retaining planned controls in their group menus.
 pub fn ribbon_is_compact(ui: &Ui) -> bool {
     ui.clip_rect().width() < RIBBON_COMPACT_WIDTH
 }
-/// PCBcraft Next's ribbon metrics (`src/desktop/theme.rs`, `RibbonMetrics`): 56 by 52 point
-/// buttons 2 points apart, a 24 point icon centered 17 points down and the label centered 10
-/// points above the bottom, 6 points of padding on each side of a group, a 12 point slot for the
-/// rule between groups, and the group's caption 10 points under its buttons.
-const RIBBON_TOOL_WIDTH: f32 = 56.0;
-const RIBBON_TOOL_HEIGHT: f32 = 52.0;
-const RIBBON_TOOL_GAP: f32 = 2.0;
+/// Shared ribbon height with PCBcraft's qualified command glyphs and inline field widths.
+const RIBBON_TOOL_WIDTH: f32 = solidcraft_ui_kit::ribbon::BUTTON_MAX_WIDTH;
+const RIBBON_TOOL_HEIGHT: f32 = solidcraft_ui_kit::ribbon::BUTTON_HEIGHT;
 const RIBBON_TOOL_ICON: f32 = 24.0;
-const RIBBON_TOOL_ICON_CENTER: f32 = 17.0;
-const RIBBON_TOOL_LABEL_CENTER: f32 = 10.0;
 const RIBBON_GROUP_PADDING: f32 = 6.0;
 const RIBBON_SEPARATOR_WIDTH: f32 = 12.0;
-const RIBBON_CAPTION_GAP: f32 = 10.0;
+const RIBBON_CAPTION_GAP: f32 = 5.0;
 const RIBBON_SCROLL_GUTTER: f32 = 5.0;
+
+/// Host source operations share one folder silhouette instead of borrowing electronics glyphs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LibraryFolderAction {
+    Add,
+    Relocate,
+    Remove,
+}
 
 /// The glyphs used by the schematic ribbon actions and Browser rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolIcon {
+    /// Source management composes the shared folder master with an original action badge.
+    LibraryFolder(LibraryFolderAction),
+    /// Pure source refresh has no matching standalone master in the pinned toolkit.
+    LibraryRefresh,
+    /// Generic interface masters come directly from the pinned Craft icon set.
+    Shared(&'static str),
+    /// Original lead-and-cross intentional-disconnection glyph.
+    NoConnect,
     Select,
     Pin,
     Pad,
@@ -68,10 +79,25 @@ pub enum ToolIcon {
     Delete,
     Nets,
     Fit,
+    /// Dots for the drawing-grid visibility control.
+    Grid,
     Browser,
     SplitView,
     EditorWindow,
     Settings,
+    /// PCB layout glyphs, drawn natively: a package, copper routing and board-level actions.
+    Footprint,
+    Track,
+    Via,
+    Zone,
+    Pair,
+    Tune,
+    Align,
+    Drc,
+    Measure,
+    FlipView,
+    Outputs,
+    Refill,
 }
 
 /// The glyph at the start of a Browser row: a container or one of the ribbon's own glyphs.
@@ -133,14 +159,14 @@ const FLOATING_RADIUS: u8 = 12;
 const FLOATING_HEADER: f32 = 24.0;
 
 /// The shared surface for cards that overlay the canvas.
-fn floating_frame() -> Frame {
-    let t = Tokens::get();
-    Frame::new().fill(t.panel).stroke(Stroke::new(1.0, t.border)).corner_radius(FLOATING_RADIUS).inner_margin(Margin::same(FLOATING_MARGIN as i8))
+fn floating_frame(ctx: &egui::Context) -> Frame {
+    solidcraft_ui_kit::panel_host_frame(ctx, true).inner_margin(Margin::same(FLOATING_MARGIN as i8))
 }
 
 /// The drawing on a workspace's tile in the picker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkspaceIcon {
+    Library,
     Schematic,
     Layout,
     Render,
@@ -192,13 +218,32 @@ pub struct WorkspacePick {
 pub struct RibbonResponse {
     pub workspace: Option<WorkspacePick>,
     pub quick: Option<usize>,
+    /// Paint slot the host completes with the current pane grids after drawing the workspace.
+    pub background: Option<RibbonBackground>,
+}
+
+/// A reserved paint slot below the ribbon cards. The host completes it after the pane cameras
+/// have processed this frame's navigation, keeping the exposed grid aligned with each canvas.
+pub struct RibbonBackground {
+    /// The whole ribbon band, including the exposed margins around its cards.
+    pub area: Rect,
+    painter: egui::Painter,
+    shape: egui::layers::ShapeIdx,
+}
+
+impl RibbonBackground {
+    /// Complete the backdrop beneath the existing ribbon controls without registering input.
+    pub fn paint(self, shapes: Vec<Shape>) {
+        self.painter.set(self.shape, Shape::Vec(shapes));
+    }
 }
 
 /// Put a tabbed command strip above the viewport. `tabs` names the ribbon tabs and `tab` is the
 /// index of the one shown; clicking another tab selects it. `add` draws the actions of the tab
 /// shown, whose index it receives, including a tab clicked this frame. The workspace tile yields
 /// space to longer tab lists at narrow widths; actions scroll with a gutter below the captions.
-/// Narrow headers use tighter tabs; quick controls yield when space runs out and on View, which holds their full controls.
+/// Narrow headers tighten and wrap tabs; quick controls yield when space runs out and on View,
+/// which holds their full controls. Extra header rows reserve space above the action strip.
 ///
 /// The workspace tile returns a workspace/placement request. Picking the current row closes
 /// the picker; the split and window icons within its card create another view.
@@ -211,80 +256,136 @@ pub fn ribbon(
     quick: &[RibbonTool<'_>],
     add: impl FnOnce(&mut Ui, usize),
 ) -> RibbonResponse {
+    let mut add = Some(add);
+    ribbon_with_controls(ui, workspace, tabs, tab, RibbonLayout { workspaces, quick, pinned_fields: 0, controls_label: "" }, |ui, section| {
+        if let RibbonSection::Commands(shown) = section
+            && let Some(add) = add.take()
+        {
+            add(ui, shown);
+        }
+    })
+}
+
+/// Host-owned options for the command ribbon and its persistent editing fields.
+pub struct RibbonLayout<'a> {
+    pub workspaces: Workspaces<'a>,
+    pub quick: &'a [RibbonTool<'a>],
+    /// Number of standard-width fields kept outside the tab's scrolling commands.
+    pub pinned_fields: usize,
+    /// Noninteractive section caption for the persistent editing fields; empty hides it.
+    pub controls_label: &'a str,
+}
+
+/// The command strip changes with its tab; editing fields keep their own identity and position.
+pub enum RibbonSection {
+    Commands(usize),
+    /// Narrow windows place compact, wrapping fields below the command strip.
+    Controls {
+        compact: bool,
+    },
+}
+
+/// Compose a tab ribbon with persistent fields at the right. At narrow widths fields wrap
+/// below the commands, staying visible while only the tab's command strip scrolls horizontally.
+pub fn ribbon_with_controls(
+    ui: &mut Ui,
+    workspace: &str,
+    tabs: &[&str],
+    tab: &mut usize,
+    layout: RibbonLayout<'_>,
+    mut add: impl FnMut(&mut Ui, RibbonSection),
+) -> RibbonResponse {
+    let RibbonLayout { workspaces, quick, pinned_fields, controls_label } = layout;
     let t = Tokens::get();
-    let wide = ui.available_width() >= if tabs.len() > 2 { 600.0 } else { 480.0 };
-    let height = RIBBON_HEIGHT + if wide { 0.0 } else { t.space_24 };
-    // Let the app bar color show behind the two rounded workspace corners.
-    let top = ui.available_rect_before_wrap();
-    ui.painter().rect_filled(Rect::from_min_size(top.min, vec2(top.width(), f32::from(t.radius_lg))), 0, t.app_bar);
-    Panel::top("workspace_ribbon")
+    let wide = ui.available_width() >= 600.0;
+    let tab_gap = if wide { t.space_6 } else { t.space_2 };
+    let tab_padding = if wide { t.space_8 } else { t.space_4 };
+    let tab_width = tabs
+        .iter()
+        .map(|title| {
+            ui.painter().layout_no_wrap((*title).to_owned(), FontId::proportional(t.font_body), t.text).size().x + 2.0 * tab_padding + tab_gap
+        })
+        .sum::<f32>();
+    let tab_room = (ui.available_width() - if wide { WORKSPACE_WIDTH + t.space_8 * 5.0 } else { t.space_8 * 4.0 }).max(1.0);
+    let extra_tab_rows = (tab_width / tab_room).ceil().max(1.0) - 1.0;
+    let field_width = t.control_height * 6.0;
+    let fixed_width = pinned_fields as f32 * field_width + pinned_fields.saturating_sub(1) as f32 * t.space_8;
+    let side_controls = pinned_fields > 0 && tab_room >= fixed_width + 240.0;
+    let compact_width = t.control_height * 5.5;
+    let columns = ((tab_room + t.space_8) / (compact_width + t.space_8)).floor().max(1.0) as usize;
+    let control_rows = pinned_fields.div_ceil(columns);
+    let compact_height = t.control_height + t.font_small + t.space_8;
+    let controls_height = control_rows as f32 * (compact_height + 1.0);
+    let extra_controls = if pinned_fields > 0 && !side_controls { controls_height + t.space_24 } else { 0.0 };
+    let height = RIBBON_HEIGHT + if wide { 0.0 } else { t.space_24 } + extra_tab_rows * t.control_height + extra_controls;
+    let painter = ui.painter().clone();
+    let background = painter.add(Shape::Noop);
+    let panel = Panel::top("workspace_ribbon")
         .exact_size(height + 2.0 * t.space_6)
         .resizable(false)
         .show_separator_line(false)
-        .frame(
-            Frame::new()
-                .fill(t.canvas)
-                .corner_radius(CornerRadius { nw: t.radius_lg, ne: t.radius_lg, sw: 0, se: 0 })
-                .inner_margin(Margin::symmetric(t.space_8 as i8, t.space_6 as i8)),
-        )
+        .frame(Frame::new().fill(Color32::TRANSPARENT).inner_margin(Margin::symmetric(t.space_8 as i8, t.space_6 as i8)))
         .show(ui, |ui| {
             let mut picked = None;
             let mut quick_pick = None;
             ui.horizontal_top(|ui| {
                 if wide {
                     // Read before the tile can toggle it, so the picker knows the frame it opens on.
-                    let was_open = egui::Popup::is_id_open(ui.ctx(), picker_id());
-                    let tile = card(t, t.space_8)
+                    let was_open = egui::Popup::is_id_open(ui.ctx(), picker_id(ui.ctx()));
+                    let tile = card(ui.ctx(), t.space_8)
                         .show(ui, |ui| {
                             workspace_tile(
                                 ui,
                                 workspace,
                                 workspaces.entries.iter().find(|entry| entry.current).map_or(WorkspaceIcon::Schematic, |entry| entry.icon),
-                                height,
+                                RIBBON_HEIGHT,
                             )
                         })
                         .inner;
                     picked = picker(ui, &tile, workspaces, !was_open);
                 }
 
-                card(t, t.space_4).show(ui, |ui| {
+                card(ui.ctx(), t.space_4).show(ui, |ui| {
                     ui.vertical(|ui| {
                         ui.set_width(ui.available_width());
                         ui.set_min_height(height - 2.0 * (t.space_4 + 1.0));
                         if !wide {
-                            let was_open = egui::Popup::is_id_open(ui.ctx(), picker_id());
-                            let tile = ui.small_button(format!("{workspace}    "));
+                            let was_open = egui::Popup::is_id_open(ui.ctx(), picker_id(ui.ctx()));
+                            let (rect, _) = ui.allocate_exact_size(vec2(WORKSPACE_WIDTH, t.space_24), Sense::hover());
+                            let tile = solidcraft_ui_kit::button_at(ui, workspace, rect, "", solidcraft_ui_kit::Button::Small);
                             let c = tile.rect.right_center() - vec2(t.space_6, 0.0);
                             ui.painter()
                                 .add(Shape::line(vec![c + vec2(-3.0, -1.5), c + vec2(0.0, 1.5), c + vec2(3.0, -1.5)], Stroke::new(1.0, t.text_dim)));
-                            tile.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, "Choose workspace"));
+                            tile.widget_info(|| WidgetInfo::labeled(Role::Button, true, "Choose workspace"));
                             picked = picker(ui, &tile, workspaces, !was_open);
                         }
                         ui.spacing_mut().item_spacing.y = 1.0;
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = if wide { t.space_6 } else { t.space_2 };
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = tab_gap;
                             for (index, title) in tabs.iter().enumerate() {
                                 if ribbon_tab(ui, title, index == *tab, wide).clicked() {
                                     *tab = index;
                                 }
                             }
                             if wide {
-                                ui.add_enabled(false, egui::Button::new("+")).on_disabled_hover_text("Ribbon customization is not available yet.");
+                                crate::controls::enabled_button(ui, false, "+").on_disabled_hover_text("Ribbon customization is not available yet.");
                             }
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 let show_quick = tabs.get(*tab) != Some(&"View")
                                     && ui.available_width() >= quick.len() as f32 * (t.space_24 + ui.spacing().item_spacing.x);
                                 for (index, tool) in quick.iter().enumerate().rev().filter(|_| show_quick) {
-                                    let (rect, response) = ui.allocate_exact_size(
-                                        vec2(t.space_24, t.space_24),
-                                        if tool.enabled { Sense::click() } else { Sense::hover() },
+                                    let (_, rect) = ui.allocate_space(vec2(t.space_24, t.space_24));
+                                    let response = crate::controls::glyph_target(
+                                        ui,
+                                        ui.scope_id().with(("ribbon_quick", tool.description)),
+                                        rect,
+                                        tool.description,
+                                        tool.enabled,
+                                        tool.active,
                                     );
-                                    response.widget_info(|| WidgetInfo::selected(WidgetType::Button, tool.enabled, tool.active, tool.description));
-                                    if tool.active {
-                                        ui.painter().rect_filled(rect, t.control_radius, t.accent_soft);
-                                    } else if response.hovered() {
-                                        ui.painter().rect_filled(rect, t.control_radius, t.hover);
-                                    }
+                                    response.widget_info(|| {
+                                        WidgetInfo::selected(Role::Button, tool.enabled && ui.is_enabled(), tool.active, tool.description)
+                                    });
                                     paint_icon(ui.painter(), tool.icon, rect.center(), t.space_16, t, tool.enabled);
                                     if response.on_hover_text(tool.description).clicked() {
                                         quick_pick = Some(index);
@@ -297,28 +398,79 @@ pub fn ribbon(
                         ui.spacing_mut().scroll.bar_width = RIBBON_SCROLL_GUTTER;
                         ui.spacing_mut().scroll.bar_inner_margin = 0.0;
                         ui.spacing_mut().scroll.bar_outer_margin = 0.0;
-                        ScrollArea::horizontal().id_salt("ribbon_actions").auto_shrink([false, true]).show(ui, |ui| {
-                            ui.horizontal_top(|ui| add(ui, *tab));
+                        let width = ui.available_width();
+                        let commands_width = if side_controls { (width - fixed_width - t.space_12).max(1.0) } else { width };
+                        let (_, row) = ui.allocate_space(vec2(width, solidcraft_ui_kit::ribbon::GROUP_HEIGHT + RIBBON_SCROLL_GUTTER));
+                        let commands = Rect::from_min_size(row.min, vec2(commands_width, row.height()));
+                        let mut command_ui = ui
+                            .new_child(egui::UiBuilder::new().id_salt("ribbon_command_host").max_rect(commands).layout(Layout::top_down(Align::Min)));
+                        command_ui.set_clip_rect(ui.clip_rect().intersect(commands));
+                        ScrollArea::horizontal().id_salt("ribbon_actions").auto_shrink([false, true]).show(&mut command_ui, |ui| {
+                            describe_scroll_viewport(ui);
+                            ui.horizontal_top(|ui| add(ui, RibbonSection::Commands(*tab)));
                         });
+                        if pinned_fields > 0 {
+                            let controls = if side_controls {
+                                ui.painter().vline(commands.right() + t.space_6, row.top()..=row.bottom(), Stroke::new(1.0, t.border));
+                                Rect::from_min_size(pos2(row.right() - fixed_width, row.top()), vec2(fixed_width, row.height()))
+                            } else {
+                                ui.add_space(t.space_8);
+                                ui.allocate_space(vec2(width, controls_height)).1
+                            };
+                            let mut controls_ui = ui.new_child(
+                                egui::UiBuilder::new()
+                                    .id_salt("ribbon_controls")
+                                    .max_rect(controls)
+                                    .layout(Layout::left_to_right(Align::Min).with_main_wrap(!side_controls)),
+                            );
+                            controls_ui.set_clip_rect(ui.clip_rect().intersect(controls));
+                            controls_ui.spacing_mut().item_spacing.x = t.space_8;
+                            add(&mut controls_ui, RibbonSection::Controls { compact: !side_controls });
+                            if !controls_label.is_empty() {
+                                let fields = controls_ui.min_rect();
+                                if side_controls {
+                                    use solidcraft_ui_kit::ribbon as shared;
+                                    let center = row.top() + shared::GROUP_HEIGHT - shared::SECTION_HEIGHT / 2.0 - (shared::CARD_INSET - 1.0);
+                                    shared::text(
+                                        ui,
+                                        pos2(fields.center().x, center),
+                                        controls_label,
+                                        solidcraft_theme::Tokens::get().font_caption,
+                                        t.text_dim,
+                                        false,
+                                    );
+                                } else {
+                                    ui.painter().text(
+                                        pos2(fields.center().x, fields.bottom() + t.space_4),
+                                        Align2::CENTER_TOP,
+                                        controls_label,
+                                        FontId::proportional(t.font_small),
+                                        t.text_dim,
+                                    );
+                                }
+                            }
+                        }
                     });
                 });
             });
-            RibbonResponse { workspace: picked, quick: quick_pick }
-        })
-        .inner
+            (picked, quick_pick)
+        });
+    RibbonResponse {
+        workspace: panel.inner.0,
+        quick: panel.inner.1,
+        background: Some(RibbonBackground { area: panel.response.rect, painter, shape: background }),
+    }
 }
 
 /// Draw the workspace tile: the accent rule, icon, workspace name and a "Workspace" caption with
-/// a caret that points up while the picker is open. The tile is a button that toggles the picker.
+/// a caret that points up while the picker is open. Its shared fixed dimensions do not
+/// depend on the active workspace's title or extra ribbon control rows.
 fn workspace_tile(ui: &mut Ui, workspace: &str, icon: WorkspaceIcon, height: f32) -> Response {
     let t = Tokens::get();
     let inset = t.space_8 + 1.0;
-    let (rect, response) = ui.allocate_exact_size(
-        vec2(if workspace.len() > 10 { WORKSPACE_WIDTH + 32.0 } else { WORKSPACE_WIDTH } - 2.0 * inset, height - 2.0 * inset),
-        Sense::click(),
-    );
-    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, "Choose workspace"));
-    let open = egui::Popup::is_id_open(ui.ctx(), picker_id());
+    let (rect, response) = ui.allocate_exact_size(vec2(WORKSPACE_WIDTH - 2.0 * inset, height - 2.0 * inset), Sense::click());
+    response.widget_info(|| WidgetInfo::labeled(Role::Button, true, "Choose workspace"));
+    let open = egui::Popup::is_id_open(ui.ctx(), picker_id(ui.ctx()));
     let center = rect.center();
     let p = ui.painter();
     if open || response.hovered() || response.has_focus() {
@@ -341,8 +493,9 @@ fn workspace_tile(ui: &mut Ui, workspace: &str, icon: WorkspaceIcon, height: f32
     response.on_hover_text("Choose workspace")
 }
 
-fn picker_id() -> egui::Id {
-    egui::Id::new("workspace_picker")
+/// Keep a picker in its native viewport when several hosts draw the same ribbon.
+fn picker_id(ctx: &egui::Context) -> egui::Id {
+    egui::Id::unique(("workspace_picker", ctx.viewport_id()))
 }
 
 /// Show the workspace picker under the tile while it's open. Clicking an available row, or
@@ -357,7 +510,7 @@ fn picker(ui: &Ui, tile: &Response, workspaces: Workspaces<'_>, opening: bool) -
         (t.form_card_width + t.form_label_width * 2.0 + t.space_24 + t.space_16 + t.space_6).min(ui.ctx().content_rect().width() - t.space_24);
     let height = (ui.ctx().content_rect().bottom() - tile.rect.bottom() - t.space_4).max(160.0);
     egui::Popup::from_toggle_button_response(tile)
-        .id(picker_id())
+        .id(picker_id(ui.ctx()))
         .kind(egui::PopupKind::Menu)
         .align(egui::RectAlign::BOTTOM_START)
         .align_alternatives(&[])
@@ -462,7 +615,7 @@ fn workspace_row(ui: &mut Ui, entry: &Workspace<'_>, width: f32, native: bool) -
     let text_right = rect.right() - t.space_8 - action_width;
     let body = Rect::from_min_max(rect.min, pos2(text_right, rect.bottom()));
     let response = ui.interact(body, allocated.id.with("workspace"), if available { Sense::click() } else { Sense::hover() });
-    response.widget_info(|| WidgetInfo::selected(WidgetType::Button, available, entry.current, entry.title));
+    response.widget_info(|| WidgetInfo::selected(Role::Button, available, entry.current, entry.title));
     let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
     if entry.current || (available && (response.hovered() || response.has_focus())) {
         painter.rect_filled(rect, t.control_radius, soft);
@@ -519,7 +672,7 @@ fn workspace_row(ui: &mut Ui, entry: &Workspace<'_>, width: f32, native: bool) -
                 vec2(t.space_24, t.space_24),
             );
             let action = ui.interact(target, allocated.id.with(index), Sense::click());
-            action.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &label));
+            action.widget_info(|| WidgetInfo::labeled(Role::Button, true, &label));
             if action.hovered() || action.has_focus() {
                 painter.rect_filled(target, t.control_radius, t.hover);
             }
@@ -538,18 +691,22 @@ fn workspace_row(ui: &mut Ui, entry: &Workspace<'_>, width: f32, native: bool) -
 fn ribbon_tab(ui: &mut Ui, title: &str, selected: bool, wide: bool) -> Response {
     let t = Tokens::get();
     let galley = ui.painter().layout_no_wrap(title.to_owned(), FontId::proportional(t.font_body), t.text);
-    let size = vec2(galley.size().x + 2.0 * if wide { t.space_8 } else { t.space_4 }, t.control_height - t.space_6);
+    let size = vec2(galley.size().x + 2.0 * if wide { t.space_8 } else { t.space_4 }, t.space_24);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
-    response.widget_info(|| WidgetInfo::selected(WidgetType::Button, true, selected, title));
+    response.widget_info(|| WidgetInfo::selected(Role::Tab, true, selected, title));
+    crate::automation::publish(ui, &response, format!("tab:{title}"));
     if ui.is_rect_visible(rect) {
+        let shared = solidcraft_theme::Tokens::get();
+        let style = solidcraft_ui_kit::ribbon::tab_style(
+            &shared,
+            solidcraft_theme::TabAccent::current(ui.ctx()),
+            false,
+            selected,
+            response.hovered() || response.has_focus(),
+        );
         let p = ui.painter();
-        if selected {
-            p.rect_filled(rect, t.radius_sm, t.accent_soft);
-        } else if response.hovered() || response.has_focus() {
-            p.rect_filled(rect, t.radius_sm, t.hover);
-        }
-        let ink = if selected { t.ribbon_tab_text } else { t.text };
-        p.galley_with_override_text_color(rect.center() - galley.size() / 2.0, galley, ink);
+        p.rect_filled(rect, t.radius_sm, style.fill);
+        p.galley_with_override_text_color(rect.center() - galley.size() / 2.0, galley, style.ink);
     }
     response
 }
@@ -557,8 +714,8 @@ fn ribbon_tab(ui: &mut Ui, title: &str, selected: bool, wide: bool) -> Response 
 /// Draw one Browser row with a stable `id`, so a press and its release stay on the same row
 /// while rows above it open or close. The disclosure arrow is its own target, labelled
 /// "Expand …" or "Collapse …": clicking it folds the row without clicking the row. Only the
-/// part right of the arrow highlights. Metrics follow PCBcraft Next's Browser rows; the separate
-/// arrow and row targets follow SolidCraft's `ui_kit/tree.rs`.
+/// part right of the arrow highlights when the row is selected. The kit draws the disclosure,
+/// while the row owns the PCBcraft glyph and any independent layer color target.
 pub fn tree_row(ui: &mut Ui, id: egui::Id, row: &TreeRow<'_>) -> TreeResponse {
     let t = Tokens::get();
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), TREE_ROW_HEIGHT), Sense::hover());
@@ -571,15 +728,15 @@ pub fn tree_row(ui: &mut Ui, id: egui::Id, row: &TreeRow<'_>) -> TreeResponse {
     let response = ui.interact(activation, id, Sense::click());
     let icon_response = editable.then(|| {
         let response = ui.interact(icon_rect, id.with("layer_color"), Sense::click());
-        response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, ui.is_enabled(), format!("Change color for layer {}", row.label)));
+        response.widget_info(|| WidgetInfo::labeled(Role::Button, ui.is_enabled(), format!("Change color for layer {}", row.label)));
         response
     });
-    response.widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, true, row.selected, row.accessibility_label.unwrap_or(row.label)));
+    response.widget_info(|| WidgetInfo::selected(Role::Button, true, row.selected, row.accessibility_label.unwrap_or(row.label)));
     let fold = row.fold.map(|open| {
-        let fold = ui.interact(fold_rect, id.with("fold"), Sense::click());
         let action = if open { "Collapse" } else { "Expand" };
-        fold.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, format!("{action} {}", row.label)));
-        (open, fold)
+        let mut arrow = ui.new_child(egui::UiBuilder::new().id_salt(id.with("fold")).max_rect(fold_rect));
+        arrow.set_clip_rect(arrow.clip_rect().intersect(fold_rect));
+        solidcraft_ui_kit::panel_disclosure_button_at(&mut arrow, fold_rect, open, &format!("{action} {}", row.label))
     });
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
@@ -592,16 +749,6 @@ pub fn tree_row(ui: &mut Ui, id: egui::Id, row: &TreeRow<'_>) -> TreeResponse {
             p.rect_filled(icon_rect, t.radius_sm, t.hover);
         }
         let cy = rect.center().y;
-        if let Some((open, fold)) = &fold {
-            let ink = if fold.hovered() || fold.has_focus() { t.text } else { t.text_dim };
-            let c = fold_rect.center();
-            let points = if *open {
-                vec![c + vec2(-3.5, -2.0), c + vec2(0.0, 1.5), c + vec2(3.5, -2.0)]
-            } else {
-                vec![c + vec2(-2.0, -3.5), c + vec2(1.5, 0.0), c + vec2(-2.0, 3.5)]
-            };
-            p.add(Shape::line(points, Stroke::new(1.3, ink)));
-        }
         if let Some(icon) = row.icon {
             paint_tree_icon(p, icon, pos2(body.left() + TREE_ICON_CENTER, cy), TREE_ICON, t);
         }
@@ -610,10 +757,7 @@ pub fn tree_row(ui: &mut Ui, id: egui::Id, row: &TreeRow<'_>) -> TreeResponse {
         let galley = elided(p, row.label, font, t.text, (body.right() - t.space_6 - x).max(0.0));
         p.galley(pos2(x, cy - galley.size().y / 2.0), galley, t.text);
     }
-    let fold_clicked = fold.as_ref().is_some_and(|(_, fold)| fold.clicked());
-    if let Some((open, fold)) = fold {
-        fold.on_hover_text(if open { "Collapse branch" } else { "Expand branch" });
-    }
+    let fold_clicked = fold.is_some_and(|fold| fold.clicked());
     let response = if row.tip.is_empty() { response } else { response.on_hover_text(row.tip) };
     let icon_clicked = icon_response.as_ref().is_some_and(|response| response.clicked());
     if let Some(icon) = icon_response {
@@ -683,8 +827,8 @@ pub struct RibbonTool<'a> {
     pub enabled: bool,
     /// Drawn pressed: a tool in use, or a panel that is shown.
     pub active: bool,
-    /// The menu row shows a check mark for `active` instead of the glyph, as for panel toggles.
-    pub toggle: bool,
+    /// A checked menu row declares whether it selects a choice or flips an independent state.
+    pub menu_check: Option<CheckKind>,
 }
 
 /// Lay out a ribbon group as PCBcraft Next does: the tools' buttons side by side, and under them
@@ -714,81 +858,167 @@ pub fn ribbon_control(ui: &mut Ui, title: &str, width: f32, add: impl FnOnce(&mu
 
 /// Draw a ribbon group with additional menu-only options after a separator. Returned indices
 /// address the visible tools first, then the extra entries; toggles use the shared checked row.
+/// Buttons share a standard width and wrap labels; a wider caption grows its group evenly.
+/// PCBcraft's surrounding layout supplies the separators between these individual groups.
 pub fn ribbon_group_with_menu(ui: &mut Ui, title: &str, tools: &[RibbonTool<'_>], menu_tools: &[RibbonTool<'_>]) -> Option<usize> {
-    let t = Tokens::get();
-    let font = FontId::proportional(t.font_body);
-    let widths: Vec<f32> = tools
-        .iter()
-        .map(|tool| (ui.painter().layout_no_wrap(tool.label.to_owned(), font.clone(), t.text).size().x + t.space_8).max(RIBBON_TOOL_WIDTH))
-        .collect();
-    let width = (widths.iter().sum::<f32>() + tools.len().saturating_sub(1) as f32 * RIBBON_TOOL_GAP + 2.0 * RIBBON_GROUP_PADDING)
-        .max(ui.painter().layout_no_wrap(title.to_owned(), FontId::proportional(t.font_small), t.text_dim).size().x + t.space_24);
-    let caption_height = t.font_small + t.space_4;
-    let (rect, _) = ui.allocate_exact_size(vec2(width, RIBBON_TOOL_HEIGHT + RIBBON_CAPTION_GAP + caption_height), Sense::hover());
-    let mut picked = None;
-    let mut x = rect.left() + RIBBON_GROUP_PADDING;
-    for (index, (tool, tool_width)) in tools.iter().zip(widths).enumerate() {
-        let button = Rect::from_min_size(pos2(x, rect.top()), vec2(tool_width, RIBBON_TOOL_HEIGHT));
-        if tool_button(ui, button, tool).clicked() {
-            picked = Some(index);
-        }
-        x += tool_width + RIBBON_TOOL_GAP;
-    }
+    ribbon_group_with_popups(ui, title, tools, menu_tools, |_, _, _| {})
+}
 
-    let caption = Rect::from_min_size(pos2(rect.left(), rect.top() + RIBBON_TOOL_HEIGHT + RIBBON_CAPTION_GAP), vec2(width, caption_height));
-    let response = ui.interact(caption, ui.id().with(("ribbon_group", title)), Sense::click());
-    // Named for what it opens, so it never reads as one of the group's actions.
-    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, format!("{title} menu")));
-    let response = response.on_hover_text(format!("{title} actions"));
-    if ui.is_rect_visible(caption) {
-        let p = ui.painter();
-        if response.hovered() || response.has_focus() {
-            p.rect_filled(caption, 3, t.hover);
-        }
-        let galley = p.layout_no_wrap(title.to_owned(), FontId::proportional(t.font_small), t.text_dim);
-        let center = caption.center() - vec2(5.0, 0.0);
-        let arrow = pos2(center.x + galley.size().x / 2.0 + 7.0, center.y);
-        p.galley(center - galley.size() / 2.0, galley, t.text_dim);
-        p.add(Shape::line(vec![arrow + vec2(-2.5, -1.0), arrow + vec2(0.0, 1.5), arrow + vec2(2.5, -1.0)], Stroke::new(1.0, t.text_dim)));
-    }
-    egui::Popup::menu(&response).frame(crate::menu::frame()).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
-        ui.set_min_width(t.control_height * 7.0);
-        ui.spacing_mut().item_spacing.y = 0.0;
-        for (index, tool) in tools.iter().chain(menu_tools).enumerate() {
-            if index == tools.len() && index > 0 {
-                ui.separator();
-            }
-            let mut item = crate::MenuItem::new(tool.label).tool_icon(tool.icon).shortcut(tool.shortcut).enabled(tool.enabled);
-            if tool.toggle {
-                item = item.checked(tool.active);
-            }
-            if item.show(ui) {
-                picked = Some(index);
-            }
-        }
+/// Attach host-owned choice menus to actual shared ribbon button responses. The host
+/// renders menu rows through chrome and handles choices after the ribbon pass.
+pub fn ribbon_group_with_popups(
+    ui: &mut Ui,
+    title: &str,
+    tools: &[RibbonTool<'_>],
+    menu_tools: &[RibbonTool<'_>],
+    mut popup: impl FnMut(&mut Ui, usize, &Response),
+) -> Option<usize> {
+    use solidcraft_ui_kit::ribbon as shared;
+    let t = Tokens::get();
+    let caption_width = ui.painter().layout_no_wrap(title.to_owned(), FontId::proportional(t.font_small), t.text_dim).size().x + t.space_24;
+    let count = tools.len().max(1) as f32;
+    let button_width = RIBBON_TOOL_WIDTH.max((caption_width - 8.0 - tools.len().saturating_sub(1) as f32 * shared::BUTTON_GAP) / count);
+    let widths = vec![button_width; tools.len()];
+    let content_width = shared::panel_width(&widths);
+    let width = content_width.max(caption_width) + 5.0;
+    let (_, rect) = ui.allocate_space(vec2(width, shared::GROUP_HEIGHT));
+    // The shared row reserves four trailing points plus its separator. Keep that fitting
+    // room outside the centered content, and clip its separator in this host composition.
+    let content_left = rect.left() + (width - content_width) / 2.0;
+    let shared_rect = Rect::from_min_size(pos2(content_left, rect.top()), vec2(content_width + 5.0, rect.height()));
+    let prefix = format!("pcbcraft:ribbon:{title}:");
+    let group = shared::Group {
+        key: title,
+        name: title,
+        label: title,
+        tip: title,
+        buttons: tools
+            .iter()
+            .zip(&widths)
+            .map(|(tool, &width)| shared::Button {
+                id: tool.description,
+                run: tool.description,
+                label: tool.label,
+                name: tool.description,
+                icon: crate::ribbon_icons::HOST_PAINTED,
+                size: shared::ButtonSize { width, min_width: width },
+                enabled: tool.enabled,
+                pressed: tool.active,
+                exit: false,
+                split: None,
+                app_paints: false,
+                covers: &[],
+            })
+            .collect(),
+        cells: Vec::new(),
+        commands: tools.iter().chain(menu_tools).map(|tool| tool.description).collect(),
+        icon: None,
+        enabled: true,
+        open: false,
+        running: None,
+        more: Vec::new(),
+    };
+    let row = shared::Row {
+        groups: vec![group],
+        labels: true,
+        accent: solidcraft_theme::TabAccent::current(ui.ctx()),
+        exit: false,
+        reveal: None,
+        more_tip: "More tools",
+        handles: shared::Handles {
+            button: &[&format!("{prefix}button:")],
+            button_rect: &format!("{prefix}button_rect:"),
+            split: &format!("{prefix}split:"),
+            cell: &[],
+            collapsed: &format!("{prefix}collapsed:"),
+            section: &format!("{prefix}section:"),
+            section_target: &format!("{prefix}section_target:"),
+            group: &format!("{prefix}group:"),
+            running: &format!("{prefix}running:"),
+            reveal: &format!("{prefix}reveal:"),
+            more: &format!("{prefix}more:"),
+            more_row: &format!("{prefix}more_row:"),
+            collapsed_count: &format!("{prefix}collapsed_count:"),
+            more_count: &format!("{prefix}more_count:"),
+            trimmed_count: &format!("{prefix}trimmed_count:"),
+            drag: &format!("{prefix}drag:"),
+            drag_remove: &format!("{prefix}drag_remove:"),
+        },
+    };
+    let mut group_ui = ui.new_child(egui::UiBuilder::new().id_salt(("ribbon_group", title)).max_rect(shared_rect));
+    let mut clip = ui.clip_rect();
+    clip.max.x = clip.max.x.min(content_left + content_width - 0.5);
+    group_ui.set_clip_rect(clip);
+    let output = shared::show(&mut group_ui, &row, shared_rect, &mut |_, _| false);
+    let mut picked = output.actions.iter().find_map(|action| match action {
+        shared::Action::Run { id, .. } => tools.iter().position(|tool| tool.description == id),
+        _ => None,
     });
+    for button in output.buttons {
+        if let Some(tool) = tools.get(button.index) {
+            crate::automation::publish_enabled(&group_ui, &button.response, format!("toolbar:{title}:{}", tool.label), tool.enabled);
+            paint_icon(ui.painter(), tool.icon, pos2(button.whole.center().x, button.whole.top() + 16.0), RIBBON_TOOL_ICON, t, tool.enabled);
+            button.response.widget_info(|| WidgetInfo::selected(Role::Button, tool.enabled && ui.is_enabled(), tool.active, tool.description));
+            popup(ui, button.index, &button.response);
+            button.response.on_hover_text(tool.description);
+        }
+    }
+    if let Some(group) = output.groups.first() {
+        let response = &group.label_response;
+        response.widget_info(|| WidgetInfo::labeled(Role::Button, ui.is_enabled(), format!("{title} menu")));
+        egui::Popup::menu(response).frame(crate::menu::frame()).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+            ui.set_min_width(t.control_height * 7.0);
+            ui.spacing_mut().item_spacing.y = 0.0;
+            for (index, tool) in tools.iter().chain(menu_tools).enumerate() {
+                if index == tools.len() && index > 0 {
+                    ui.separator();
+                }
+                let mut item = crate::MenuItem::new(tool.label).tool_icon(tool.icon).shortcut(tool.shortcut).enabled(tool.enabled);
+                if let Some(kind) = tool.menu_check {
+                    item = item.with_check(kind, tool.active);
+                }
+                if item.show(ui) {
+                    picked = Some(index);
+                }
+            }
+        });
+    }
     picked
 }
 
 /// Standard themed layer dropdown with a color patch in its closed field and every popup row.
 /// Labels and color targets stay independent; selecting a row changes only the supplied value.
-pub fn layer_choice<T: Copy + PartialEq>(ui: &mut Ui, label: &str, value: &mut T, options: &[(T, &str, Color32)]) -> bool {
+/// The returned response carries the trigger bounds and reports whether its value changed.
+pub fn layer_choice<T: Copy + PartialEq>(ui: &mut Ui, label: &str, value: &mut T, options: &[(T, &str, Color32)]) -> Response {
     let before = *value;
     let selected = options.iter().find(|(option, _, _)| option == value);
     let selected_name = selected.map_or("Layer", |(_, name, _)| *name);
-    let result =
-        egui::ComboBox::from_id_salt(label).selected_text(layer_choice_label(ui, selected_name)).width(ui.available_width()).show_ui(ui, |ui| {
-            for (option, name, color) in options {
-                let text = layer_choice_label(ui, name);
-                let response = ui.selectable_value(value, *option, text);
-                layer_choice_patch(ui, response.rect, *color);
-            }
-        });
+    let mut response = solidcraft_ui_kit::bounded_dropdown_menu(ui, label, "", ui.available_width(), |ui| {
+        for (option, name, color) in options {
+            let text = layer_choice_label(ui, name);
+            let response = ui.selectable_value(value, *option, text);
+            layer_choice_patch(ui, response.rect, *color);
+        }
+    });
+    let t = Tokens::get();
+    let text_rect = response.rect.shrink2(ui.spacing().button_padding);
+    let mut text = layer_choice_label(ui, selected_name);
+    text.wrap.max_width = (text_rect.width() - t.space_24).max(0.0);
+    text.wrap.max_rows = 1;
+    let galley = ui.painter().layout_job(text);
+    ui.painter().with_clip_rect(text_rect).galley(pos2(text_rect.left(), text_rect.center().y - galley.size().y / 2.0), galley, t.text);
     if let Some((_, _, color)) = selected {
-        layer_choice_patch(ui, result.response.rect, *color);
+        layer_choice_patch(ui, response.rect, *color);
     }
-    result.response.widget_info(|| WidgetInfo::labeled(WidgetType::ComboBox, ui.is_enabled(), label));
-    before != *value
+    response.widget_info(|| {
+        let mut info = WidgetInfo::labeled(Role::ComboBox, ui.is_enabled(), label);
+        info.current_text_value = Some(selected_name.to_owned());
+        info
+    });
+    if before != *value {
+        response.mark_changed();
+    }
+    response
 }
 
 /// Reserve actual layout space for a swatch rather than padding the visible or accessible text.
@@ -812,18 +1042,26 @@ fn layer_choice_patch(ui: &Ui, rect: Rect, color: Color32) {
 
 /// Place a standard themed field in the ribbon using the existing group height and caption.
 /// Its own control opens any menu; the caption adds no second popup or interaction target.
-pub fn ribbon_field<R>(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
+/// Compact fields place the caption above the control for a wrapping persistent settings row.
+/// The caption uses the rendered control's center, including any host-imposed size constraints.
+pub fn ribbon_field(ui: &mut Ui, title: &str, compact: bool, add: impl FnOnce(&mut Ui) -> Response) -> Response {
     let t = Tokens::get();
-    let width = t.control_height * 6.0;
-    let height = RIBBON_TOOL_HEIGHT + RIBBON_CAPTION_GAP + t.font_small + t.space_4;
+    let width = t.control_height * if compact { 5.5 } else { 6.0 };
+    let height =
+        if compact { t.control_height + t.font_small + t.space_8 } else { RIBBON_TOOL_HEIGHT + RIBBON_CAPTION_GAP + t.font_small + t.space_4 };
     let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
-    let field = Rect::from_min_max(
-        rect.min + vec2(RIBBON_GROUP_PADDING, t.space_8),
-        pos2(rect.right() - RIBBON_GROUP_PADDING, rect.top() + RIBBON_TOOL_HEIGHT),
-    );
-    let result = ui.scope_builder(egui::UiBuilder::new().max_rect(field).layout(Layout::top_down(Align::Min)), add).inner;
+    let field = if compact {
+        Rect::from_min_max(rect.min + vec2(RIBBON_GROUP_PADDING, t.font_small + t.space_4), rect.max - vec2(RIBBON_GROUP_PADDING, 0.0))
+    } else {
+        Rect::from_min_max(
+            rect.min + vec2(RIBBON_GROUP_PADDING, t.space_8),
+            pos2(rect.right() - RIBBON_GROUP_PADDING, rect.top() + RIBBON_TOOL_HEIGHT),
+        )
+    };
+    let mut field_ui = ui.new_child(egui::UiBuilder::new().id_salt(("ribbon_field", title)).max_rect(field).layout(Layout::top_down(Align::Center)));
+    let result = add(&mut field_ui);
     ui.painter().text(
-        pos2(rect.center().x, rect.top() + RIBBON_TOOL_HEIGHT + RIBBON_CAPTION_GAP),
+        pos2(result.rect.center().x, if compact { rect.top() } else { result.rect.bottom() + RIBBON_CAPTION_GAP }),
         Align2::CENTER_TOP,
         title,
         FontId::proportional(t.font_small),
@@ -832,40 +1070,30 @@ pub fn ribbon_field<R>(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui) -> R)
     result
 }
 
+/// Tell assistive technology which part of a scroll area's content is on screen. Call it first
+/// thing inside `ScrollArea::show`: the content `ui`'s accessibility node gets the visible
+/// viewport, its clip rectangle, as its bounds and is marked as clipping its children. egui
+/// leaves these containers without bounds, so without this a control scrolled under the edge
+/// of the area still reports its full rectangle as if it were visible.
+pub fn describe_scroll_viewport(ui: &Ui) {
+    let viewport = ui.clip_rect();
+    ui.ctx().accesskit_node_builder(ui.unique_id(), |node| {
+        node.set_bounds(egui::accesskit::Rect {
+            x0: viewport.min.x.into(),
+            y0: viewport.min.y.into(),
+            x1: viewport.max.x.into(),
+            y1: viewport.max.y.into(),
+        });
+        node.set_clips_children();
+    });
+}
+
 /// The quiet rule between two ribbon groups, in a slot as tall as the groups.
 pub fn ribbon_separator(ui: &mut Ui) {
     let t = Tokens::get();
     let height = RIBBON_TOOL_HEIGHT + RIBBON_CAPTION_GAP + t.font_small + t.space_4;
     let (rect, _) = ui.allocate_exact_size(vec2(RIBBON_SEPARATOR_WIDTH, height), Sense::hover());
     ui.painter().vline(rect.center().x, rect.top() + t.space_2..=rect.bottom(), Stroke::new(1.0, t.border));
-}
-
-/// Draw one ribbon button in `rect`, as PCBcraft Next's `tool_button`: quiet until hovered or
-/// pressed, the glyph near the top and the label under it. The description labels the button
-/// for assistive technology and is its tooltip.
-fn tool_button(ui: &mut Ui, rect: Rect, tool: &RibbonTool<'_>) -> Response {
-    let t = Tokens::get();
-    let sense = if tool.enabled { Sense::click() } else { Sense::hover() };
-    let response = ui.interact(rect, ui.id().with(("ribbon_tool", tool.description)), sense);
-    response.widget_info(|| WidgetInfo::selected(WidgetType::Button, tool.enabled, tool.active, tool.description));
-    if ui.is_rect_visible(rect) {
-        let p = ui.painter();
-        if tool.active {
-            p.rect_filled(rect, t.control_radius, t.accent_soft);
-        } else if tool.enabled && (response.hovered() || response.has_focus()) {
-            p.rect_filled(rect, t.control_radius, t.hover);
-        }
-        paint_icon(p, tool.icon, pos2(rect.center().x, rect.top() + RIBBON_TOOL_ICON_CENTER), RIBBON_TOOL_ICON, t, tool.enabled);
-        let ink = if tool.enabled { t.text } else { t.text_dim };
-        p.text(
-            pos2(rect.center().x, rect.bottom() - RIBBON_TOOL_LABEL_CENTER),
-            Align2::CENTER_CENTER,
-            tool.label,
-            FontId::proportional(t.font_body),
-            ink,
-        );
-    }
-    response.on_hover_text(tool.description)
 }
 
 /// Paint a ribbon glyph in a menu row's leading column.
@@ -925,7 +1153,7 @@ fn docked_card(ui: &mut Ui, panel: Panel, title: &str, bottom_clearance: f32, cl
         .resizable(false)
         .show_separator_line(false)
         .frame(Frame::new().fill(t.canvas).inner_margin(margin))
-        .show(ui, |ui| card(t, t.space_8).show(ui, |ui| card_contents(ui, title, f32::INFINITY, closable, add)).inner)
+        .show(ui, |ui| card(ui.ctx(), t.space_8).show(ui, |ui| card_contents(ui, title, f32::INFINITY, closable, add)).inner)
         .inner
 }
 
@@ -938,7 +1166,7 @@ fn docked_card(ui: &mut Ui, panel: Panel, title: &str, bottom_clearance: f32, cl
 /// rectangle and whether the header was clicked, which should toggle `collapsed`. Inherits
 /// the host's enabled state, including when a project dialog lives in another native window.
 pub fn floating_card(ui: &Ui, id: &'static str, title: &str, area: Rect, collapsed: bool, add: impl FnOnce(&mut Ui)) -> (Rect, bool) {
-    floating_card_with_id(ui, egui::Id::new(id), title, area, collapsed, add)
+    floating_card_with_id(ui, egui::Id::unique(id), title, area, collapsed, add)
 }
 
 /// Render a floating card with an explicit host identity, allowing independent native windows.
@@ -948,7 +1176,8 @@ pub fn floating_card_with_id(ui: &Ui, id: egui::Id, title: &str, area: Rect, col
 
 /// Minimum area height needed for a floating card's header, frame and edge clearance.
 pub(crate) fn floating_card_min_height() -> f32 {
-    FLOATING_HEADER + floating_frame().total_margin().sum().y + 2.0 * FLOATING_GAP
+    let t = solidcraft_theme::Tokens::get();
+    FLOATING_HEADER + 2.0 * (FLOATING_MARGIN + t.primary_border(t.border).width) + 2.0 * FLOATING_GAP
 }
 
 /// Anchor a workspace card to either canvas edge, retaining shared dimensions and collapse behavior.
@@ -988,7 +1217,7 @@ pub fn floating_card_width(
     }
     let height = area.height() - 2.0 * FLOATING_GAP;
     let body_height = (height - 2.0 * (FLOATING_MARGIN + 1.0) - FLOATING_HEADER - t.space_8).max(0.0);
-    let frame = floating_frame();
+    let frame = floating_frame(ui.ctx());
     let shown = egui::Area::new(id)
         .enabled(ui.is_enabled())
         .order(egui::Order::Middle)
@@ -1015,30 +1244,64 @@ pub fn floating_card_width(
 }
 
 /// The shared six-dot grip marks the title region that can move a floating or docked card.
-pub(super) fn drag_grip(painter: &egui::Painter, header: Rect) {
-    for x in [4.0, 8.0] {
-        for y in [-4.0, 0.0, 4.0] {
-            painter.circle_filled(header.left_center() + vec2(x, y), 1.0, Tokens::get().text_dim);
-        }
-    }
+pub(super) fn drag_grip(ui: &mut Ui, header: Rect) {
+    let bounds = Rect::from_center_size(header.left_center() + vec2(7.0, 0.0), vec2(10.0, 18.0));
+    let mut grip = ui.new_child(egui::UiBuilder::new().id_salt("panel_grip").max_rect(bounds));
+    grip.set_clip_rect(ui.clip_rect().intersect(header));
+    solidcraft_ui_kit::panel_grip(&mut grip);
 }
 
 /// A floating card's header: its title on the left and a chevron on the right, one button that
 /// collapses or expands the card and is labelled for that.
 fn card_header(ui: &mut Ui, title: &str, collapsed: bool) -> Response {
     let t = Tokens::get();
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), FLOATING_HEADER), Sense::click());
+    let (id, rect) = ui.allocate_space(vec2(ui.available_width(), FLOATING_HEADER));
+    let response = panel_header_control(ui, id, rect, title, false);
     let action = if collapsed { "Expand" } else { "Collapse" };
-    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, format!("{action} {title}")));
-    let p = ui.painter();
-    if response.hovered() || response.has_focus() {
-        p.rect_filled(rect, t.radius_sm, t.hover);
+    response.widget_info(|| WidgetInfo::labeled(Role::Button, ui.is_enabled(), format!("{action} {title}")));
+    ui.ctx().accesskit_node_builder(response.id, |node| node.set_expanded(!collapsed));
+    let icon = Rect::from_center_size(rect.right_center() - vec2(10.0, 0.0), vec2(12.0, 12.0));
+    if collapsed {
+        solidcraft_ui_kit::icons::paint_ink(ui.painter(), icon, "chevron", t.text_dim);
+    } else {
+        solidcraft_ui_kit::icons::paint_ink_flipped(ui.painter(), icon, "chevron", t.text_dim);
     }
-    p.text(rect.left_center() + vec2(2.0, 0.0), Align2::LEFT_CENTER, title, fonts::interface_heading(ui, t.font_body), t.text);
-    let c = rect.right_center() - vec2(10.0, 0.0);
-    let sign = if collapsed { -1.0 } else { 1.0 };
-    p.add(Shape::line(vec![c + vec2(-4.0, -2.0 * sign), c + vec2(0.0, 2.0 * sign), c + vec2(4.0, -2.0 * sign)], Stroke::new(1.3, t.text_dim)));
-    response.on_hover_text(if collapsed { "Expand panel" } else { "Collapse panel" })
+    response.on_hover_text(format!("{action} {title}"))
+}
+
+/// Plain panel titles have no hover fill or tooltip of their own. The caller supplies one
+/// action tooltip when needed; keyboard focus remains visible without adding a selection fill.
+/// Movable cards reuse the compact catalog's grip spacing and shared focus/grip primitives.
+pub(super) fn panel_header_control(ui: &mut Ui, id: egui::Id, rect: Rect, title: &str, drag: bool) -> Response {
+    let sense = if !ui.is_enabled() {
+        Sense::hover()
+    } else if drag {
+        Sense::click_and_drag()
+    } else {
+        Sense::click()
+    };
+    let response = ui.interact(rect, id, sense);
+    response.widget_info(|| WidgetInfo::labeled(Role::Button, ui.is_enabled(), title));
+    let t = Tokens::get();
+    let painter = ui.painter().with_clip_rect(ui.clip_rect().intersect(rect));
+    if response.has_focus() {
+        painter.add(solidcraft_ui_kit::native_button_focus(ui, &response, rect.shrink(t.space_2)));
+    }
+    if drag {
+        drag_grip(ui, rect);
+    }
+    let left = (rect.left() + if drag { 18.0 } else { t.space_4 }).min(rect.right());
+    let right = if drag { rect.right() } else { (rect.right() - t.space_24).max(left) };
+    let label = Rect::from_min_max(pos2(left, rect.top()), pos2(right, rect.bottom()));
+    let font = if drag { fonts::interface_heading(ui, t.font_body) } else { FontId::proportional(t.font_label) };
+    painter.with_clip_rect(painter.clip_rect().intersect(label)).text(
+        label.left_center(),
+        Align2::LEFT_CENTER,
+        title,
+        font,
+        if ui.is_enabled() { t.text } else { t.text_dim },
+    );
+    response.on_hover_cursor(if drag { egui::CursorIcon::Grab } else { egui::CursorIcon::PointingHand })
 }
 
 /// A card's header, with its title and optional named Close button, over a body that scrolls
@@ -1051,8 +1314,8 @@ fn card_contents(ui: &mut Ui, title: &str, max_body_height: f32, closable: bool,
         .allocate_ui_with_layout(header_size, Layout::right_to_left(Align::Center), |ui| {
             // Named after the card, so a screen reader can tell several cards apart.
             let close = closable && {
-                let close = ui.small_button("Close");
-                close.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, format!("Close {title}")));
+                let close = crate::controls::small_button(ui, "Close");
+                close.widget_info(|| WidgetInfo::labeled(Role::Button, true, format!("Close {title}")));
                 close.clicked()
             };
             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
@@ -1067,8 +1330,10 @@ fn card_contents(ui: &mut Ui, title: &str, max_body_height: f32, closable: bool,
 }
 
 /// Shared bordered surface for the ribbon and inspector.
-fn card(t: Tokens, inset: f32) -> Frame {
-    Frame::new().fill(t.panel).stroke(Stroke::new(1.0, t.border)).corner_radius(t.radius_md).inner_margin(Margin::same(inset as i8))
+fn card(ctx: &egui::Context, inset: f32) -> Frame {
+    solidcraft_ui_kit::Container::floating_card(solidcraft_ui_kit::Surface::Chrome)
+        .frame(ctx, Tokens::get().panel, solidcraft_ui_kit::frame::Side::Left)
+        .inner_margin(Margin::same(inset as i8))
 }
 
 /// Draw a workspace's icon, `size` points square, in the theme's icon colour roles. Planned
@@ -1085,6 +1350,9 @@ fn paint_workspace_glyph(p: &egui::Painter, icon: WorkspaceIcon, center: Pos2, s
     let stroke = |width: f32, color| Stroke::new(width * scale, color);
     let line = |points: &[(f32, f32)], stroke: Stroke| p.add(Shape::line(points.iter().map(|&(x, y)| at(x, y)).collect(), stroke));
     match icon {
+        WorkspaceIcon::Library => {
+            solidcraft_ui_kit::icons::paint_icon(p, Rect::from_center_size(center, vec2(size, size)), "library", if available { 1.0 } else { 0.35 });
+        }
         WorkspaceIcon::Schematic => {
             let outline = stroke(2.55, ink);
             let accent = stroke(3.0, active_2);
@@ -1142,7 +1410,7 @@ fn paint_workspace_glyph(p: &egui::Painter, icon: WorkspaceIcon, center: Pos2, s
 /// Draw a ribbon glyph in the theme's icon roles: line art in `icon_line` and accents in the
 /// strongest icon blue, both faded when the action is unavailable. Registered SVG masters use
 /// the embedded loader; other chrome glyphs retain their native painter and menu artwork.
-fn paint_icon(p: &egui::Painter, icon: ToolIcon, center: Pos2, size: f32, t: Tokens, enabled: bool) {
+pub(crate) fn paint_icon(p: &egui::Painter, icon: ToolIcon, center: Pos2, size: f32, t: Tokens, enabled: bool) {
     if crate::ribbon_icons::paint(p, icon, center, size, t, enabled) {
         return;
     }
@@ -1152,6 +1420,42 @@ fn paint_icon(p: &egui::Painter, icon: ToolIcon, center: Pos2, size: f32, t: Tok
     let stroke = |width: f32, color| Stroke::new(width * size / 64.0, color);
     let line = |points: &[(f32, f32)], stroke: Stroke| p.add(Shape::line(points.iter().map(|&(x, y)| at(x, y)).collect(), stroke));
     match icon {
+        ToolIcon::LibraryFolder(action) => {
+            solidcraft_ui_kit::icons::paint_icon(p, Rect::from_center_size(center, vec2(size, size)), "folder", if enabled { 1.0 } else { 0.35 });
+            let center = at(47.0, 47.0);
+            let radius = size * 0.16;
+            p.circle_filled(center, radius * 1.3, t.panel);
+            let mark = Stroke::new(size * 0.065, accent);
+            p.line_segment([center - vec2(radius, 0.0), center + vec2(radius, 0.0)], mark);
+            match action {
+                LibraryFolderAction::Add => {
+                    p.line_segment([center - vec2(0.0, radius), center + vec2(0.0, radius)], mark);
+                }
+                LibraryFolderAction::Relocate => {
+                    p.line_segment([center + vec2(radius * 0.3, -radius * 0.7), center + vec2(radius, 0.0)], mark);
+                    p.line_segment([center + vec2(radius * 0.3, radius * 0.7), center + vec2(radius, 0.0)], mark);
+                }
+                LibraryFolderAction::Remove => {}
+            }
+        }
+        ToolIcon::LibraryRefresh => {
+            let points: Vec<_> = (0..=24)
+                .map(|i| {
+                    let angle = (45.0 + i as f32 * 270.0 / 24.0).to_radians();
+                    at(32.0 + 21.0 * angle.cos(), 32.0 + 21.0 * angle.sin())
+                })
+                .collect();
+            p.add(Shape::line(points, stroke(4.25, ink)));
+            line(&[(39.0, 14.0), (47.0, 17.0), (48.0, 8.0)], stroke(4.25, ink));
+        }
+        ToolIcon::Shared(name) => {
+            solidcraft_ui_kit::icons::paint_icon(p, Rect::from_center_size(center, vec2(size, size)), name, if enabled { 1.0 } else { 0.35 })
+        }
+        ToolIcon::NoConnect => {
+            line(&[(10., 32.), (42., 32.)], stroke(4., ink));
+            line(&[(30., 20.), (54., 44.)], stroke(4., ink));
+            line(&[(30., 44.), (54., 20.)], stroke(4., ink));
+        }
         ToolIcon::Ground => {
             line(&[(32., 10.), (32., 29.)], stroke(3., ink));
             for (y, width) in [(29., 18.), (39., 12.), (49., 6.)] {
@@ -1239,6 +1543,13 @@ fn paint_icon(p: &egui::Painter, icon: ToolIcon, center: Pos2, size: f32, t: Tok
             }
             p.rect_filled(Rect::from_min_max(at(24.0, 24.0), at(40.0, 40.0)), (2.0 * size / 64.0) as u8, ink);
         }
+        ToolIcon::Grid => {
+            for x in [-0.3, 0.0, 0.3] {
+                for y in [-0.3, 0.0, 0.3] {
+                    p.circle_filled(center + vec2(x, y) * size, size * 0.055, ink);
+                }
+            }
+        }
         ToolIcon::Settings => {
             let mut painter = p.clone();
             if !enabled {
@@ -1255,6 +1566,83 @@ fn paint_icon(p: &egui::Painter, icon: ToolIcon, center: Pos2, size: f32, t: Tok
             line(&[(12.0, 20.0), (8.0, 20.0), (8.0, 54.0), (44.0, 54.0), (44.0, 50.0)], stroke(4.0, ink));
             line(&[(20.0, 10.0), (56.0, 10.0), (56.0, 44.0), (20.0, 44.0), (20.0, 10.0)], stroke(4.0, accent));
         }
+        ToolIcon::Footprint => {
+            line(&[(18.0, 18.0), (46.0, 18.0), (46.0, 46.0), (18.0, 46.0), (18.0, 18.0)], stroke(4.0, ink));
+            for offset in [24.0, 32.0, 40.0] {
+                line(&[(8.0, offset), (16.0, offset)], stroke(3.5, accent));
+                line(&[(48.0, offset), (56.0, offset)], stroke(3.5, accent));
+                line(&[(offset, 8.0), (offset, 16.0)], stroke(3.5, accent));
+                line(&[(offset, 48.0), (offset, 56.0)], stroke(3.5, accent));
+            }
+        }
+        ToolIcon::Track => {
+            line(&[(8.0, 48.0), (26.0, 48.0), (46.0, 28.0), (56.0, 28.0)], stroke(6.0, ink));
+            p.circle_filled(at(8.0, 48.0), 5.0 * size / 64.0, accent);
+            p.circle_filled(at(56.0, 28.0), 5.0 * size / 64.0, accent);
+        }
+        ToolIcon::Via => {
+            p.circle_filled(at(32.0, 32.0), 20.0 * size / 64.0, accent);
+            p.circle(at(32.0, 32.0), 9.0 * size / 64.0, t.panel, stroke(3.0, ink));
+        }
+        ToolIcon::Zone => {
+            line(&[(10.0, 14.0), (44.0, 14.0), (54.0, 26.0), (54.0, 52.0), (10.0, 52.0), (10.0, 14.0)], stroke(4.0, ink));
+            for x in [18.0, 28.0, 38.0] {
+                line(&[(x, 46.0), (x + 12.0, 22.0)], stroke(3.0, accent));
+            }
+        }
+        ToolIcon::Pair => {
+            line(&[(8.0, 42.0), (24.0, 42.0), (40.0, 26.0), (56.0, 26.0)], stroke(4.0, ink));
+            line(&[(8.0, 52.0), (28.0, 52.0), (44.0, 36.0), (56.0, 36.0)], stroke(4.0, accent));
+        }
+        ToolIcon::Tune => {
+            line(
+                &[
+                    (6.0, 44.0),
+                    (14.0, 44.0),
+                    (14.0, 20.0),
+                    (24.0, 20.0),
+                    (24.0, 44.0),
+                    (34.0, 44.0),
+                    (34.0, 20.0),
+                    (44.0, 20.0),
+                    (44.0, 44.0),
+                    (58.0, 44.0),
+                ],
+                stroke(4.0, ink),
+            );
+            p.circle_filled(at(6.0, 44.0), 4.0 * size / 64.0, accent);
+            p.circle_filled(at(58.0, 44.0), 4.0 * size / 64.0, accent);
+        }
+        ToolIcon::Align => {
+            line(&[(12.0, 8.0), (12.0, 56.0)], stroke(4.0, accent));
+            for (y, length) in [(18.0, 38.0), (32.0, 26.0), (46.0, 32.0)] {
+                p.rect_filled(Rect::from_min_max(at(16.0, y - 4.0), at(16.0 + length, y + 4.0)), (size / 32.0) as u8, ink);
+            }
+        }
+        ToolIcon::Drc => {
+            line(&[(10.0, 10.0), (54.0, 10.0), (54.0, 54.0), (10.0, 54.0), (10.0, 10.0)], stroke(4.0, ink));
+            line(&[(20.0, 32.0), (29.0, 42.0), (46.0, 22.0)], stroke(5.0, accent));
+        }
+        ToolIcon::Measure => {
+            line(&[(6.0, 26.0), (58.0, 26.0), (58.0, 40.0), (6.0, 40.0), (6.0, 26.0)], stroke(3.5, ink));
+            for (index, x) in [14.0, 22.0, 30.0, 38.0, 46.0].into_iter().enumerate() {
+                line(&[(x, 26.0), (x, if index % 2 == 0 { 35.0 } else { 31.0 })], stroke(3.0, accent));
+            }
+        }
+        ToolIcon::FlipView => {
+            line(&[(32.0, 6.0), (32.0, 58.0)], stroke(3.0, ink));
+            line(&[(26.0, 16.0), (8.0, 46.0), (26.0, 46.0), (26.0, 16.0)], stroke(4.0, ink));
+            line(&[(38.0, 16.0), (56.0, 46.0), (38.0, 46.0), (38.0, 16.0)], stroke(4.0, accent));
+        }
+        ToolIcon::Outputs => {
+            line(&[(14.0, 6.0), (40.0, 6.0), (50.0, 16.0), (50.0, 58.0), (14.0, 58.0), (14.0, 6.0)], stroke(4.0, ink));
+            line(&[(32.0, 20.0), (32.0, 46.0)], stroke(4.0, accent));
+            line(&[(22.0, 36.0), (32.0, 46.0), (42.0, 36.0)], stroke(4.0, accent));
+        }
+        ToolIcon::Refill => {
+            line(&[(10.0, 14.0), (44.0, 14.0), (54.0, 26.0), (54.0, 52.0), (10.0, 52.0), (10.0, 14.0)], stroke(4.0, ink));
+            p.rect_filled(Rect::from_min_max(at(18.0, 22.0), at(46.0, 44.0)), (size / 32.0) as u8, accent);
+        }
     }
 }
 
@@ -1265,4 +1653,78 @@ pub fn ribbon_licenses(ui: &mut Ui) {
             ui.label(crate::ribbon_icons::NOTICES);
         });
     });
+}
+
+#[cfg(test)]
+mod ribbon_tests {
+    use super::*;
+
+    /// Extra window width must not expand the Board command group. Its tool pair and caption
+    /// stay centered in their compact allocation beside the preceding command groups.
+    #[test]
+    fn two_button_group_stays_compact_with_extra_room() {
+        let ctx = egui::Context::default();
+        crate::install(&ctx);
+        let mut output =
+            ctx.run_ui(egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(600., 200.))), ..Default::default() }, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let tools: Vec<_> = ["Update PCB", "Setup"]
+                            .into_iter()
+                            .map(|label| RibbonTool {
+                                icon: ToolIcon::Fit,
+                                label,
+                                description: label,
+                                shortcut: "",
+                                enabled: true,
+                                active: false,
+                                menu_check: None,
+                            })
+                            .collect();
+                        let response = ui.scope(|ui| ribbon_group(ui, "Board", &tools)).response;
+                        let first = solidcraft_ui_registry::rect_of("pcbcraft:ribbon:Board:button_rect:Update PCB").unwrap();
+                        let second = solidcraft_ui_registry::rect_of("pcbcraft:ribbon:Board:button_rect:Setup").unwrap();
+                        let caption = solidcraft_ui_registry::rect_of("pcbcraft:ribbon:Board:section_target:Board").unwrap();
+                        let buttons = first.union(second);
+                        assert!(response.rect.width() <= buttons.width() + 20., "extra viewport space must not expand the group");
+                        assert!((buttons.center().x - response.rect.center().x).abs() <= 1.0);
+                        assert!((buttons.center().x - caption.center().x).abs() <= 1.0);
+                        assert_eq!(first.size(), second.size());
+                    });
+                });
+            });
+        output.textures_delta.clear();
+    }
+
+    /// The toolkit's fitting reserve belongs outside the visible group. A single button
+    /// and its caption must be centered in the host allocation, even for a long caption.
+    #[test]
+    fn single_button_groups_are_centered_in_their_allocated_space() {
+        let ctx = egui::Context::default();
+        crate::install(&ctx);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (title, label) in [("PCB", "Update PCB"), ("Navigate", "Fit"), ("Selected definition", "Edit copy")] {
+                        let tools = [RibbonTool {
+                            icon: ToolIcon::Fit,
+                            label,
+                            description: label,
+                            shortcut: "",
+                            enabled: true,
+                            active: false,
+                            menu_check: None,
+                        }];
+                        let response = ui.scope(|ui| ribbon_group(ui, title, &tools)).response;
+                        let prefix = format!("pcbcraft:ribbon:{title}:");
+                        let button = solidcraft_ui_registry::rect_of(&format!("{prefix}button_rect:{label}")).unwrap();
+                        let caption = solidcraft_ui_registry::rect_of(&format!("{prefix}section_target:{title}")).unwrap();
+                        assert!((button.center().x - response.rect.center().x).abs() <= 1.0, "{title}: {button:?}, {:?}", response.rect);
+                        assert!((button.center().x - caption.center().x).abs() <= 1.0, "{title}");
+                    }
+                });
+            });
+        });
+        output.textures_delta.clear();
+    }
 }

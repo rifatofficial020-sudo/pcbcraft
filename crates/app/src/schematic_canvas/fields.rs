@@ -40,7 +40,7 @@ fn instance_ink(ui: &Ui, project: &Project, symbol: &SymbolPlacement, camera: &C
     ink(
         ui.painter(),
         symbol,
-        Content { reference: component.reference(), value: component.value(), metadata: &component.metadata },
+        Content { reference: component.reference(), value: &component.display_value(), metadata: &component.metadata },
         camera.screen(symbol.position, rect),
         camera.unit_step(),
         color,
@@ -53,11 +53,16 @@ fn ink(painter: &Painter, symbol: &SymbolPlacement, content: Content<'_>, center
     if step < theme::SCHEMATIC_MIN_GRID_SPACING {
         return Vec::new();
     }
-    let drawing = drawing_bounds(&symbol.definition);
-    let bounds = if drawing.is_positive() { turn_rect(drawing, symbol.turns()) } else { Rect::from_center_size(Pos2::ZERO, vec2(2., 2.)) };
+    let drawing = drawing_bounds(symbol.unit_definition());
+    let bounds = if drawing.is_positive() {
+        turn_rect(drawing, symbol.turns(), symbol.is_mirrored())
+    } else {
+        Rect::from_center_size(Pos2::ZERO, vec2(2., 2.))
+    };
     let t = Tokens::get();
     let metadata = content.metadata;
-    let mut content = vec![("reference", "Reference", content.reference), ("value", "Value", content.value)];
+    let reference = symbol.display_reference(content.reference);
+    let mut content = vec![("reference", "Reference", reference.as_str()), ("value", "Value", content.value)];
     content.extend(metadata.fields.iter().map(|(id, f)| (id.as_str(), f.name.as_str(), f.value.as_str())));
     content
         .into_iter()
@@ -77,7 +82,7 @@ fn ink(painter: &Painter, symbol: &SymbolPlacement, content: Content<'_>, center
                 (center + vec2(0., (step * (bounds.max.y + 0.4)).max(t.space_12) + (index - 1) as f32 * step * 1.5), Align2::CENTER_TOP)
             };
             let anchor = layout.offset.map_or(automatic, |p| {
-                let (x, y) = turn(p.x_nm as f32 / GRID_NM as f32, p.y_nm as f32 / GRID_NM as f32, symbol.turns());
+                let (x, y) = turn(p.x_nm as f32 / GRID_NM as f32, p.y_nm as f32 / GRID_NM as f32, symbol.turns(), symbol.is_mirrored());
                 center + vec2(x, y) * step
             });
             let horizontal = match layout.align {
@@ -152,12 +157,7 @@ pub(super) fn destination(project: &Project, camera: &Camera, rect: Rect, drag: 
     let point = camera.snap(pointer + drag.offset, rect);
     let dx = point.x_nm.checked_sub(symbol.position.x_nm)?;
     let dy = point.y_nm.checked_sub(symbol.position.y_nm)?;
-    let (x_nm, y_nm) = match symbol.turns() % 4 {
-        0 => (dx, dy),
-        1 => (-dy, dx),
-        2 => (-dx, -dy),
-        _ => (dy, -dx),
-    };
+    let (x_nm, y_nm) = pcbcraft_engine::schematic::unplace(dx, dy, symbol.turns(), symbol.is_mirrored());
     let mut layouts = symbol.field_layout.clone();
     let layout = layouts.entry(drag.field.clone()).or_default();
     layout.offset = Some(Point { x_nm, y_nm });

@@ -26,6 +26,24 @@ pub(crate) fn auto_heal(params: &Value) -> bool {
 /// Maximum intermediate points accepted in a single authored wire.
 pub const MAX_BENDS: usize = 64;
 
+/// A connecting leg created when a retained pose keeps a fixed named contact attached.
+/// The recorded endpoints and bends distinguish it from authored routes on a later return.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GeneratedLeg {
+    pub(crate) wire: u64,
+    pub(crate) end: WireEndpoint,
+    pub(crate) other: WireEndpoint,
+    pub(crate) bends: Option<Vec<Point>>,
+}
+
+impl GeneratedLeg {
+    /// Whether this record still describes the exact wire it was created from. Any later
+    /// endpoint or bend edit makes the route authored again and must preserve it.
+    pub(crate) fn matches(&self, wire: &Wire) -> bool {
+        wire.ordinal() == self.wire && wire.endpoints() == [self.other, self.end] && wire.bends() == self.bends.as_deref()
+    }
+}
+
 /// A wire gesture targets an existing electrical identity or creates a free endpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Anchor {
@@ -106,7 +124,7 @@ impl Project {
         leg > 0 || leg + 2 < path.len() || wire.endpoints.iter().any(|&end| self.wire_end_has_attachment(end))
     }
 
-    /// Component/hierarchy pins and shared junctions anchor a route end; degree-one
+    /// Part instance/hierarchy pins and shared junctions anchor a route end; degree-one
     /// junctions are already free and keep their identity when a neighboring leg is broken.
     fn wire_end_has_attachment(&self, end: WireEndpoint) -> bool {
         !matches!(end, WireEndpoint::Junction(_)) || self.wires.iter().filter(|wire| wire.endpoints.contains(&end)).count() > 1
@@ -146,6 +164,7 @@ impl Project {
             })
             .collect();
         Arc::make_mut(&mut self.sheet_mut().junctions).retain(|id, _| used.contains(id));
+        Arc::make_mut(&mut self.sheet_mut().no_connect_ends).retain(|id| used.contains(id));
     }
 }
 
@@ -267,7 +286,7 @@ impl Session {
         };
         edit.draw(endpoints, &path)?;
         let candidate = edit.finish(auto_heal(params))?;
-        self.change(candidate);
+        self.change(candidate)?;
         Ok(())
     }
 
@@ -394,7 +413,7 @@ impl Session {
         }
         candidate.prune_junctions();
         candidate.sheet_mut().connectivity = Arc::default();
-        self.change(candidate);
+        self.change(candidate)?;
         Ok(())
     }
 
@@ -433,7 +452,7 @@ impl Session {
         Arc::make_mut(&mut candidate.sheet_mut().wires).remove(index);
         candidate.prune_junctions();
         candidate.sheet_mut().connectivity = Arc::default();
-        self.change(candidate);
+        self.change(candidate)?;
         Ok(())
     }
 }
@@ -476,10 +495,10 @@ mod tests {
         assert_eq!(project.connectivity().nets, vec![Vec::<crate::schematic::Terminal>::new()]);
         assert_eq!(project.wire_path(&project.wires()[0]).len(), 3);
         for encoding in [Encoding::Json, Encoding::Zip] {
-            let bytes = persistence::encode_file(project.clone(), encoding).unwrap();
-            let (loaded, detected) = persistence::decode_file(&bytes).unwrap();
+            let bytes = persistence::diagnostic_test_file(project.clone(), encoding).unwrap();
+            let (loaded, detected) = persistence::decode_diagnostic_file(&bytes).unwrap();
             assert_eq!(detected, encoding);
-            assert_eq!(persistence::encode_file(loaded.clone(), encoding).unwrap(), bytes);
+            assert_eq!(persistence::diagnostic_test_file(loaded.clone(), encoding).unwrap(), bytes);
             assert_eq!(loaded.inspect_schematic(), state["project"]["schematic"]);
             let mut reopened = Session::default();
             reopened.open_snapshot(loaded);
@@ -529,8 +548,8 @@ mod tests {
         let path = after.wire_path(&after.wires()[0]);
         assert_ne!(path[0], before.wire_path(&before.wires()[0])[0]);
         assert!(path.windows(2).all(|pair| pair[0].x_nm == pair[1].x_nm || pair[0].y_nm == pair[1].y_nm));
-        let bytes = persistence::encode(after).unwrap();
-        assert_eq!(persistence::encode(persistence::decode(&bytes).unwrap()).unwrap(), bytes);
+        let bytes = persistence::encode_documents(after).unwrap();
+        assert_eq!(persistence::encode_documents(persistence::decode_documents(&bytes).unwrap()).unwrap(), bytes);
         session.apply(crate::DELETE_SYMBOL, &json!({"symbol":"symbol-2","expected_revision":session.revision()})).unwrap();
         assert!(session.project().unwrap().wires().is_empty());
         assert_eq!(session.project().unwrap().junctions().count(), 0);
@@ -577,8 +596,8 @@ mod tests {
         let [_, middle] = project.wires()[0].endpoints();
         assert_eq!(project.wires()[1].endpoints()[0], middle, "the halves share the new junction");
         assert_eq!(project.connectivity().nets.len(), before.connectivity().nets.len());
-        let bytes = persistence::encode(project.clone()).unwrap();
-        assert_eq!(persistence::encode(persistence::decode(&bytes).unwrap()).unwrap(), bytes);
+        let bytes = persistence::encode_documents(project.clone()).unwrap();
+        assert_eq!(persistence::encode_documents(persistence::decode_documents(&bytes).unwrap()).unwrap(), bytes);
 
         // Slicing at a corner splits there without adding a point to either half.
         session.apply("edit.undo", &Value::Null).unwrap();
@@ -650,8 +669,8 @@ mod tests {
         assert_eq!(&routes(&session)[1..3], other_routes.as_slice());
         assert_eq!(project.connectivity().net_for(one).unwrap(), &[one]);
         assert_eq!(project.connectivity().net_for(two).unwrap(), &[two]);
-        let bytes = persistence::encode(project.clone()).unwrap();
-        assert_eq!(persistence::encode(persistence::decode(&bytes).unwrap()).unwrap(), bytes);
+        let bytes = persistence::encode_documents(project.clone()).unwrap();
+        assert_eq!(persistence::encode_documents(persistence::decode_documents(&bytes).unwrap()).unwrap(), bytes);
         session.apply("edit.undo", &Value::Null).unwrap();
         assert_eq!(session.project().unwrap().connectivity().net_for(one).unwrap(), &[one, two]);
         assert_eq!(routes(&session)[0], route);
@@ -688,8 +707,8 @@ mod tests {
         assert_ne!(wires[1].endpoints()[1], wires[2].endpoints()[0]);
         assert_eq!(project.junctions().count(), 5);
         assert_eq!(project.connectivity().net_for(terminal).unwrap(), &[terminal]);
-        let bytes = persistence::encode(project.clone()).unwrap();
-        assert_eq!(persistence::encode(persistence::decode(&bytes).unwrap()).unwrap(), bytes);
+        let bytes = persistence::encode_documents(project.clone()).unwrap();
+        assert_eq!(persistence::encode_documents(persistence::decode_documents(&bytes).unwrap()).unwrap(), bytes);
         session.apply("edit.undo", &Value::Null).unwrap();
         assert_eq!(session.inspect()["project"], before["project"]);
 
@@ -747,7 +766,7 @@ mod tests {
         let snapshot = session.inspect();
         assert!(session.apply(DRAW_WIRE, &valid).is_err());
         assert_eq!(session.inspect(), snapshot);
-        let bytes = persistence::encode(session.snapshot().unwrap()).unwrap();
+        let bytes = persistence::encode(persistence::diagnostic_snapshot(session.snapshot().unwrap())).unwrap();
         let stored: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(stored["format"], "pcbcraft-project/10");
         for (path, value) in [

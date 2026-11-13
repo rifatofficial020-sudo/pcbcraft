@@ -8,12 +8,57 @@ use std::{
 };
 
 use egui::{Event, PointerButton, Pos2, Rect, ViewportCommand, ViewportId, pos2, vec2};
-use pcbcraft_engine::{persistence::encode, schematic::Point};
+use pcbcraft_engine::{persistence::encode_documents, schematic::Point};
 
 use super::*;
 use crate::editor_layout::HostId;
 
 mod pane_drag;
+
+/// A nested Assistant viewport does not begin editor collection and must not publish its
+/// window-local controls into the original editor's background layer.
+#[test]
+fn ui_automation_ignores_detached_assistant_targets() {
+    let (mut h, peers) = many_windows();
+    h.state_mut().automation.observing = true;
+    click(&mut h, "Assistant");
+    click(&mut h, "Pop out Assistant");
+    h.run_steps(3);
+    let child = peers.borrow().get(&ViewportId::from_hash_of("pcbcraft_assistant")).unwrap().clone();
+    child_rect(&child, "Dock Assistant");
+    let ctx = h.ctx.clone();
+    let root = h.state_mut().automation_command(&ctx, "ui.handles", &json!({"window":0})).unwrap();
+    assert!(!root["handles"].as_array().unwrap().iter().any(|target| target["name"] == "button:Dock Assistant"), "{root}");
+    assert!(h.state_mut().automation_command(&ctx, "ui.at", &json!({"window":0,"handle":"button:Dock Assistant"})).is_err());
+}
+
+/// Named geometry remains window-local even though immediate hosts share the toolkit registry.
+/// The pinned framework lacks the input hook for these child windows, which must refuse input.
+#[test]
+fn ui_automation_lookup_keeps_detached_hosts_separate() {
+    let (mut h, peer) = multi_window();
+    let ctx = h.ctx.clone();
+    let root = h.state().views.active.id();
+    h.state_mut().run_window_command(&ctx, "view.open_window", &json!({"view":root.0})).unwrap();
+    h.state_mut().automation.observing = true;
+    peer.borrow_mut().focused = true;
+    h.run_steps(4);
+    let root_targets = h.state_mut().automation_command(&ctx, "ui.handles", &json!({"window":0})).unwrap();
+    let child_targets = h.state_mut().automation_command(&ctx, "ui.handles", &json!({"window":1})).unwrap();
+    let child = h.state().views.hosts[&HostId(1)].focused;
+    assert_eq!(root_targets["window"], 0);
+    assert_eq!(child_targets["window"], 1);
+    for (targets, view) in [(&root_targets, root), (&child_targets, child)] {
+        assert!(targets["handles"].as_array().unwrap().iter().any(|target| target["name"] == format!("canvas:{}", view.0)), "{targets}");
+    }
+    assert!(!child_targets["handles"].as_array().unwrap().iter().any(|target| target["name"] == format!("canvas:{}", root.0)));
+    assert!(
+        h.state_mut()
+            .automation_command(&ctx, "ui.click", &json!({"window":1,"target":{"handle":"tab:View"}}))
+            .unwrap_err()
+            .contains("detached windows support named lookup only")
+    );
+}
 
 #[derive(Default)]
 struct Peer {
@@ -26,6 +71,7 @@ struct Peer {
     output: egui::FullOutput,
     frames: usize,
     decorations: Option<bool>,
+    title: Option<String>,
 }
 
 impl Peer {
@@ -77,6 +123,7 @@ fn many_windows() -> (Harness<'static, PcbApp>, Peers) {
         {
             let mut peer = state.borrow_mut();
             peer.decorations = viewport.builder.decorations;
+            peer.title = viewport.builder.title.clone();
             input.focused = peer.focused;
             input.events = std::mem::take(&mut peer.events);
             let mut info = egui::ViewportInfo { parent: Some(ViewportId::ROOT), focused: Some(peer.focused), ..Default::default() };
@@ -107,13 +154,16 @@ fn child_rect(peer: &Rc<RefCell<Peer>>, label: &str) -> Rect {
         .nodes
         .values()
         .find_map(|node| {
-            if node.label() != Some(label) {
+            if node.label().or_else(|| node.value()) != Some(label) {
                 return None;
             }
             let bounds = node.bounds()?;
             Some(Rect::from_min_max(pos2(bounds.x0 as f32, bounds.y0 as f32), pos2(bounds.x1 as f32, bounds.y1 as f32)))
         })
-        .unwrap_or_else(|| panic!("missing child control: {label}"))
+        .unwrap_or_else(|| {
+            let named: Vec<_> = peer.borrow().nodes.values().filter_map(|node| node.label().or_else(|| node.value())).map(str::to_owned).collect();
+            panic!("missing child control: {label}; available names: {named:?}")
+        })
 }
 
 /// Deliver focus to one host only, keeping its input stream independent of repaint order.
@@ -181,6 +231,20 @@ fn detached_browser_navigation_and_selection_stay_in_the_child_host() {
     h.run_steps(3);
     let at = child_rect(&peer, "Open in PCB layout").center();
     child_click_at(&mut h, &peer, at);
+    // Shared ribbon metrics leave less vertical room in this 760 pt child. Reveal the
+    // footprint row through the child's Browser, retaining its independent input stream.
+    let at = child_rect(&peer, "Board Board").center();
+    peer.borrow_mut().events.extend([
+        Event::PointerMoved(at),
+        Event::MouseWheel {
+            source: egui::MouseWheelSource::Unknown,
+            unit: egui::MouseWheelUnit::Point,
+            delta: vec2(0.0, -52.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: Modifiers::NONE,
+        },
+    ]);
+    h.run_steps(5);
     let at = child_rect(&peer, "Footprint R1  R").center();
     child_click_at(&mut h, &peer, at);
     let child = h.state().views.hosts[&HostId(1)].focused;
@@ -322,27 +386,47 @@ fn window_click(h: &mut Harness<'_, PcbApp>, peer: Option<&Rc<RefCell<Peer>>>, p
 /// pointer serial. Both hosts use the same chrome, including when project controls are blocked.
 #[test]
 fn native_window_gestures_start_on_press_in_each_host() {
+    for workspace in [None, Some("library"), Some("symbol_editor")] {
+        native_window_gestures_for_workspace(workspace);
+    }
+}
+
+/// Service workspaces must not bypass native gestures, including disabled modal frames.
+fn native_window_gestures_for_workspace(workspace: Option<&str>) {
     use egui::ResizeDirection::*;
+    let auxiliary = workspace.is_some();
     for child in [false, true] {
         for modal in [false, true] {
             let (mut h, peer) = multi_window();
             h.state_mut().integrated_titlebar = true;
             detach(&mut h);
+            if let Some(workspace) = workspace {
+                let ctx = h.ctx.clone();
+                for id in h.state_mut().views.all_mut().map(|v| v.id()).collect::<Vec<_>>() {
+                    h.state_mut().run_window_command(&ctx, "app.set_workspace", &json!({"view":id.0,"workspace":workspace})).unwrap();
+                }
+            }
             h.run_steps(3);
             let host = if child { HostId(1) } else { HostId::ROOT };
             let target = child.then_some(&peer);
             let width = if child { 1100.0 } else { 1400.0 };
             let height = if child { 760.0 } else { 900.0 };
             let preferences = if child { child_rect(&peer, "Preferences") } else { h.get_by_label("Preferences").rect() };
-            let create = if child { child_rect(&peer, "New arrangement") } else { h.get_by_label("New arrangement").rect() };
+            let create = if auxiliary {
+                preferences
+            } else if child {
+                child_rect(&peer, "New arrangement")
+            } else {
+                h.get_by_label("New arrangement").rect()
+            };
             let t = pcbcraft_chrome::Tokens::get();
             let brand = pos2(t.space_8 + (t.space_16 + t.space_4) / 2.0, preferences.center().y);
-            let title = if child {
+            let title = if child || auxiliary {
                 None
             } else {
                 Some(h.query_all_by_label("Untitled").find(|node| node.rect().bottom() <= preferences.bottom()).unwrap().rect())
             };
-            let drag = pos2((create.right() + preferences.left()) / 2.0, preferences.center().y);
+            let drag = pos2(if auxiliary { width / 2.0 } else { (create.right() + preferences.left()) / 2.0 }, preferences.center().y);
             if modal {
                 h.state_mut().dialog = Dialog::About;
             }
@@ -580,7 +664,7 @@ fn detach_close_and_dock_preserve_views_without_copying_the_project() {
             let app = h.state();
             let before = app.session.snapshot().unwrap();
             let revision = app.session.revision();
-            let bytes = encode(before.clone()).unwrap();
+            let bytes = encode_documents(before.clone()).unwrap();
             let origin = Point { x_nm: 0, y_nm: 0 };
             let positions = [ViewId(0), ViewId(1)].map(|id| app.views.view(id).unwrap().camera.screen(origin, Rect::ZERO));
             let old = app.views.active.input(&app.session).unwrap();
@@ -624,7 +708,7 @@ fn detach_close_and_dock_preserve_views_without_copying_the_project() {
             }
             assert!(Arc::ptr_eq(&before, &h.state().session.snapshot().unwrap()));
             assert_eq!(h.state().session.revision(), revision);
-            assert_eq!(encode(h.state().session.snapshot().unwrap()).unwrap(), bytes);
+            assert_eq!(encode_documents(h.state().session.snapshot().unwrap()).unwrap(), bytes);
         }
     }
 }
@@ -743,7 +827,10 @@ fn closing_matching_or_mixed_windows_keeps_the_addressed_survivor() {
             if board {
                 let at = child_rect(&peer, "Choose workspace").center();
                 child_click_at(&mut h, &peer, at);
-                let at = child_rect(&peer, "PCB layout").center();
+                // egui 0.37 sizes a new popup in a hidden child pass. The harness only
+                // settles root repaints, so deliver the child's requested paint too.
+                h.run();
+                let at = child_rect(&peer, "PCB Layout").center();
                 child_click_at(&mut h, &peer, at);
             }
             let survivor = if close_original { child } else { HostId::ROOT };
@@ -751,7 +838,7 @@ fn closing_matching_or_mixed_windows_keeps_the_addressed_survivor() {
             let focused = h.state().views.hosts[&survivor].focused;
             let views = h.state().views.hosts[&survivor].layout.views();
             let camera = h.state().views.view(focused).unwrap().camera.saved_state();
-            let before = encode(h.state().session.snapshot().unwrap()).unwrap();
+            let before = encode_documents(h.state().session.snapshot().unwrap()).unwrap();
             if close_original {
                 focus_host(&mut h, &peers, HostId::ROOT);
                 close_root(&mut h);
@@ -766,7 +853,7 @@ fn closing_matching_or_mixed_windows_keeps_the_addressed_survivor() {
             assert_eq!(h.state().views.hosts[&survivor].focused, focused);
             assert_eq!(h.state().views.view(focused).unwrap().camera.saved_state(), camera);
             assert!(matches!(h.state().dialog, Dialog::None));
-            assert_eq!(encode(h.state().session.snapshot().unwrap()).unwrap(), before);
+            assert_eq!(encode_documents(h.state().session.snapshot().unwrap()).unwrap(), before);
             if close_original {
                 child_rect(&peer, if board { "PCB canvas" } else { "Schematic canvas" });
                 peer.borrow_mut().close = true;
@@ -1492,7 +1579,7 @@ fn board_windows_open_directly_and_share_counterpart_highlights() {
     let before = h.state().session.inspect();
     for _ in 0..2 {
         click(&mut h, "Choose workspace");
-        click(&mut h, "Open PCB layout in new window");
+        click(&mut h, "Open PCB Layout in new window");
         h.get_by_label("Schematic canvas");
         assert!(!h.state().views.is_split());
     }
@@ -1591,7 +1678,7 @@ fn child_tab_menu(h: &mut Harness<'_, PcbApp>, peer: &Rc<RefCell<Peer>>, label: 
 fn project_open_rebinds_detached_pcb_and_main_schematic() {
     let (mut h, peer) = multi_window();
     click(&mut h, "Choose workspace");
-    click(&mut h, "Open PCB layout in new window");
+    click(&mut h, "Open PCB Layout in new window");
     let child = h.state().views.hosts[&HostId(1)].focused;
     let stale = h.state().views.view(child).unwrap().input(&h.state().session).unwrap();
     let (_copy, path) = dual_led_copy();
@@ -1633,6 +1720,33 @@ fn schematic_move_hotkey_in_detached_window_uses_its_own_view() {
     assert!(Arc::ptr_eq(&before, &h.state().session.snapshot().unwrap()));
 }
 
+/// A report hosted by the root brings the source window forward after navigating to its pin,
+/// without editing the document or changing which editor owns the target view.
+#[test]
+fn no_connect_show_focuses_the_detached_source_window() {
+    let (mut h, peer) = multi_window();
+    let p = h.state().session.project().unwrap();
+    let target = p.no_connect_target(p.symbols()[0].terminals()[0]).unwrap();
+    let revision = h.state().session.revision();
+    h.state_mut().run(pcbcraft_engine::no_connect::SET, &json!({"target":target,"marked":true,"expected_revision":revision}));
+    detach(&mut h);
+    focus(&mut h, &peer, true);
+    let source = h.state().views.hosts[&HostId(1)].focused;
+    h.state_mut().bind_editor_host(HostId(1));
+    h.state_mut().inspect_no_connects();
+    h.state_mut().bind_editor_host(HostId::ROOT);
+    h.run();
+    focus(&mut h, &peer, false);
+    let before = h.state().session.snapshot().unwrap();
+    h.get_by_label("Show R1 pin 1").click();
+    h.step();
+    assert!(matches!(h.state().dialog, Dialog::None));
+    assert!(h.output().viewport_output[&editor_windows::viewport(HostId(1))].commands.contains(&ViewportCommand::Focus));
+    assert_eq!(h.state().views.owner(source), Some(HostId(1)));
+    assert_eq!(h.state().views.view(source).unwrap().schematic.selection.single_symbol(), Some(before.symbols()[0].id().as_str()));
+    assert!(Arc::ptr_eq(&before, &h.state().session.snapshot().unwrap()));
+}
+
 /// Detached PCB tools use that host's input, cancel on focus loss, and commit through the shared
 /// session. Quarter-turn UI steps also preserve a pre-existing non-quarter-turn orientation.
 #[test]
@@ -1649,7 +1763,7 @@ fn footprint_transforms_in_detached_windows_share_history_and_cancel_on_focus_lo
     h.run();
     let before = encode_documents(h.state().session.snapshot().unwrap()).unwrap();
     click(&mut h, "Choose workspace");
-    click(&mut h, "Open PCB layout in new window");
+    click(&mut h, "Open PCB Layout in new window");
     let child = h.state().views.hosts[&HostId(1)].focused;
     let canvas = child_rect(&peer, "PCB canvas");
     let origin = h.state().views.view(child).unwrap().camera.screen(Point { x_nm: 0, y_nm: 0 }, canvas);
@@ -1700,11 +1814,13 @@ fn detached_board_edge_preview_cancels_on_focus_loss_and_close() {
     let (mut h, peer) = multi_window();
     let before = encode_documents(h.state().session.snapshot().unwrap()).unwrap();
     click(&mut h, "Choose workspace");
-    click(&mut h, "Open PCB layout in new window");
+    click(&mut h, "Open PCB Layout in new window");
     let child = h.state().views.hosts[&HostId(1)].focused;
     let layer = child_rect(&peer, "Activate layer Board Outline").center();
     child_click_at(&mut h, &peer, layer);
-    let tool = child_rect(&peer, "Draw rectangle on Board Outline").center();
+    let draw = child_rect(&peer, "Draw").center();
+    child_click_at(&mut h, &peer, draw);
+    let tool = child_rect(&peer, "Draw rectangle on active layer").center();
     child_click_at(&mut h, &peer, tool);
     let origin = child_rect(&peer, "PCB canvas").center();
     child_click_at(&mut h, &peer, origin);
@@ -1736,6 +1852,25 @@ fn arrangement_dialog_stays_in_its_host_when_main_enters_a_library_workspace() {
     h.state_mut().new_library_item(pcbcraft_engine::authoring::Kind::Symbol);
     h.run();
     assert!(h.state().views.active.definition.is_some());
+    assert_eq!(h.state().arrangement_dialog_host(), Some(HostId(1)));
+    assert!(h.query_by_label("Arrangement name").is_none());
+    assert!(peer.borrow().nodes.values().any(|n| n.role() == egui::accesskit::Role::TextInput));
+}
+
+/// Parts Library obeys the same arrangement-form owner as project and definition hosts.
+#[test]
+fn review_arrangement_dialog_owner_in_parts_library() {
+    let (mut h, peer) = multi_window();
+    let source = h.state().views.active.id();
+    h.state_mut().views.open_window(source).unwrap();
+    h.run();
+    child_tab_menu(&mut h, &peer, "Arrangement Views");
+    let at = child_rect(&peer, "Rename…").center();
+    window_click(&mut h, Some(&peer), at);
+    h.run();
+    let ctx = h.ctx.clone();
+    h.state_mut().place_library_workspace(&ctx, pcbcraft_chrome::workspace::Placement::Here).unwrap();
+    h.run();
     assert_eq!(h.state().arrangement_dialog_host(), Some(HostId(1)));
     assert!(h.query_by_label("Arrangement name").is_none());
     assert!(peer.borrow().nodes.values().any(|n| n.role() == egui::accesskit::Role::TextInput));
@@ -1813,7 +1948,7 @@ fn detached_physical_footprint_click_then_delete_uses_its_own_input() {
         );
         h.run();
         click(&mut h, "Choose workspace");
-        click(&mut h, "Open PCB layout in new window");
+        click(&mut h, "Open PCB Layout in new window");
         let host = h.state().views.detached_hosts()[0];
         let peer = peers.borrow()[&editor_windows::viewport(host)].clone();
         let view = h.state().views.hosts[&host].focused;
@@ -1867,4 +2002,58 @@ fn detached_inline_text_remains_in_the_child_canvas() {
     assert_eq!(h.state().session.project().unwrap().components().next().unwrap().reference(), "R42");
     child_key(&mut h, &peer, Key::Z, Modifiers::COMMAND);
     assert!(Arc::ptr_eq(&before, &h.state().session.snapshot().unwrap()));
+}
+
+/// Titles sent to the main native window, stepping one frame at a time so a command sent in an
+/// intermediate frame isn't hidden behind `run`'s final output. Queue at most one event before
+/// calling: kittest's `step` runs one frame per queued event and keeps only the last output.
+fn root_titles_over(h: &mut Harness<'_, PcbApp>, frames: usize) -> Vec<String> {
+    let mut titles = Vec::new();
+    for _ in 0..frames {
+        h.step();
+        let Some(output) = h.output().viewport_output.get(&ViewportId::ROOT) else {
+            continue;
+        };
+        titles.extend(output.commands.iter().filter_map(|command| match command {
+            ViewportCommand::Title(title) => Some(title.clone()),
+            _ => None,
+        }));
+    }
+    titles
+}
+
+/// The main window's OS title names its focused document the way a detached window's does
+/// (#220); it used to stay "PCBCraft", so taskbars couldn't tell two projects apart. Home shows
+/// the app name alone, an unchanged title isn't resent every frame, and a main window that an
+/// arrangement recreates after it was closed is titled again.
+#[test]
+fn main_window_title_names_its_document_like_a_detached_window() {
+    let (mut h, peers) = many_windows();
+    focus_host(&mut h, &peers, HostId::ROOT);
+    let document = h.state().view_title(h.state().views.hosts[&HostId::ROOT].focused);
+    assert!(document.starts_with(&h.state().session.project().unwrap().name), "{document}");
+    let titled = format!("{document} — PCBCraft");
+    h.get_by_label("Home").click();
+    assert_eq!(root_titles_over(&mut h, 3), ["PCBCraft"]);
+    assert!(h.state().home);
+    let back = format!("Back to {}", h.state().session.project().unwrap().name);
+    h.get_by_label(&back).click();
+    assert_eq!(root_titles_over(&mut h, 3), [titled.as_str()]);
+    assert!(!h.state().home);
+    assert!(root_titles_over(&mut h, 3).is_empty(), "an unchanged title is not resent");
+
+    let original = h.state().views.active.id();
+    let child = h.state_mut().views.open_window(original).unwrap();
+    h.run();
+    let peer = peers.borrow()[&editor_windows::viewport(child)].clone();
+    assert_eq!(peer.borrow().title.as_deref(), Some(titled.as_str()));
+
+    close_root(&mut h);
+    assert!(!h.state().views.hosts.contains_key(&HostId::ROOT));
+    let ctx = h.ctx.clone();
+    h.state_mut()
+        .queue_arrangement(&ctx, crate::arrangements::Action::Create { name: "One window".into(), start: crate::arrangements::Start::SingleView });
+    let titles = root_titles_over(&mut h, 4);
+    assert!(h.state().views.hosts.contains_key(&HostId::ROOT), "the arrangement recreates the main window");
+    assert_eq!(titles, [titled.as_str()]);
 }

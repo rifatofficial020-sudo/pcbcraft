@@ -34,9 +34,43 @@ The project is MIT OR Apache-2.0, so code can move freely between the Craft apps
 - No file surgery: agents never hand-edit project files to get things done.
 - Same controls as KiCad. New ideas go on top of that base, not in place of it. Don't copy KiCad's icons or artwork.
 - Project files stay friendly to Git: a save with no changes gives zero diff, and moving one part changes only that part's lines.
-- Keep the app's chrome easy to move onto the shared Craft UI crate: colours, sizes, menus and dialogs come from `crates/chrome`, not from styling in the app.
+- Use the shared Craft UI toolkit through `crates/chrome` for interface controls, icons, layout and styling whenever a suitable component exists. Follow the toolkit reuse workflow below before building custom chrome.
 - Copying from SolidCraft and the other MIT/Apache Craft apps is fine and encouraged. Record it in `ATTRIBUTION.md`.
 - Add or update Rust `///` doc comments for new or changed public APIs and for new or changed functions with branching logic, including private helpers. Describe behavior callers rely on, such as input constraints, errors, or state changes. Review the diff for missing or stale doc comments before opening a PR. CodeRabbit’s [Docstring Coverage check](https://docs.coderabbit.ai/pr-reviews/pre-merge-checks) targets 80% of eligible functions touched by the diff.
+
+## Shared UI toolkit reuse
+
+Before implementing or restyling an interface, inspect the existing
+`crates/chrome` adapters and the pinned `solidcraft-ui-kit`, `solidcraft-look`,
+`solidcraft-theme` and `solidcraft-ui-registry` APIs. Read
+[the shared UI migration notes](docs/shared-ui-migration.md) and search the
+pinned toolkit's documentation and components for the required behavior. A
+similar control in another Craft app is a reason to check for a shared component.
+
+Prefer an existing adapter or a thin adapter around the toolkit component.
+Reuse its controls, icon masters, surfaces, typography, tokens and interaction
+behavior, including focus, disabled states, accessibility and narrow layouts.
+Keep PCBcraft commands, electronics data and view ownership in the host. Standard
+buttons, menus, toolbars, tabs, tables and panel chrome should use those shared
+components when feasible instead of being drawn from scratch.
+
+When the toolkit lacks the required behavior, compose its existing primitives
+before introducing a custom control. Explain the specific gap in the change
+description, and keep reusable presentation code in `crates/chrome`. Original
+schematic/PCB geometry and domain-specific graphics remain appropriate custom
+drawing. This reuse preference does not authorize dependency upgrades or change
+the source, licence and attribution requirements.
+
+### Menus and action choices
+
+Match the app's existing File, ribbon and context menus when presenting a list
+of actions. Use the shared menu surface and full-width `MenuItem` rows, keeping
+icon, label, shortcut and submenu columns aligned. Anchor choices to their
+trigger; retain the standard keyboard, disabled-state and dismissal behavior.
+Do not substitute a dialog containing a stack of small buttons for an action
+menu. Reserve dialogs for forms, consequential confirmations and errors that
+need context. Review the rendered open menu against an existing app menu in
+both themes before considering the UI complete.
 
 ## Extension and cross-application boundaries
 
@@ -87,6 +121,33 @@ shared libraries remain reuse candidates under the source rules above. New
 integration work must not silently synchronize, replace or transfer ownership
 of either application's documents.
 
+## Keep verification bounded
+
+Before an expensive verification run, state the question it answers, the changed
+behavior or boundary it exercises, the smallest suitable test and its stopping
+condition. Choose a scope that can change an implementation or acceptance
+decision; collecting more evidence is not a goal by itself.
+
+Run required checks once after a coherent change. Repeat affected checks when
+subsequent code changes invalidate their results, a concrete failure needs
+verification, or a narrower experiment tests a specific hypothesis. Once the
+required checks pass and no unresolved correctness failure or acceptance question
+requires another run, stop testing and finish the work.
+
+Inconclusive timings, noisy results or a rejected comparison do not by themselves
+justify another broad replay, rebuild or larger sample count. Check whether the
+test actually isolates the changed work before attributing a slowdown to it. If
+it cannot answer that question, use a focused measurement with a stated hypothesis
+or preserve the result and report the limitation. Do not repeat runs until a
+comparison looks clean, discard inconvenient samples or treat an unmeasured
+boundary as a pass.
+
+Extensive baselines, allocation profiling and endurance sessions need an explicit
+qualification scope and stopping condition. They are separate from routine
+correctness checks and should not grow into an open-ended investigation during
+feature delivery. Keep any required check that failed or could not run visible
+in the handoff.
+
 ## Review failure paths before opening a PR
 
 For changes that introduce or alter blocking I/O, concurrency, or shared state, do a separate review pass after the usual checks. Follow the changed code into its callers and callees, including across crates, and verify the relevant cases:
@@ -96,3 +157,30 @@ For changes that introduce or alter blocking I/O, concurrency, or shared state, 
 - Walk through a stalled or disconnected peer, a full queue, or two overlapping operations where applicable. Add a focused regression test when existing tests miss a concrete failure path.
 
 In the PR description, name the failure paths reviewed and distinguish the ones exercised by tests from the ones checked by reading the code.
+
+## Performance evidence
+
+Before changing routing, ERC/DRC, geometry queries, connectivity, snapshot
+preparation/publication, live MCP edits, or performance-sensitive editor input/rendering paths,
+apply [the verification stopping rule](#keep-verification-bounded) and read
+[the performance-testing guide](docs/performance-testing.md) and its
+[coverage record](docs/performance-coverage.md). Select the saved command-generated
+fixtures and runners affected by the change: CPU replay for engine costs,
+native/browser rendered replay for editor/renderer or live MCP behavior, and
+process-resource collection for memory/allocation claims. Record a baseline
+before implementation and rerun the same artifacts afterward under matched
+conditions on affected, available targets.
+
+Include revisions, artifact hashes, environment/build metadata, raw samples,
+comparisons and correctness results in the PR. Explain regressions and unavailable
+or unmeasured boundaries; a faster result must still pass the oracle and replay
+assertions. Extend the measurements with the feature when adding worker queues,
+an index, ERC progress or new routing behavior. These instructions continue to
+apply after the initial infrastructure issue #240 closes.
+
+Routine CI runs the short harness checks and saved-evidence validators. Full
+100-iteration rendered baselines, allocation profiling and endurance sessions
+are targeted development/qualification runs, rather than requirements for every
+PR. Follow the [change-appropriate submission checks](CONTRIBUTING.md#verify-and-submit)
+for documentation, copy and unrelated changes, without fresh performance baselines. CPU or GPU-readback timings do not establish
+compositor presentation latency or resolve the recorded Wayland endurance failure.

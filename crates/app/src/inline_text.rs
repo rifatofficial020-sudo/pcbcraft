@@ -36,7 +36,7 @@ impl PcbApp {
             Target::Symbol { symbol, field } => {
                 project.symbols().iter().find(|s| s.id() == *symbol).and_then(|s| project.component(s)).and_then(|c| match field.as_str() {
                     "reference" => Some(("Reference".into(), c.reference().into())),
-                    "value" => Some(("Value".into(), c.value().into())),
+                    "value" => Some(("Value".into(), c.display_value().into_owned())),
                     _ => c.metadata.fields.get(field).map(|f| (f.name.clone(), f.value.clone())),
                 })
             }
@@ -61,7 +61,7 @@ impl PcbApp {
     /// applies once; Escape, outside clicks, focus loss or a changed opening/revision discard it.
     pub(super) fn show_inline_text(&mut self, ui: &mut Ui, project: &Project) {
         let Some(mut edit) = self.views.active.schematic.text_edit.take() else { return };
-        let id = *edit.widget.get_or_insert_with(|| ui.id().with(("inline_field", ui.ctx().cumulative_pass_nr())));
+        let id = *edit.widget.get_or_insert_with(|| ui.scope_id().with(("inline_field", ui.ctx().cumulative_pass_nr())));
         if !self.views.active.accepts(edit.source, &self.session) || !matches!(self.dialog, crate::Dialog::None) {
             ui.memory_mut(|memory| memory.surrender_focus(id));
             ui.ctx().request_repaint();
@@ -167,7 +167,7 @@ impl PcbApp {
         let (command, params) = match &edit.target {
             Target::Symbol { symbol, field } => {
                 let placement = project.symbols().iter().find(|s| s.id() == *symbol).ok_or("Symbol no longer exists")?;
-                let component = project.component(placement).ok_or("Component no longer exists")?;
+                let component = project.component(placement).ok_or("Part no longer exists")?;
                 let mut params = json!({"sheet":edit.sheet.id(),"symbol":symbol,"reference":component.reference(),"value":component.value(),"expected_revision":edit.source.revision});
                 match field.as_str() {
                     "reference" => params["reference"] = json!(edit.value),
